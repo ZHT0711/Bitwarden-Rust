@@ -1,0 +1,14 @@
+/target/
+/work/PackageProbe/
+.vscode/
+.vs/
+**/bin/
+**/obj/
+*.user
+*.suo
+*.msix
+*.msixbundle
+*.appx
+*.appxbundle
+*.cer
+*.pfx

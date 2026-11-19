@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<Page
+    x:Class="Bitwarden_WinUI.Pages.GeneratorPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d">
+    <Grid Padding="24,8,24,24" RowSpacing="18">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <StackPanel Spacing="4">
+            <TextBlock Style="{StaticResource TitleTextBlockStyle}" Text="密码生成器" />
+            <TextBlock Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="使用与 Bitwarden Desktop 2026.10.4 对齐的密码设置生成本地密码。" TextWrapping="Wrap" />
+        </StackPanel>
+
+        <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+            <StackPanel MaxWidth="720" Spacing="16">
+                <Border Padding="24" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1" CornerRadius="8">
+                    <Grid RowSpacing="16">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                        </Grid.RowDefinitions>
+                        <Grid ColumnDefinitions="*,Auto">
+                            <TextBlock Style="{StaticResource BodyStrongTextBlockStyle}" Text="生成的密码" />
+                            <Button Grid.Column="1" Content="复制" Click="Copy_Click" />
+                        </Grid>
+                        <TextBox Grid.Row="1" x:Name="GeneratedPassword" FontFamily="Consolas" FontSize="18" IsReadOnly="True" PlaceholderText="点击“生成密码”" TextWrapping="Wrap" />
+                        <StackPanel Grid.Row="2" Orientation="Horizontal" Spacing="10">
+                            <Button Content="生成密码" Click="Generate_Click" />
+                            <Button Content="清空" Click="Clear_Click" />
+                        </StackPanel>
+                    </Grid>
+                </Border>
+
+                <Border Padding="24" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1" CornerRadius="8">
+                    <StackPanel Spacing="16">
+                        <TextBlock Style="{StaticResource SubtitleTextBlockStyle}" Text="密码选项" />
+                        <StackPanel Spacing="6">
+                            <Grid ColumnDefinitions="*,Auto">
+                                <TextBlock Text="长度" />
+                                <TextBlock x:Name="LengthLabel" Grid.Column="1" Text="14" />
+                            </Grid>
+                            <Slider x:Name="LengthSlider" Maximum="128" Minimum="5" StepFrequency="1" Value="14" ValueChanged="LengthSlider_ValueChanged" />
+                        </StackPanel>
+                        <Grid ColumnSpacing="32">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <StackPanel Spacing="10">
+                                <ToggleSwitch x:Name="Uppercase" Header="大写字母" IsOn="True" />
+                                <ToggleSwitch x:Name="Lowercase" Header="小写字母" IsOn="True" />
+                                <ToggleSwitch x:Name="Numbers" Header="数字" IsOn="True" />
+                            </StackPanel>
+                            <StackPanel Grid.Column="1" Spacing="10">
+                                <ToggleSwitch x:Name="Special" Header="特殊字符" IsOn="False" />
+                                <ToggleSwitch x:Name="AvoidAmbiguous" Header="避免易混淆字符" IsOn="False" />
+                            </StackPanel>
+                        </Grid>
+                        <Grid ColumnSpacing="16">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <NumberBox x:Name="MinimumNumbers" Header="最少数字" Minimum="0" Maximum="9" SpinButtonPlacementMode="Compact" Value="1" />
+                            <NumberBox x:Name="MinimumSpecial" Grid.Column="1" Header="最少特殊字符" Minimum="0" Maximum="9" SpinButtonPlacementMode="Compact" Value="0" />
+                        </Grid>
+                        <InfoBar x:Name="GeneratorNotice" IsOpen="False" Severity="Error" Title="无法生成密码" />
+                    </StackPanel>
+                </Border>
+            </StackPanel>
+        </ScrollViewer>
+    </Grid>
+</Page>
