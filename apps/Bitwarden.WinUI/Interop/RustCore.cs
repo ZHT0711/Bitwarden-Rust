@@ -12,6 +12,13 @@ internal static class RustCore
     [DllImport(LibraryName, EntryPoint = "bw_generate_password", CallingConvention = CallingConvention.Cdecl)]
     private static extern IntPtr GeneratePasswordNative(uint length, uint options, uint minimumNumbers, uint minimumSpecial);
 
+    [DllImport(LibraryName, EntryPoint = "bw_generate_passphrase", CallingConvention = CallingConvention.Cdecl)]
+    private static extern IntPtr GeneratePassphraseNative(
+        uint numberOfWords,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string wordSeparator,
+        byte capitalize,
+        byte includeNumber);
+
     [DllImport(LibraryName, EntryPoint = "bw_string_free", CallingConvention = CallingConvention.Cdecl)]
     private static extern void FreeStringNative(IntPtr value);
 
@@ -38,6 +45,32 @@ internal static class RustCore
         if (value == IntPtr.Zero)
         {
             throw new InvalidOperationException("Password settings are invalid or require more characters than the selected length.");
+        }
+
+        try
+        {
+            return Marshal.PtrToStringUTF8(value) ?? throw new InvalidOperationException("Rust core returned invalid UTF-8.");
+        }
+        finally
+        {
+            FreeStringNative(value);
+        }
+    }
+
+    internal static string GeneratePassphrase(
+        uint numberOfWords,
+        string wordSeparator,
+        bool capitalize,
+        bool includeNumber)
+    {
+        var value = GeneratePassphraseNative(
+            numberOfWords,
+            wordSeparator,
+            capitalize ? (byte)1 : (byte)0,
+            includeNumber ? (byte)1 : (byte)0);
+        if (value == IntPtr.Zero)
+        {
+            throw new InvalidOperationException("Passphrase settings are invalid. Choose between 3 and 20 words.");
         }
 
         try
