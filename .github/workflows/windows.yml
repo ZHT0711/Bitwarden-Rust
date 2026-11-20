@@ -1,0 +1,40 @@
+name: Windows validation
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+        with:
+          dotnet-version: 10.0.x
+      - name: Prepare Rust
+        run: |
+          rustup update stable --no-self-update
+          rustup component add rustfmt clippy
+      - name: Formatting, native tests and Clippy
+        shell: pwsh
+        run: |
+          . ./scripts/build-rust-core.ps1
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo fmt --all -- --check
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo test --locked -p bitwarden-core@0.2.0
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo clippy --locked -p bitwarden-core@0.2.0 --all-targets -- -D warnings
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Managed filters and native interop
+        run: dotnet run --project tests/Bitwarden.Interop.Tests -- target/debug/bitwarden_core.dll
+      - name: Build unsigned x64 MSIX preview
+        run: dotnet build apps/Bitwarden.WinUI/Bitwarden.WinUI.csproj -p:Platform=x64 -p:GenerateAppxPackageOnBuild=true -p:AppxPackageSigningEnabled=false --nologo
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: Bitwarden-Rust-unsigned-msix-x64
+          path: apps/Bitwarden.WinUI/AppPackages/**/*.msix
+          if-no-files-found: error

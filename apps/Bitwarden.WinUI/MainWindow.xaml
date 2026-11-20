@@ -41,11 +41,13 @@
                         x:Name="SearchBox"
                         PlaceholderText="搜索保险库"
                         QueryIcon="Find"
-                        Width="420"
+                        MaxWidth="420"
+                        MinWidth="180"
+                        TextChanged="SearchBox_TextChanged"
                         HorizontalAlignment="Left"
                         QuerySubmitted="SearchBox_QuerySubmitted" />
                     <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8">
-                        <Button Content="同步" IsEnabled="False" ToolTipService.ToolTip="账户同步将在后续迭代接入" />
+                        <Button x:Name="SyncButton" Content="同步" IsEnabled="False" Click="Sync_Click" />
                         <Button x:Name="SignInButton" Content="登录" Click="SignIn_Click" />
                     </StackPanel>
                 </Grid>
@@ -70,6 +72,21 @@
                 </NavigationViewItem>
                 <NavigationViewItem Content="身份信息" Tag="identities">
                     <NavigationViewItem.Icon><SymbolIcon Symbol="ContactInfo" /></NavigationViewItem.Icon>
+                </NavigationViewItem>
+                <NavigationViewItem Content="SSH 密钥" Tag="ssh">
+                    <NavigationViewItem.Icon><SymbolIcon Symbol="Permissions" /></NavigationViewItem.Icon>
+                </NavigationViewItem>
+                <NavigationViewItem Content="银行账户" Tag="bankaccounts">
+                    <NavigationViewItem.Icon><SymbolIcon Symbol="Contact" /></NavigationViewItem.Icon>
+                </NavigationViewItem>
+                <NavigationViewItem Content="驾驶执照" Tag="licenses">
+                    <NavigationViewItem.Icon><SymbolIcon Symbol="ContactInfo" /></NavigationViewItem.Icon>
+                </NavigationViewItem>
+                <NavigationViewItem Content="护照" Tag="passports">
+                    <NavigationViewItem.Icon><SymbolIcon Symbol="ContactInfo" /></NavigationViewItem.Icon>
+                </NavigationViewItem>
+                <NavigationViewItem Content="归档" Tag="archived">
+                    <NavigationViewItem.Icon><SymbolIcon Symbol="Folder" /></NavigationViewItem.Icon>
                 </NavigationViewItem>
                 <NavigationViewItem Content="回收站" Tag="trash">
                     <NavigationViewItem.Icon><SymbolIcon Symbol="Delete" /></NavigationViewItem.Icon>

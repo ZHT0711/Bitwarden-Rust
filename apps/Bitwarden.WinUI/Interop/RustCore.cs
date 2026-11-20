@@ -1,6 +1,7 @@
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 
 namespace Bitwarden_WinUI.Interop;
 
@@ -31,14 +32,25 @@ internal static class RustCore
         uint provider,
         IntPtr token,
         uint serverMode,
-        IntPtr serverUrl);
+        IntPtr serverUrl,
+        ulong requestId);
 
     [DllImport(LibraryName, EntryPoint = "bw_auth_send_two_factor_email", CallingConvention = CallingConvention.Cdecl)]
     private static extern byte SendTwoFactorEmailNative(
         IntPtr email,
         IntPtr password,
         uint serverMode,
-        IntPtr serverUrl);
+        IntPtr serverUrl,
+        ulong requestId);
+
+    [DllImport(LibraryName, EntryPoint = "bw_auth_begin_request", CallingConvention = CallingConvention.Cdecl)]
+    private static extern ulong BeginAuthRequestNative();
+
+    [DllImport(LibraryName, EntryPoint = "bw_auth_cancel_request", CallingConvention = CallingConvention.Cdecl)]
+    private static extern void CancelAuthRequestNative(ulong requestId);
+
+    [DllImport(LibraryName, EntryPoint = "bw_auth_validate_server", CallingConvention = CallingConvention.Cdecl)]
+    private static extern byte ValidateServerNative(uint serverMode, [MarshalAs(UnmanagedType.LPUTF8Str)] string serverUrl);
 
     [DllImport(LibraryName, EntryPoint = "bw_auth_is_authenticated", CallingConvention = CallingConvention.Cdecl)]
     private static extern byte IsAuthenticatedNative();
@@ -46,8 +58,63 @@ internal static class RustCore
     [DllImport(LibraryName, EntryPoint = "bw_auth_logout", CallingConvention = CallingConvention.Cdecl)]
     private static extern void LogoutNative();
 
+    [DllImport(LibraryName, EntryPoint = "bw_vault_overview", CallingConvention = CallingConvention.Cdecl)]
+    private static extern IntPtr VaultOverviewNative();
+
+    [DllImport(LibraryName, EntryPoint = "bw_vault_sync", CallingConvention = CallingConvention.Cdecl)]
+    private static extern IntPtr VaultSyncNative(ulong requestId);
+
+    [DllImport(LibraryName, EntryPoint = "bw_vault_detail", CallingConvention = CallingConvention.Cdecl)]
+    private static extern IntPtr VaultDetailNative(IntPtr id, IntPtr password, ulong requestId);
+
+    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
+
+    internal static VaultOverview GetVaultOverview() => ReadJson<VaultOverview>(VaultOverviewNative());
+
+    internal static VaultOverview SyncVault(CancellationToken token) =>
+        RunVaultRequest<VaultOverview>(VaultSyncNative, token);
+
+    internal static VaultDetail GetVaultDetail(string id, string password, CancellationToken token)
+    {
+        using var idBuffer = new Utf8Buffer(id);
+        using var passwordBuffer = new Utf8Buffer(password);
+        return RunVaultRequest<VaultDetail>(requestId => VaultDetailNative(idBuffer.Pointer, passwordBuffer.Pointer, requestId), token);
+    }
+
+    private static T RunVaultRequest<T>(Func<ulong, IntPtr> operation, CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        var requestId = BeginAuthRequestNative();
+        using var cancellation = token.Register(() => CancelAuthRequestNative(requestId));
+        var result = ReadJson<T>(operation(requestId));
+        token.ThrowIfCancellationRequested();
+        return result;
+    }
+
+    private static T ReadJson<T>(IntPtr pointer)
+    {
+        if (pointer == IntPtr.Zero) throw new VaultException("internal");
+        try
+        {
+            var json = Marshal.PtrToStringUTF8(pointer) ?? throw new VaultException("internal");
+            var response = JsonSerializer.Deserialize<NativeResponse<T>>(json, JsonOptions);
+            if (response is null) throw new VaultException("internal");
+            if (!response.Ok)
+            {
+                if (response.Error == "cancelled") throw new OperationCanceledException();
+                throw new VaultException(response.Error ?? "internal");
+            }
+            return response.Data ?? throw new VaultException("internal");
+        }
+        catch (JsonException) { throw new VaultException("internal"); }
+        finally { FreeStringNative(pointer); }
+    }
+
+    private sealed record NativeResponse<T>(bool Ok, T? Data, string? Error);
+
     internal static string Version => Marshal.PtrToStringUTF8(GetVersionNative()) ?? "unknown";
     internal static bool IsAuthenticated => IsAuthenticatedNative() != 0;
+    internal static bool IsValidServer(uint serverMode, string serverUrl) => ValidateServerNative(serverMode, serverUrl) != 0;
 
     internal static AuthResult Login(
         string email,
@@ -55,43 +122,63 @@ internal static class RustCore
         uint provider,
         string token,
         uint serverMode,
-        string serverUrl)
+        string serverUrl,
+        CancellationToken cancellationToken = default)
     {
-        var emailPointer = AllocateUtf8(email, out var emailLength);
-        var passwordPointer = AllocateUtf8(password, out var passwordLength);
-        var tokenPointer = AllocateUtf8(token, out var tokenLength);
-        var serverPointer = AllocateUtf8(serverUrl, out var serverLength);
+        cancellationToken.ThrowIfCancellationRequested();
+        using var emailBuffer = new Utf8Buffer(email);
+        using var passwordBuffer = new Utf8Buffer(password);
+        using var tokenBuffer = new Utf8Buffer(token);
+        using var serverBuffer = new Utf8Buffer(serverUrl);
+        var requestId = BeginAuthRequestNative();
+        using var cancellation = cancellationToken.Register(() => CancelAuthRequestNative(requestId));
 
-        try
+        var result = LoginNative(emailBuffer.Pointer, passwordBuffer.Pointer, provider, tokenBuffer.Pointer,
+            serverMode, serverBuffer.Pointer, requestId);
+        if (cancellationToken.IsCancellationRequested)
         {
-            var result = LoginNative(emailPointer, passwordPointer, provider, tokenPointer, serverMode, serverPointer);
-            return new AuthResult(result & 0xff, result >> 8);
+            LogoutNative();
+            return new AuthResult(AuthStatus.Cancelled, 0);
         }
-        finally
-        {
-            ZeroAndFree(emailPointer, emailLength);
-            ZeroAndFree(passwordPointer, passwordLength);
-            ZeroAndFree(tokenPointer, tokenLength);
-            ZeroAndFree(serverPointer, serverLength);
-        }
+        return new AuthResult((AuthStatus)(result & 0xff), result >> 8);
     }
 
     internal static void Logout() => LogoutNative();
 
-    internal static bool SendTwoFactorEmail(string email, string password, uint serverMode, string serverUrl)
+    internal static AuthStatus SendTwoFactorEmail(
+        string email,
+        string password,
+        uint serverMode,
+        string serverUrl,
+        CancellationToken cancellationToken = default)
     {
-        var emailPointer = AllocateUtf8(email, out var emailLength);
-        var passwordPointer = AllocateUtf8(password, out var passwordLength);
-        var serverPointer = AllocateUtf8(serverUrl, out var serverLength);
-        try
+        cancellationToken.ThrowIfCancellationRequested();
+        using var emailBuffer = new Utf8Buffer(email);
+        using var passwordBuffer = new Utf8Buffer(password);
+        using var serverBuffer = new Utf8Buffer(serverUrl);
+        var requestId = BeginAuthRequestNative();
+        using var cancellation = cancellationToken.Register(() => CancelAuthRequestNative(requestId));
+        var status = (AuthStatus)SendTwoFactorEmailNative(emailBuffer.Pointer, passwordBuffer.Pointer,
+            serverMode, serverBuffer.Pointer, requestId);
+        if (cancellationToken.IsCancellationRequested)
         {
-            return SendTwoFactorEmailNative(emailPointer, passwordPointer, serverMode, serverPointer) != 0;
+            LogoutNative();
+            return AuthStatus.Cancelled;
         }
-        finally
+        return status;
+    }
+
+    private sealed class Utf8Buffer : IDisposable
+    {
+        private readonly int _byteLength;
+        public IntPtr Pointer { get; private set; }
+
+        public Utf8Buffer(string value) => Pointer = AllocateUtf8(value, out _byteLength);
+
+        public void Dispose()
         {
-            ZeroAndFree(emailPointer, emailLength);
-            ZeroAndFree(passwordPointer, passwordLength);
-            ZeroAndFree(serverPointer, serverLength);
+            ZeroAndFree(Pointer, _byteLength);
+            Pointer = IntPtr.Zero;
         }
     }
 
@@ -201,4 +288,13 @@ internal static class RustCore
     }
 }
 
-internal readonly record struct AuthResult(uint Status, uint AvailableTwoFactorMethods);
+internal enum AuthStatus : uint
+{
+    Failed = 0,
+    Authenticated = 1,
+    TwoFactorRequired = 2,
+    TimedOut = 3,
+    Cancelled = 4,
+}
+
+internal readonly record struct AuthResult(AuthStatus Status, uint AvailableTwoFactorMethods);

@@ -47,7 +47,7 @@ $env:LIB = @(
 ) -join ";"
 
 $workspaceManifest = Join-Path $PSScriptRoot "../Cargo.toml"
-$cargoArgs = @("build", "-p", "bitwarden-core@0.2.0", "--manifest-path", $workspaceManifest)
+$cargoArgs = @("build", "--locked", "-p", "bitwarden-core@0.2.0", "--manifest-path", $workspaceManifest)
 if ($Profile -eq "Release") {
     $cargoArgs += "--release"
 }

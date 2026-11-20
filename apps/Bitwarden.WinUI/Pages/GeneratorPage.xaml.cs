@@ -2,7 +2,6 @@ using Bitwarden_WinUI.Interop;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Controls.Primitives;
-using Windows.ApplicationModel.DataTransfer;
 
 namespace Bitwarden_WinUI.Pages;
 
@@ -20,6 +19,13 @@ public sealed partial class GeneratorPage : Page
         _regenerationTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(150) };
         _regenerationTimer.Tick += RegenerationTimer_Tick;
         GenerateCurrent();
+        Unloaded += (_, _) => ClearSensitiveState();
+    }
+
+    public void ClearSensitiveState()
+    {
+        _regenerationTimer?.Stop();
+        GeneratedPassword.Text = string.Empty;
     }
 
     private void LengthSlider_ValueChanged(object sender, RangeBaseValueChangedEventArgs e)
@@ -89,13 +95,19 @@ public sealed partial class GeneratorPage : Page
             return;
         }
 
-        var package = new DataPackage();
-        package.SetText(GeneratedPassword.Text);
-        Clipboard.SetContent(package);
+        try { ClipboardCleaner.Copy(GeneratedPassword.Text); }
+        catch (Exception error) when (error is System.Runtime.InteropServices.COMException or InvalidOperationException)
+        {
+            GeneratorNotice.Title = "无法复制";
+            GeneratorNotice.Message = "剪贴板暂时不可用，请重试。";
+            GeneratorNotice.Severity = InfoBarSeverity.Error;
+            GeneratorNotice.IsOpen = true;
+            return;
+        }
         GeneratorNotice.Title = "已复制";
         GeneratorNotice.Message = IsPassphraseSelected
-            ? "密码短语已复制到剪贴板。自动清理将在后续迭代接入。"
-            : "密码已复制到剪贴板。自动清理将在后续迭代接入。";
+            ? "密码短语已复制。30 秒后会清除本应用仍然拥有的剪贴板内容。"
+            : "密码已复制。30 秒后会清除本应用仍然拥有的剪贴板内容。";
         GeneratorNotice.Severity = InfoBarSeverity.Success;
         GeneratorNotice.IsOpen = true;
     }

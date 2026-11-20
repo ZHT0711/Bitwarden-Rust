@@ -9,7 +9,7 @@ use std::{
 
 use bitwarden_auth::token_management::PasswordManagerTokenHandler;
 use bitwarden_generators::{
-    GeneratorClientsExt, PassphraseGeneratorRequest, PasswordGeneratorRequest,
+    GeneratorClient, GeneratorClientsExt, PassphraseGeneratorRequest, PasswordGeneratorRequest,
 };
 use bw_sdk_core::{
     auth::login::{PasswordLoginRequest, TwoFactorProvider, TwoFactorRequest},
@@ -19,9 +19,14 @@ use bw_sdk_core::{
 use url::Url;
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::auth_request::{self, RequestError};
+use crate::vault::{VaultCache, VaultError};
+
 const AUTH_FAILED: u32 = 0;
 const AUTHENTICATED: u32 = 1;
 const TWO_FACTOR_REQUIRED: u32 = 2;
+const AUTH_TIMED_OUT: u32 = 3;
+const AUTH_CANCELLED: u32 = 4;
 const TWO_FACTOR_MASK_SHIFT: u32 = 8;
 const TWO_FACTOR_AUTHENTICATOR: u32 = 1 << 0;
 const TWO_FACTOR_EMAIL: u32 = 1 << 1;
@@ -30,6 +35,7 @@ const TWO_FACTOR_YUBIKEY: u32 = 1 << 3;
 static AUTHENTICATED_STATE: AtomicBool = AtomicBool::new(false);
 static AUTH_CLIENT: OnceLock<Mutex<Option<AuthSession>>> = OnceLock::new();
 static ASYNC_RUNTIME: OnceLock<Option<tokio::runtime::Runtime>> = OnceLock::new();
+static GENERATOR: OnceLock<GeneratorClient> = OnceLock::new();
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct AuthServer {
@@ -40,6 +46,7 @@ struct AuthServer {
 struct AuthSession {
     server: AuthServer,
     client: Client,
+    vault: VaultCache,
 }
 
 struct SensitiveLoginRequest(PasswordLoginRequest);
@@ -65,6 +72,7 @@ fn runtime() -> Option<&'static tokio::runtime::Runtime> {
     ASYNC_RUNTIME
         .get_or_init(|| {
             tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
                 .enable_all()
                 .build()
                 .ok()
@@ -107,7 +115,10 @@ fn custom_auth_server(base_url: &str) -> Option<AuthServer> {
         return None;
     }
 
-    let final_path_segment = base_url.path_segments()?.next_back().unwrap_or_default();
+    let final_path_segment = base_url
+        .path_segments()?
+        .rfind(|segment| !segment.is_empty())
+        .unwrap_or_default();
     if matches!(final_path_segment, "api" | "identity") {
         return None;
     }
@@ -155,6 +166,7 @@ fn auth_client_for_server<'a>(
         *session = Some(AuthSession {
             server: server.clone(),
             client: build_auth_client(server),
+            vault: VaultCache::default(),
         });
         AUTHENTICATED_STATE.store(false, Ordering::Release);
     }
@@ -251,7 +263,7 @@ fn generate_password(
         ..Default::default()
     };
 
-    Client::new(None).generator().password(request).ok()
+    generator().password(request).ok()
 }
 
 fn generate_passphrase(
@@ -267,7 +279,12 @@ fn generate_passphrase(
         include_number,
     };
 
-    Client::new(None).generator().passphrase(request).ok()
+    generator().passphrase(request).ok()
+}
+
+fn generator() -> &'static GeneratorClient {
+    // This instance never receives account credentials or tokens.
+    GENERATOR.get_or_init(|| Client::new(None).generator())
 }
 
 fn into_raw_string(value: String) -> *mut c_char {
@@ -321,6 +338,24 @@ pub unsafe extern "C" fn bw_generate_passphrase(
 /// Authenticate through the official Bitwarden Rust SDK. The result's low byte is a status;
 /// when status is TWO_FACTOR_REQUIRED, the upper bits contain a supported-provider bitmask.
 #[no_mangle]
+pub extern "C" fn bw_auth_begin_request() -> u64 {
+    auth_request::begin()
+}
+
+#[no_mangle]
+pub extern "C" fn bw_auth_cancel_request(request_id: u64) {
+    auth_request::cancel(request_id);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn bw_auth_validate_server(mode: u32, server_url: *const c_char) -> u8 {
+    let Some(server_url) = (unsafe { read_utf8(server_url) }) else {
+        return 0;
+    };
+    u8::from(auth_server(mode, &server_url).is_some())
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn bw_auth_login(
     email: *const c_char,
     password: *const c_char,
@@ -328,6 +363,7 @@ pub unsafe extern "C" fn bw_auth_login(
     token: *const c_char,
     server_mode: u32,
     server_url: *const c_char,
+    request_id: u64,
 ) -> u32 {
     catch_unwind(AssertUnwindSafe(|| {
         let Some(email) = (unsafe { read_utf8(email) }) else {
@@ -377,11 +413,25 @@ pub unsafe extern "C" fn bw_auth_login(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let client = auth_client_for_server(&mut session, &server);
-            Ok::<_, ()>(runtime.block_on(client.auth().login_password(&request.0)))
+            let response = runtime.block_on(auth_request::run(
+                request_id,
+                client.auth().login_password(&request.0),
+            ));
+            let status = match response {
+                Ok(response) => login_status(response),
+                Err(RequestError::TimedOut) => AUTH_TIMED_OUT,
+                Err(RequestError::Cancelled) => AUTH_CANCELLED,
+            };
+            if status & 0xff != AUTHENTICATED && status & 0xff != TWO_FACTOR_REQUIRED {
+                // Includes partially authenticated state if a request failed after setting tokens.
+                *session = None;
+                AUTHENTICATED_STATE.store(false, Ordering::Release);
+            }
+            Ok::<_, ()>(status)
         }));
 
         match result {
-            Ok(Ok(result)) => login_status(result),
+            Ok(Ok(status)) => status,
             Ok(Err(())) | Err(_) => {
                 AUTHENTICATED_STATE.store(false, Ordering::Release);
                 AUTH_FAILED
@@ -398,6 +448,7 @@ pub unsafe extern "C" fn bw_auth_send_two_factor_email(
     password: *const c_char,
     server_mode: u32,
     server_url: *const c_char,
+    request_id: u64,
 ) -> u8 {
     catch_unwind(AssertUnwindSafe(|| {
         let Some(password) = (unsafe { read_utf8(password) }) else {
@@ -428,11 +479,25 @@ pub unsafe extern "C" fn bw_auth_send_two_factor_email(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let client = auth_client_for_server(&mut session, &server);
-            Ok::<_, ()>(runtime.block_on(client.auth().send_two_factor_email(&request.0)))
+            let response = runtime.block_on(auth_request::run(
+                request_id,
+                client.auth().send_two_factor_email(&request.0),
+            ));
+            let status = match response {
+                Ok(Ok(())) => AUTHENTICATED as u8,
+                Ok(Err(_)) => AUTH_FAILED as u8,
+                Err(RequestError::TimedOut) => AUTH_TIMED_OUT as u8,
+                Err(RequestError::Cancelled) => AUTH_CANCELLED as u8,
+            };
+            if status == AUTH_TIMED_OUT as u8 || status == AUTH_CANCELLED as u8 {
+                *session = None;
+                AUTHENTICATED_STATE.store(false, Ordering::Release);
+            }
+            Ok::<_, ()>(status)
         }));
 
         match result {
-            Ok(Ok(Ok(()))) => 1,
+            Ok(Ok(status)) => status,
             _ => 0,
         }
     }))
@@ -446,11 +511,116 @@ pub extern "C" fn bw_auth_is_authenticated() -> u8 {
 
 #[no_mangle]
 pub extern "C" fn bw_auth_logout() {
+    // Wake an in-flight network operation before waiting for its session guard.
+    auth_request::begin();
     let mut session = auth_client()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     *session = None;
     AUTHENTICATED_STATE.store(false, Ordering::Release);
+}
+
+fn vault_error(code: &str) -> *mut c_char {
+    into_raw_string(serde_json::json!({"ok": false, "error": code}).to_string())
+}
+
+fn vault_success(value: &impl serde::Serialize) -> *mut c_char {
+    into_raw_string(serde_json::json!({"ok": true, "data": value}).to_string())
+}
+
+#[no_mangle]
+pub extern "C" fn bw_vault_overview() -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let guard = auth_client()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(session) = guard
+            .as_ref()
+            .filter(|_| AUTHENTICATED_STATE.load(Ordering::Acquire))
+        else {
+            return vault_error("notAuthenticated");
+        };
+        match session.vault.overview() {
+            Ok(overview) => vault_success(overview),
+            Err(error) => vault_error(&error.to_string()),
+        }
+    }))
+    .unwrap_or_else(|_| vault_error("internal"))
+}
+
+#[no_mangle]
+pub extern "C" fn bw_vault_sync(request_id: u64) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(runtime) = runtime() else {
+            return vault_error("internal");
+        };
+        let mut guard = auth_client()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(session) = guard
+            .as_mut()
+            .filter(|_| AUTHENTICATED_STATE.load(Ordering::Acquire))
+        else {
+            return vault_error("notAuthenticated");
+        };
+        match runtime.block_on(auth_request::run(
+            request_id,
+            VaultCache::fetch(&session.client),
+        )) {
+            Ok(Ok(cache)) if auth_request::is_current(request_id) => {
+                session.vault = cache;
+                vault_success(
+                    session
+                        .vault
+                        .overview()
+                        .expect("successful sync has an overview"),
+                )
+            }
+            Ok(Ok(_)) | Err(RequestError::Cancelled) => vault_error("cancelled"),
+            Err(RequestError::TimedOut) => vault_error("timedOut"),
+            Ok(Err(error)) => vault_error(&error.to_string()),
+        }
+    }))
+    .unwrap_or_else(|_| vault_error("internal"))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn bw_vault_detail(
+    id: *const c_char,
+    password: *const c_char,
+    request_id: u64,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(id) = (unsafe { read_utf8(id) }) else {
+            return vault_error("notFound");
+        };
+        let Some(password) = (unsafe { read_utf8(password) }) else {
+            return vault_error("passwordRequired");
+        };
+        let password = Zeroizing::new(password);
+        let Some(runtime) = runtime() else {
+            return vault_error("internal");
+        };
+        let guard = auth_client()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(session) = guard
+            .as_ref()
+            .filter(|_| AUTHENTICATED_STATE.load(Ordering::Acquire))
+        else {
+            return vault_error(&VaultError::NotAuthenticated.to_string());
+        };
+        match runtime.block_on(auth_request::run(
+            request_id,
+            session.vault.detail(&session.client, &id, &password),
+        )) {
+            Ok(Ok(detail)) if auth_request::is_current(request_id) => vault_success(&detail),
+            Ok(Ok(_)) | Err(RequestError::Cancelled) => vault_error("cancelled"),
+            Err(RequestError::TimedOut) => vault_error("timedOut"),
+            Ok(Err(error)) => vault_error(&error.to_string()),
+        }
+    }))
+    .unwrap_or_else(|_| vault_error("internal"))
 }
 
 #[no_mangle]
@@ -549,6 +719,7 @@ mod tests {
                 token.as_ptr(),
                 0,
                 server_url.as_ptr(),
+                0,
             )
         };
         assert_eq!(result, super::AUTH_FAILED);
@@ -568,6 +739,7 @@ mod tests {
                 token.as_ptr(),
                 0,
                 server_url.as_ptr(),
+                0,
             )
         };
         assert_eq!(result, super::AUTH_FAILED);
@@ -619,7 +791,9 @@ mod tests {
             "https://vault.example.com/#fragment",
             "http://vault.example.com",
             "https://vault.example.com/api",
+            "https://vault.example.com/api/",
             "https://vault.example.com/identity",
+            "https://vault.example.com/identity/",
         ] {
             assert!(
                 custom_auth_server(value).is_none(),

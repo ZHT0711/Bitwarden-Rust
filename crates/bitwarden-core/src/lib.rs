@@ -1,7 +1,9 @@
+mod auth_request;
 mod crypto;
 mod ffi;
 mod model;
 mod storage;
+mod vault;
 
 pub use crypto::{EncryptedSnapshot, LocalKey, LocalKeyDeriver};
 pub use model::{Cipher, CipherType, Folder, Login, SecureNote, VaultSnapshot};

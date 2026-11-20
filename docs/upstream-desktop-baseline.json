@@ -1,0 +1,25 @@
+{
+  "checkedAt": "2026-11-20",
+  "releaseTag": "desktop-v2026.11.0",
+  "source": "https://github.com/bitwarden/clients/releases/download/desktop-v2026.11.0/bit-Bitwarden-2026.11.0-x64-store.appx",
+  "packageName": "8bitSolutionsLLC.bitwardendesktop",
+  "version": "2026.11.0.0",
+  "architecture": "x64",
+  "publisher": "CN=14D52771-DE3C-4886-B8BF-825BA7690418",
+  "bytes": 208684223,
+  "sha256": "BDCFEBFBC38C25C41B7436B27C587C73B7DEF8AA13367331C7C4958D6B329081",
+  "applications": [
+    {
+      "id": "bitwardendesktop",
+      "executable": "app\\Bitwarden.exe",
+      "entryPoint": "Windows.FullTrustApplication"
+    }
+  ],
+  "archives": [
+    {
+      "path": "app/resources/app.asar",
+      "bytes": 97187466
+    }
+  ],
+  "note": "Downloaded and inspected only. The installed official 2026.10.4.0 package was not updated. Functional parity is still incomplete."
+}

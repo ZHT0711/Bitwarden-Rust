@@ -21,6 +21,13 @@ public sealed partial class MainWindow : Window
         AppWindow.SetIcon("Assets/AppIcon.ico");
         NavFrame.Navigated += NavFrame_Navigated;
         NavFrame.Navigate(typeof(HomePage), "vault");
+        Closed += (_, _) =>
+        {
+            if (NavFrame.Content is HomePage page) page.ClearSensitiveState();
+            if (NavFrame.Content is GeneratorPage generator) generator.ClearSensitiveState();
+            ClipboardCleaner.ClearOwned();
+            try { RustCore.Logout(); } catch (Exception error) when (IsCoreUnavailable(error)) { }
+        };
     }
 
     private void TitleBar_PaneToggleRequested(TitleBar sender, object args)
@@ -71,12 +78,24 @@ public sealed partial class MainWindow : Window
         }
     }
 
+    private void SearchBox_TextChanged(AutoSuggestBox sender, AutoSuggestBoxTextChangedEventArgs args)
+    {
+        if (NavFrame.Content is HomePage page) page.SetSearch(sender.Text);
+    }
+
+    private async void Sync_Click(object sender, RoutedEventArgs e)
+    {
+        if (NavFrame.Content is not HomePage) NavFrame.Navigate(typeof(HomePage), "vault");
+        if (NavFrame.Content is HomePage page) await page.RefreshAsync(true);
+    }
+
     private void NavFrame_Navigated(object sender, NavigationEventArgs e)
     {
         if (e.Content is HomePage page)
         {
             page.SignInRequested -= HomePage_SignInRequested;
             page.SignInRequested += HomePage_SignInRequested;
+            page.SetSearch(SearchBox.Text);
         }
     }
 
@@ -86,16 +105,20 @@ public sealed partial class MainWindow : Window
         {
             if (RustCore.IsAuthenticated)
             {
-                RustCore.Logout();
-                SignInButton.Content = "登录";
+                SignInButton.IsEnabled = SyncButton.IsEnabled = false;
                 if (NavFrame.Content is HomePage homePage)
                 {
                     homePage.ShowLoggedOut();
                 }
+                if (NavFrame.Content is GeneratorPage generator) generator.ClearSensitiveState();
+                SearchBox.Text = string.Empty;
+                ClipboardCleaner.ClearOwned();
+                try { await Task.Run(RustCore.Logout); }
+                finally { SignInButton.IsEnabled = true; SignInButton.Content = "登录"; }
                 return;
             }
         }
-        catch (DllNotFoundException)
+        catch (Exception error) when (IsCoreUnavailable(error))
         {
             return;
         }
@@ -105,9 +128,34 @@ public sealed partial class MainWindow : Window
 
     private void HomePage_SignInRequested(object? sender, EventArgs e) => _ = ShowSignInDialogAsync();
 
+    private bool _signInDialogOpen;
+
     private async Task ShowSignInDialogAsync()
     {
-        var serverBox = new ComboBox {
+        if (_signInDialogOpen)
+        {
+            return;
+        }
+
+        _signInDialogOpen = true;
+        SignInButton.IsEnabled = false;
+        try
+        {
+            await ShowSignInDialogCoreAsync();
+        }
+        finally
+        {
+            SignInButton.IsEnabled = true;
+            _signInDialogOpen = false;
+        }
+    }
+
+    private async Task ShowSignInDialogCoreAsync()
+    {
+        var environment = LoginEnvironment.Load();
+        var serverBox = new ComboBox
+        {
+            Name = "ServerRegion",
             Header = "服务器区域",
             HorizontalAlignment = HorizontalAlignment.Stretch,
             Items = {
@@ -115,164 +163,231 @@ public sealed partial class MainWindow : Window
                 new ComboBoxItem { Content = "Bitwarden.eu（欧盟）", Tag = 1u },
                 new ComboBoxItem { Content = "自托管 / 自定义服务器", Tag = 2u },
             },
-            SelectedIndex = 0,
+            SelectedIndex = (int)environment.Mode,
         };
-        var serverUrlBox = new TextBox {
+        var serverUrlBox = new TextBox
+        {
+            Name = "CustomServerUrl",
             Header = "服务器 URL",
             PlaceholderText = "https://vault.example.com",
-            Visibility = Visibility.Collapsed,
+            Text = environment.CustomUrl,
+            Visibility = environment.Mode == 2 ? Visibility.Visible : Visibility.Collapsed,
+        };
+        var serverHelp = new TextBlock
+        {
+            Text = "填写服务器根地址，无需添加 /api 或 /identity。HTTP 仅支持本机回环地址。",
+            TextWrapping = TextWrapping.Wrap,
+            Visibility = serverUrlBox.Visibility,
         };
         var emailBox = new TextBox { Header = "电子邮箱", PlaceholderText = "name@example.com" };
         var passwordBox = new PasswordBox { Header = "主密码", PlaceholderText = "输入 Bitwarden 主密码" };
         var providerBox = new ComboBox { Header = "二步验证方式", Visibility = Visibility.Collapsed, HorizontalAlignment = HorizontalAlignment.Stretch };
         var tokenBox = new TextBox { Header = "验证码", PlaceholderText = "输入一次性验证码", Visibility = Visibility.Collapsed };
         var sendEmailButton = new Button { Content = "发送邮箱验证码", Visibility = Visibility.Collapsed, HorizontalAlignment = HorizontalAlignment.Left };
-        var statusText = new TextBlock { TextWrapping = TextWrapping.Wrap };
-        var content = new StackPanel { Spacing = 12, MinWidth = 360 };
-        content.Children.Add(serverBox);
-        content.Children.Add(serverUrlBox);
-        content.Children.Add(emailBox);
-        content.Children.Add(passwordBox);
-        content.Children.Add(providerBox);
-        content.Children.Add(tokenBox);
-        content.Children.Add(sendEmailButton);
-        content.Children.Add(statusText);
+        var progress = new ProgressBar { IsIndeterminate = true, Visibility = Visibility.Collapsed };
+        var statusText = new TextBlock { Name = "LoginStatus", TextWrapping = TextWrapping.Wrap };
+        var content = new StackPanel { Spacing = 12, MinWidth = 320, MaxWidth = 440 };
+        foreach (var element in new UIElement[] { serverBox, serverUrlBox, serverHelp, emailBox,
+            passwordBox, providerBox, tokenBox, sendEmailButton, progress, statusText })
+        {
+            content.Children.Add(element);
+        }
 
         var dialog = new ContentDialog
         {
             Title = "登录 Bitwarden",
-            Content = content,
+            Content = new ScrollViewer { Content = content, VerticalScrollBarVisibility = ScrollBarVisibility.Auto },
             PrimaryButtonText = "登录",
             CloseButtonText = "取消",
             DefaultButton = ContentDialogButton.Primary,
             XamlRoot = AppTitleBar.XamlRoot,
         };
 
+        var busy = false;
+        var closingRequested = false;
+        var unsupportedTwoFactor = false;
+        CancellationTokenSource? requestCancellation = null;
+
+        (uint Mode, string Url) GetServerSelection()
+        {
+            var mode = serverBox.SelectedItem is ComboBoxItem item && item.Tag is uint selectedMode
+                ? selectedMode : 0u;
+            return (mode, mode == 2 ? serverUrlBox.Text.Trim() : string.Empty);
+        }
+
+        void SetBusy(bool value)
+        {
+            busy = value;
+            progress.Visibility = value ? Visibility.Visible : Visibility.Collapsed;
+            serverBox.IsEnabled = serverUrlBox.IsEnabled = !value;
+            emailBox.IsEnabled = passwordBox.IsEnabled = !value;
+            providerBox.IsEnabled = tokenBox.IsEnabled = !value;
+            sendEmailButton.IsEnabled = !value;
+            dialog.IsPrimaryButtonEnabled = !value && !unsupportedTwoFactor;
+            dialog.CloseButtonText = value ? "取消请求" : "取消";
+        }
+
+        void ResetTwoFactor()
+        {
+            if (busy) return;
+            unsupportedTwoFactor = false;
+            providerBox.Items.Clear();
+            providerBox.Visibility = tokenBox.Visibility = sendEmailButton.Visibility = Visibility.Collapsed;
+            tokenBox.Text = string.Empty;
+            statusText.Text = string.Empty;
+            dialog.IsPrimaryButtonEnabled = true;
+        }
+
+        void RequestClose()
+        {
+            if (!busy) return;
+            closingRequested = true;
+            statusText.Text = "正在取消请求…";
+            requestCancellation?.Cancel();
+        }
+
+        void FinishRequest()
+        {
+            requestCancellation?.Dispose();
+            requestCancellation = null;
+            SetBusy(false);
+            if (closingRequested) dialog.Hide();
+        }
+
+        bool Validate(string email, string password, uint serverMode, string serverUrl)
+        {
+            if (string.IsNullOrWhiteSpace(email) || string.IsNullOrEmpty(password))
+            {
+                statusText.Text = "请填写电子邮箱和主密码。";
+                if (string.IsNullOrWhiteSpace(email)) emailBox.Focus(FocusState.Programmatic);
+                else passwordBox.Focus(FocusState.Programmatic);
+                return false;
+            }
+            if (!RustCore.IsValidServer(serverMode, serverUrl))
+            {
+                statusText.Text = "服务器地址无效。请填写完整的 HTTPS 根地址，例如 https://vault.example.com。";
+                serverUrlBox.Focus(FocusState.Programmatic);
+                return false;
+            }
+            new LoginEnvironment(serverMode, serverUrlBox.Text.Trim()).Save();
+            return true;
+        }
+
         providerBox.SelectionChanged += (_, _) =>
         {
             var isEmail = providerBox.SelectedItem is ComboBoxItem item && item.Tag is uint provider && provider == 1;
             sendEmailButton.Visibility = isEmail ? Visibility.Visible : Visibility.Collapsed;
+            tokenBox.Text = string.Empty;
         };
-
         serverBox.SelectionChanged += (_, _) =>
         {
-            serverUrlBox.Visibility = serverBox.SelectedItem is ComboBoxItem item
-                && item.Tag is uint mode
-                && mode == 2
-                    ? Visibility.Visible
-                    : Visibility.Collapsed;
+            var visibility = GetServerSelection().Mode == 2 ? Visibility.Visible : Visibility.Collapsed;
+            serverUrlBox.Visibility = serverHelp.Visibility = visibility;
+            ResetTwoFactor();
+        };
+        serverUrlBox.TextChanged += (_, _) => ResetTwoFactor();
+        emailBox.TextChanged += (_, _) => ResetTwoFactor();
+        passwordBox.PasswordChanged += (_, _) => ResetTwoFactor();
+        dialog.CloseButtonClick += (_, args) =>
+        {
+            if (busy) { args.Cancel = true; RequestClose(); }
+        };
+        dialog.Closing += (_, args) =>
+        {
+            if (busy) { args.Cancel = true; RequestClose(); }
         };
 
         sendEmailButton.Click += async (_, _) =>
         {
-            var email = emailBox.Text.Trim();
-            var password = passwordBox.Password;
-            var (serverMode, serverUrl) = GetServerSelection(serverBox, serverUrlBox);
-            if (string.IsNullOrWhiteSpace(email) || string.IsNullOrEmpty(password))
-            {
-                statusText.Text = "先填写电子邮箱和主密码，再发送验证码。";
-                return;
-            }
-            if (serverMode == 2 && !IsValidCustomServerUrl(serverUrl))
-            {
-                statusText.Text = "请输入有效的服务器地址，例如 https://vault.example.com；HTTP 仅支持本机回环地址。";
-                return;
-            }
-
-            sendEmailButton.IsEnabled = false;
-            statusText.Text = "正在请求发送验证码…";
-            try
-            {
-                var sent = await Task.Run(() => RustCore.SendTwoFactorEmail(email, password, serverMode, serverUrl));
-                statusText.Text = sent ? "验证码发送请求已成功。请检查邮箱。" : "无法发送验证码。请检查账户信息、网络连接后重试。";
-            }
-            catch (Exception)
-            {
-                statusText.Text = "无法发送验证码。请检查网络连接后重试。";
-            }
-            finally
-            {
-                sendEmailButton.IsEnabled = true;
-            }
-        };
-
-        var unsupportedTwoFactor = false;
-        dialog.PrimaryButtonClick += async (_, args) =>
-        {
-            var deferral = args.GetDeferral();
-            args.Cancel = true;
-            dialog.IsPrimaryButtonEnabled = false;
+            if (busy) return;
             try
             {
                 var email = emailBox.Text.Trim();
                 var password = passwordBox.Password;
+                var (mode, url) = GetServerSelection();
+                if (!Validate(email, password, mode, url)) return;
+                requestCancellation = new CancellationTokenSource();
+                var cancellationToken = requestCancellation.Token;
+                SetBusy(true);
+                statusText.Text = "正在请求发送验证码…";
+                var result = await Task.Run(() => RustCore.SendTwoFactorEmail(email, password, mode, url, cancellationToken));
+                statusText.Text = result switch
+                {
+                    AuthStatus.Authenticated => "验证码发送请求已成功。请检查邮箱。",
+                    AuthStatus.TimedOut => "服务器响应超时，请检查服务器地址和网络连接后重试。",
+                    AuthStatus.Cancelled => "请求已取消。",
+                    _ => "无法发送验证码。请检查账户信息与网络连接后重试。",
+                };
+            }
+            catch (OperationCanceledException) { statusText.Text = "请求已取消。"; }
+            catch (Exception error) when (IsCoreUnavailable(error)) { statusText.Text = "Rust 核心未能加载，请重新构建或修复应用安装。"; }
+            finally { FinishRequest(); }
+        };
+
+        dialog.PrimaryButtonClick += async (_, args) =>
+        {
+            args.Cancel = true;
+            if (busy) return;
+            var authenticated = false;
+            try
+            {
+                var email = emailBox.Text.Trim();
+                var password = passwordBox.Password;
+                var (mode, url) = GetServerSelection();
+                if (!Validate(email, password, mode, url)) return;
                 var needsToken = tokenBox.Visibility == Visibility.Visible;
                 var token = tokenBox.Text.Trim();
-                var selectedProvider = providerBox.SelectedItem as ComboBoxItem;
-                var providerId = selectedProvider?.Tag is uint provider ? provider : 0;
-                var (serverMode, serverUrl) = GetServerSelection(serverBox, serverUrlBox);
-
-                if (string.IsNullOrWhiteSpace(email) || string.IsNullOrEmpty(password))
-                {
-                    statusText.Text = "请填写电子邮箱和主密码。";
-                    return;
-                }
-                if (serverMode == 2 && !IsValidCustomServerUrl(serverUrl))
-                {
-                    statusText.Text = "请输入有效的服务器地址，例如 https://vault.example.com；HTTP 仅支持本机回环地址。";
-                    return;
-                }
-                if (needsToken && string.IsNullOrWhiteSpace(token))
+                if (needsToken && token.Length == 0)
                 {
                     statusText.Text = "请输入二步验证码。";
+                    tokenBox.Focus(FocusState.Programmatic);
                     return;
                 }
-
-                statusText.Text = "正在通过 Bitwarden SDK 验证…";
-                var result = await Task.Run(() => RustCore.Login(email, password, providerId, token, serverMode, serverUrl));
-                if (result.Status == 1)
+                var provider = providerBox.SelectedItem is ComboBoxItem item && item.Tag is uint id ? id : 0;
+                requestCancellation = new CancellationTokenSource();
+                var cancellationToken = requestCancellation.Token;
+                SetBusy(true);
+                statusText.Text = "正在验证账户…";
+                var result = await Task.Run(() => RustCore.Login(email, password, provider,
+                    needsToken ? token : string.Empty, mode, url, cancellationToken));
+                if (result.Status == AuthStatus.Authenticated)
                 {
-                    args.Cancel = false;
+                    authenticated = true;
                     SignInButton.Content = "退出登录";
-                    if (NavFrame.Content is HomePage page)
-                    {
-                        page.ShowAuthenticated();
-                    }
+                    SyncButton.IsEnabled = true;
+                    if (NavFrame.Content is HomePage page) page.ShowAuthenticated();
                     return;
                 }
-
-                if (result.Status == 2)
+                if (result.Status == AuthStatus.TwoFactorRequired)
                 {
+                    var previousProvider = providerBox.SelectedItem is ComboBoxItem previous ? previous.Tag : null;
                     PopulateTwoFactorMethods(providerBox, result.AvailableTwoFactorMethods);
+                    foreach (var candidate in providerBox.Items.OfType<ComboBoxItem>())
+                    {
+                        if (Equals(candidate.Tag, previousProvider)) providerBox.SelectedItem = candidate;
+                    }
                     providerBox.Visibility = Visibility.Visible;
                     tokenBox.Visibility = Visibility.Visible;
-                    if (providerBox.Items.Count == 0)
-                    {
-                        unsupportedTwoFactor = true;
-                        dialog.IsPrimaryButtonEnabled = false;
-                        statusText.Text = "账户要求的二步验证方式暂不受此预览版支持。当前已接入身份验证器、邮箱验证码和 YubiKey。";
-                    }
-                    else
-                    {
-                        dialog.IsPrimaryButtonEnabled = true;
-                        statusText.Text = "请选择二步验证方式并输入验证码。";
-                    }
+                    tokenBox.Text = string.Empty;
+                    unsupportedTwoFactor = providerBox.Items.Count == 0;
+                    statusText.Text = unsupportedTwoFactor
+                        ? "此账户的二步验证方式暂不受支持。当前支持身份验证器、邮箱验证码和 YubiKey。"
+                        : "请选择二步验证方式并输入新的验证码。";
                     return;
                 }
-
-                statusText.Text = "登录失败。请检查账户信息、验证码或网络连接后重试。";
+                statusText.Text = result.Status switch
+                {
+                    AuthStatus.TimedOut => "服务器响应超时，请检查服务器地址和网络连接后重试。",
+                    AuthStatus.Cancelled => "请求已取消。",
+                    _ => "登录失败。请检查账户、主密码、验证码和服务器地址后重试。",
+                };
             }
-            catch (Exception)
-            {
-                statusText.Text = "登录暂时无法完成。请检查网络连接后重试。";
-            }
+            catch (OperationCanceledException) { statusText.Text = "请求已取消。"; }
+            catch (Exception error) when (IsCoreUnavailable(error)) { statusText.Text = "Rust 核心未能加载，请重新构建或修复应用安装。"; }
             finally
             {
-                if (args.Cancel && !unsupportedTwoFactor)
-                {
-                    dialog.IsPrimaryButtonEnabled = true;
-                }
-                deferral.Complete();
+                FinishRequest();
+                if (authenticated) dialog.Hide();
             }
         };
 
@@ -282,40 +397,23 @@ public sealed partial class MainWindow : Window
         }
         finally
         {
+            requestCancellation?.Cancel();
+            requestCancellation?.Dispose();
             passwordBox.Password = string.Empty;
             tokenBox.Text = string.Empty;
+            // Server preferences are not account credentials and can be saved without logging in.
+            var (mode, url) = GetServerSelection();
+            try
+            {
+                if (mode != 2 || RustCore.IsValidServer(mode, url))
+                    new LoginEnvironment(mode, serverUrlBox.Text.Trim()).Save();
+            }
+            catch (Exception error) when (IsCoreUnavailable(error)) { }
         }
     }
 
-    private static (uint Mode, string Url) GetServerSelection(ComboBox serverBox, TextBox serverUrlBox)
-    {
-        var mode = serverBox.SelectedItem is ComboBoxItem item && item.Tag is uint selectedMode
-            ? selectedMode
-            : 0u;
-        return (mode, mode == 2 ? serverUrlBox.Text.Trim() : string.Empty);
-    }
-
-    private static bool IsValidCustomServerUrl(string value)
-    {
-        if (!Uri.TryCreate(value.Trim(), UriKind.Absolute, out var uri)
-            || string.IsNullOrEmpty(uri.Host)
-            || !string.IsNullOrEmpty(uri.UserInfo)
-            || !string.IsNullOrEmpty(uri.Query)
-            || !string.IsNullOrEmpty(uri.Fragment))
-        {
-            return false;
-        }
-
-        var isLoopback = uri.Host.Equals("localhost", StringComparison.OrdinalIgnoreCase)
-            || IPAddress.TryParse(uri.Host, out var address) && IPAddress.IsLoopback(address);
-        if (uri.Scheme != Uri.UriSchemeHttps && !(uri.Scheme == Uri.UriSchemeHttp && isLoopback))
-        {
-            return false;
-        }
-
-        var lastSegment = uri.AbsolutePath.TrimEnd('/').Split('/').LastOrDefault();
-        return lastSegment is not ("api" or "identity");
-    }
+    private static bool IsCoreUnavailable(Exception error) =>
+        error is DllNotFoundException or EntryPointNotFoundException or BadImageFormatException;
 
     private static void PopulateTwoFactorMethods(ComboBox providerBox, uint methodMask)
     {

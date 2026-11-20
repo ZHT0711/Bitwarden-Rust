@@ -17,7 +17,7 @@
         <StackPanel Grid.Row="1" Spacing="8">
             <TextBlock Text="WinUI 3 桌面客户端原型" />
             <TextBlock Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="目标对照版本：Bitwarden Desktop 2026.11.0；本机安装版本：2026.10.4.0。" />
-            <TextBlock Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="密码登录与部分二步验证由官方 Rust SDK 处理；会话仅驻留内存，保险库同步和条目管理仍在开发中。" TextWrapping="Wrap" />
+            <TextBlock Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="密码登录、部分二步验证、保险库同步和解密由官方 Rust SDK 处理。会话仅驻留内存；条目写入、离线解锁和完整桌面功能仍在开发中。" TextWrapping="Wrap" />
         </StackPanel>
     </Grid>
 </Page>
