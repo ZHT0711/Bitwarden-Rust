@@ -25,6 +25,7 @@
                         <ComboBoxItem Content="深色" />
                     </ComboBox>
                     <TextBlock Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="此预览使用 Windows 系统 Fluent 主题。主题持久化将在后续迭代加入。" TextWrapping="Wrap" />
+                    <ToggleSwitch x:Name="WebsiteIconsToggle" Header="显示网站图标" />
                 </StackPanel>
             </Border>
             <Border Padding="20" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1" CornerRadius="8">

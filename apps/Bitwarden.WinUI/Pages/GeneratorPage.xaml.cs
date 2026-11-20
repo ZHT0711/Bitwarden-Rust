@@ -7,7 +7,8 @@ namespace Bitwarden_WinUI.Pages;
 
 public sealed partial class GeneratorPage : Page
 {
-    private DispatcherTimer? _regenerationTimer;
+    private readonly DispatcherTimer _regenerationTimer;
+    private bool _ready;
     private double _lastMinimumNumbers = 1;
     private double _lastMinimumSpecial = 1;
     private bool _updatingMinimums;
@@ -15,16 +16,17 @@ public sealed partial class GeneratorPage : Page
     public GeneratorPage()
     {
         InitializeComponent();
-        CredentialType.SelectedIndex = 0;
         _regenerationTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(150) };
         _regenerationTimer.Tick += RegenerationTimer_Tick;
-        GenerateCurrent();
+        _ready = true;
+        CredentialType.SelectedIndex = 0;
+        Loaded += (_, _) => GenerateCurrent();
         Unloaded += (_, _) => ClearSensitiveState();
     }
 
     public void ClearSensitiveState()
     {
-        _regenerationTimer?.Stop();
+        _regenerationTimer.Stop();
         GeneratedPassword.Text = string.Empty;
     }
 
@@ -41,6 +43,7 @@ public sealed partial class GeneratorPage : Page
 
     private void GenerateCurrent()
     {
+        _regenerationTimer.Stop();
         try
         {
             GeneratedPassword.Text = IsPassphraseSelected
@@ -78,9 +81,7 @@ public sealed partial class GeneratorPage : Page
 
     private void Clear_Click(object sender, RoutedEventArgs e)
     {
-        GeneratedPassword.Text = string.Empty;
-        GeneratorNotice.Title = "无法生成密码";
-        GeneratorNotice.Severity = InfoBarSeverity.Error;
+        ClearSensitiveState();
         GeneratorNotice.IsOpen = false;
     }
 
@@ -118,6 +119,7 @@ public sealed partial class GeneratorPage : Page
 
     private void CredentialType_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
+        if (!_ready) return;
         var showPassphrase = IsPassphraseSelected;
         PasswordOptions.Visibility = showPassphrase ? Visibility.Collapsed : Visibility.Visible;
         PassphraseOptions.Visibility = showPassphrase ? Visibility.Visible : Visibility.Collapsed;
@@ -128,7 +130,7 @@ public sealed partial class GeneratorPage : Page
 
     private void PasswordOption_Toggled(object sender, RoutedEventArgs e)
     {
-        if (_updatingMinimums)
+        if (!_ready || _updatingMinimums)
         {
             return;
         }
@@ -147,6 +149,7 @@ public sealed partial class GeneratorPage : Page
 
     private void PasswordOption_ValueChanged(object sender, NumberBoxValueChangedEventArgs e)
     {
+        if (!_ready) return;
         if (!_updatingMinimums && sender is NumberBox numberBox)
         {
             if (ReferenceEquals(numberBox, MinimumNumbers))
@@ -182,7 +185,7 @@ public sealed partial class GeneratorPage : Page
 
     private void ScheduleRegeneration()
     {
-        if (_regenerationTimer is null)
+        if (!_ready)
         {
             return;
         }
@@ -193,18 +196,7 @@ public sealed partial class GeneratorPage : Page
 
     private void RegenerationTimer_Tick(object? sender, object e)
     {
-        _regenerationTimer?.Stop();
         GenerateCurrent();
-    }
-
-    private void Page_Unloaded(object sender, RoutedEventArgs e)
-    {
-        if (_regenerationTimer is not null)
-        {
-            _regenerationTimer.Stop();
-            _regenerationTimer.Tick -= RegenerationTimer_Tick;
-            _regenerationTimer = null;
-        }
     }
 
     private void UpdateMinimumFromToggle(ToggleSwitch toggle, NumberBox minimum, ref double previous)

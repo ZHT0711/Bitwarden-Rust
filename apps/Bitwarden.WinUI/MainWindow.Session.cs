@@ -1,5 +1,6 @@
 using Bitwarden_WinUI.Interop;
 using Bitwarden_WinUI.Pages;
+using Bitwarden_WinUI.Controls;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 
@@ -50,6 +51,7 @@ public sealed partial class MainWindow
         SearchBox.Text = string.Empty;
         if (NavFrame.Content is HomePage vault) vault.ClearSensitiveState();
         if (NavFrame.Content is GeneratorPage generator) generator.ClearSensitiveState();
+        WebsiteIcons.ClearCache();
         ClipboardCleaner.ClearOwned();
 
         try { await Task.Run(change); }
@@ -80,7 +82,7 @@ public sealed partial class MainWindow
         var password = new PasswordBox { Header = "主密码", MinWidth = 300 };
         var status = new TextBlock { TextWrapping = TextWrapping.Wrap, MaxWidth = 360 };
         var panel = new StackPanel { Spacing = 8 };
-        panel.Children.Add(password);
+        panel.Children.Add(PasswordVisibility.WithToggle(password));
         panel.Children.Add(status);
         var dialog = new ContentDialog
         {

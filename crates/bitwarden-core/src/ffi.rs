@@ -25,6 +25,7 @@ use url::Url;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::auth_request::{self, RequestError};
+use crate::protocol_compat::{self, ResponseKind, SyncCompatibility};
 use crate::vault::{VaultCache, VaultEditorData, VaultError, VaultMutationResult};
 
 const AUTH_FAILED: u32 = 0;
@@ -51,6 +52,7 @@ static GENERATOR: OnceLock<GeneratorClient> = OnceLock::new();
 struct AuthServer {
     api_url: String,
     identity_url: String,
+    self_hosted: bool,
 }
 
 struct AuthSession {
@@ -133,9 +135,10 @@ impl reqwest_middleware::Middleware for DeviceLoginMiddleware {
         extensions: &mut http::Extensions,
         next: reqwest_middleware::Next<'_>,
     ) -> reqwest_middleware::Result<reqwest::Response> {
-        if request.url().path().ends_with("/connect/token")
-            && request.method() == reqwest::Method::POST
-        {
+        let path = request.url().path();
+        let is_token = path.ends_with("/connect/token");
+        let is_prelogin = path.ends_with("/accounts/prelogin/password");
+        if is_token && request.method() == reqwest::Method::POST {
             let otp = self
                 .pending_otp
                 .lock()
@@ -143,7 +146,14 @@ impl reqwest_middleware::Middleware for DeviceLoginMiddleware {
                 .take();
             self.rewrite_login_request(&mut request, otp.as_deref().map(String::as_str));
         }
-        next.run(request, extensions).await
+        let response = next.run(request, extensions).await?;
+        if is_token {
+            protocol_compat::normalize(response, ResponseKind::Token).await
+        } else if is_prelogin {
+            protocol_compat::normalize(response, ResponseKind::Prelogin).await
+        } else {
+            Ok(response)
+        }
     }
 }
 
@@ -187,10 +197,12 @@ fn auth_server(mode: u32, base_url: &str) -> Option<AuthServer> {
         0 => Some(AuthServer {
             api_url: "https://api.bitwarden.com".to_owned(),
             identity_url: "https://identity.bitwarden.com".to_owned(),
+            self_hosted: false,
         }),
         1 => Some(AuthServer {
             api_url: "https://api.bitwarden.eu".to_owned(),
             identity_url: "https://identity.bitwarden.eu".to_owned(),
+            self_hosted: false,
         }),
         2 => custom_auth_server(base_url),
         _ => None,
@@ -230,6 +242,7 @@ fn custom_auth_server(base_url: &str) -> Option<AuthServer> {
     Some(AuthServer {
         api_url: append_endpoint(&base_url, "api")?,
         identity_url: append_endpoint(&base_url, "identity")?,
+        self_hosted: true,
     })
 }
 
@@ -247,11 +260,17 @@ fn build_auth_client(server: &AuthServer, middleware: Arc<DeviceLoginMiddleware>
         ..ClientSettings::default()
     };
 
-    ClientBuilder::new()
+    let builder = ClientBuilder::new()
         .with_settings(settings)
         .with_token_handler(std::sync::Arc::new(PasswordManagerTokenHandler::default()))
-        .with_identity_middleware(vec![middleware])
-        .build()
+        .with_identity_middleware(vec![middleware]);
+    if server.self_hosted {
+        builder
+            .with_middleware(vec![Arc::new(SyncCompatibility)])
+            .build()
+    } else {
+        builder.build()
+    }
 }
 
 fn auth_client_for_server<'a>(

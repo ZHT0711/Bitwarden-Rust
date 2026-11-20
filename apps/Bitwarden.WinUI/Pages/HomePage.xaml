@@ -3,7 +3,8 @@
     x:Class="Bitwarden_WinUI.Pages.HomePage"
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-    xmlns:interop="using:Bitwarden_WinUI.Interop">
+    xmlns:interop="using:Bitwarden_WinUI.Interop"
+    xmlns:controls="using:Bitwarden_WinUI.Controls">
     <Grid Padding="24,8,24,24" RowSpacing="14" RowDefinitions="Auto,Auto,Auto,*">
         <Grid ColumnDefinitions="*,Auto" ColumnSpacing="12">
             <StackPanel Spacing="4">
@@ -42,12 +43,13 @@
                         HorizontalContentAlignment="Stretch">
                         <ListView.ItemTemplate>
                             <DataTemplate x:DataType="interop:VaultItem">
-                                <Grid Padding="8,10" ColumnSpacing="12" ColumnDefinitions="*,Auto">
-                                    <StackPanel Spacing="4">
+                                <Grid Padding="8,10" ColumnSpacing="12" ColumnDefinitions="Auto,*,Auto">
+                                    <controls:WebsiteIcon Host="{x:Bind WebsiteHost}" VerticalAlignment="Center" />
+                                    <StackPanel Grid.Column="1" Spacing="4">
                                         <TextBlock Text="{x:Bind DisplayName}" Style="{StaticResource BodyStrongTextBlockStyle}" TextTrimming="CharacterEllipsis" />
                                         <TextBlock Text="{x:Bind Subtitle}" Foreground="{ThemeResource TextFillColorSecondaryBrush}" TextTrimming="CharacterEllipsis" />
                                     </StackPanel>
-                                    <TextBlock Grid.Column="1" Text="{x:Bind StatusLabel}" VerticalAlignment="Center"
+                                    <TextBlock Grid.Column="2" Text="{x:Bind StatusLabel}" VerticalAlignment="Center"
                                         Style="{StaticResource CaptionTextBlockStyle}" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                                 </Grid>
                             </DataTemplate>

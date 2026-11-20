@@ -15,9 +15,9 @@
 | --- | --- | --- |
 | WinUI 外壳 | 原生 NavigationView、系统控件、Mica、列表详情 | 窄窗口、键盘、屏幕阅读器、亮 / 暗主题完整验收 |
 | 服务器 | US / EU / 自托管，根 URL 校验和选择保存 | 拆分 API / Identity URL、代理等高级设置 |
-| 登录 | 官方 SDK 主密码、认证器 / 二步邮箱 / YubiKey；自托管新设备邮箱验证、验证码重发与登录重试；可取消、超时 | 真实 US / EU / 自托管账户；SSO、Duo、WebAuthn、设备批准、API 密钥、多账户、V2 账户登录 |
+| 登录 | 官方 SDK 主密码、认证器 / 二步邮箱 / YubiKey；自托管新设备邮箱验证、验证码重发与登录重试；兼容 NodeWarden 新旧响应字段，可取消、超时 | 云端各地区和用户 NodeWarden 实例验收；SSO、Duo、WebAuthn、设备批准、API 密钥、多账户、V2 账户登录 |
 | 同步与解密 | 官方 API、组织密钥初始化、密文内存缓存、SDK 严格解密、失败计数；本机 Vaultwarden 1.37.5 已验证登录后同步和新增条目 | 用户实例、云端与组织账户；密钥轮换、通知增量同步、断网恢复、撤销登录、集合权限、大库性能 |
-| 列表与读取 | 八种 SDK 类型、收藏 / 归档 / 回收站、文件夹、名称 / 副标题搜索、按需详情 | 八类真实数据、嵌套文件夹 / 集合、搜索语法、排序、批量选择、密码历史、关联字段 |
+| 列表与读取 | 八种 SDK 类型、收藏 / 归档 / 回收站、文件夹、名称 / 副标题搜索、按需详情、密码显隐和可关闭的网站图标 | 八类真实数据、V2 图标、嵌套文件夹 / 集合、搜索语法、排序、批量选择、密码历史、关联字段 |
 | 访问边界 | Rust 主密码复验、隐藏密码权限、详情 DTO 排除保险库密钥与 FIDO2 私密材料 | V2 复验、组织访问申请 / 审批、全部权限组合与策略 |
 | 剪贴板 | 禁止历史 / 云同步、30 秒归属清理、退出清理 | 系统忙、多应用覆盖、退出时序的实际 UI 验证；设置可配置 |
 | 生成器 | 官方密码 / 密码短语生成 | 用户名 / 转发服务、历史与设置持久化 |
@@ -47,6 +47,8 @@
 - 将 SDK 的 Identity middleware 扩展放在仓库内固定 SDK core 副本中。WinUI x64 构建通过；新设备验证协议已在合成服务器上通过真实 DLL 验证。还没有用用户的自托管实例进行端到端确认。
 - 锁定与解锁增加了真实 DLL 生命周期检查，覆盖错误主密码、锁定时拒绝读写、离线恢复已确认的编辑、组织密钥恢复、写入结果待核对及服务器更换密钥后的重新登录。另用 `winapp ui` 验证了锁定后清除条目、停止合成服务器后解锁和锁定状态下退出登录。
 - 在本机 Vaultwarden 1.37.5 复现了登录成功后首次同步返回 `internal`。同步资料包含 `accountKeys` 时，旧实现会调用依赖状态桥的 SDK 同步处理器。原生客户端目前使用进程内状态，已按 SDK 状态桥的注册状态调用处理器，并继续校验账户密钥资料。修复后用同一个合成账户同步、创建条目并再次同步成功。CI 模拟的同步资料也加入了 `accountKeys`。对照了 [官方桌面共享同步实现](https://github.com/bitwarden/clients/blob/desktop-v2026.11.0/libs/common/src/platform/sync/default-sync.service.ts) 和 [Vaultwarden 1.37.5 同步实现](https://github.com/dani-garcia/vaultwarden/blob/1.37.5/src/api/core/ciphers.rs)。
+- NodeWarden 的公开预登录响应同时返回两套字段名，旧的 SDK 兼容层会拒绝解析。回归测试加入两套预登录参数、令牌解锁参数和同步资料，并覆盖值为 `null` 的认证器挑战。自托管联机验收仍需用户账户确认。对照了 [NodeWarden 身份验证实现](https://github.com/shuaiplus/NodeWarden/blob/main/src/handlers/identity.ts) 和 [同步实现](https://github.com/shuaiplus/NodeWarden/blob/main/src/handlers/sync.ts)。
+- 修复生成器初始化时控件尚未就绪导致的崩溃，WinUI 界面验证密码重新生成及六词密码短语。
 
 ## 后续顺序
 

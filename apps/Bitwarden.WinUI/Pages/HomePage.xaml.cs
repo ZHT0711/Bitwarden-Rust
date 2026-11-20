@@ -1,4 +1,5 @@
 using Bitwarden_WinUI.Interop;
+using Bitwarden_WinUI.Controls;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Navigation;
@@ -78,7 +79,8 @@ public sealed partial class HomePage : Page
         VaultList.ItemsSource = null;
         foreach (var field in DetailPanel.Children.OfType<StackPanel>())
         {
-            foreach (var box in field.Children.OfType<PasswordBox>()) box.Password = string.Empty;
+            foreach (var box in field.Children.OfType<Grid>().SelectMany(row => row.Children.OfType<PasswordBox>()))
+                box.Password = string.Empty;
             foreach (var box in field.Children.OfType<TextBox>()) box.Text = string.Empty;
         }
         DetailPanel.Children.Clear();
@@ -215,7 +217,7 @@ public sealed partial class HomePage : Page
         {
             var panel = new StackPanel { Spacing = 6 };
             panel.Children.Add(new TextBlock { Text = field.Label, Style = (Style)Application.Current.Resources["BodyStrongTextBlockStyle"] });
-            if (field.Sensitive) panel.Children.Add(new PasswordBox { Password = field.Value, PasswordRevealMode = PasswordRevealMode.Peek });
+            if (field.Sensitive) panel.Children.Add(PasswordVisibility.WithToggle(new PasswordBox { Password = field.Value }));
             else panel.Children.Add(new TextBox { Text = field.Value, IsReadOnly = true, TextWrapping = TextWrapping.Wrap, AcceptsReturn = true });
             var copy = new Button { Content = "复制", HorizontalAlignment = HorizontalAlignment.Left };
             Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(copy, $"复制{field.Label}");

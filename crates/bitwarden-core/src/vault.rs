@@ -13,7 +13,7 @@ use repository::CipherRepository;
 use bitwarden_api_api::models::SyncResponseModel;
 use bitwarden_crypto::UnsignedSharedKey;
 use bitwarden_crypto_sync_handler::{CryptoSyncData, CryptoSyncHandlerClientExt};
-use bitwarden_vault::{Cipher, CipherView, Folder, VaultClientExt};
+use bitwarden_vault::{Cipher, CipherListViewType, CipherView, Folder, VaultClientExt};
 use bw_sdk_core::{
     auth::login::PasswordLoginUnlockData,
     key_management::account_cryptographic_state::WrappedAccountCryptographicState, Client,
@@ -74,6 +74,7 @@ pub(crate) struct VaultItem {
     reprompt: bool,
     restricted: bool,
     revision_date: String,
+    website_host: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -301,6 +302,9 @@ impl VaultCache {
             for item in &mut overview.items {
                 item.name.zeroize();
                 item.subtitle.zeroize();
+                if let Some(host) = item.website_host.as_mut() {
+                    host.zeroize();
+                }
             }
             for folder in &mut overview.folders {
                 folder.name.zeroize();
@@ -338,9 +342,22 @@ impl VaultCache {
             .map_err(|_| VaultError::DecryptionFailed)?;
         let failures = result.failures.len();
         let mut items = Vec::new();
+        let allow_legacy_icon_uris = client.internal.get_security_version()
+            < bw_sdk_core::key_management::MINIMUM_ENFORCE_ICON_URI_HASH_VERSION;
         for view in result.successes {
             let Some(id) = view.id else {
                 continue;
+            };
+            let website_host = match &view.r#type {
+                CipherListViewType::Login(login) if !view.partial && allow_legacy_icon_uris => {
+                    login
+                        .uris
+                        .iter()
+                        .flatten()
+                        .filter_map(|uri| uri.uri.as_deref())
+                        .find_map(website_host)
+                }
+                _ => None,
             };
             items.push(VaultItem {
                 id: id.to_string(),
@@ -355,6 +372,7 @@ impl VaultCache {
                 reprompt: view.reprompt as u8 != 0,
                 restricted: view.partial,
                 revision_date: view.revision_date.to_rfc3339(),
+                website_host,
             });
         }
         items.sort_by_cached_key(|item| item.name.to_lowercase());
@@ -432,6 +450,40 @@ impl VaultCache {
             .map_err(|_| VaultError::DecryptionFailed)?;
         Ok(display_detail(view))
     }
+}
+
+fn website_host(value: &str) -> Option<String> {
+    let value = value.trim();
+    let url = if value.contains("://") {
+        url::Url::parse(value).ok()?
+    } else {
+        url::Url::parse(&format!("https://{value}")).ok()?
+    };
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return None;
+    }
+    let url::Host::Domain(host) = url.host()? else {
+        return None;
+    };
+    let host = host.trim_end_matches('.');
+    let (name, suffix) = host.rsplit_once('.')?;
+    (!name.is_empty()
+        && !matches!(
+            suffix,
+            "onion"
+                | "i2p"
+                | "local"
+                | "localhost"
+                | "internal"
+                | "lan"
+                | "test"
+                | "invalid"
+                | "example"
+        ))
+    .then(|| host.to_owned())
 }
 
 fn display_detail(view: CipherView) -> VaultDetail {
@@ -856,7 +908,10 @@ mod tests {
         let output =
             std::env::var("BITWARDEN_FIXTURE_OUTPUT").expect("set an explicit fixture output path");
         let client = Client::init_test_account(test_bitwarden_com_account()).await;
-        let mut response = response_for(&client, test_view()).await;
+        let mut icon_item = test_view();
+        icon_item.login.as_mut().unwrap().uris.as_mut().unwrap()[0].uri =
+            Some("https://example.com/synthetic-icon-fixture".to_owned());
+        let mut response = response_for(&client, icon_item).await;
         let mut guarded = test_view();
         guarded.name = "Synthetic protected item".to_owned();
         guarded.reprompt = bitwarden_vault::CipherRepromptType::Password;

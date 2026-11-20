@@ -2,6 +2,7 @@ mod auth_request;
 mod crypto;
 mod ffi;
 mod model;
+mod protocol_compat;
 mod storage;
 mod vault;
 

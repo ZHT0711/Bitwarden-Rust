@@ -1,4 +1,5 @@
 using Bitwarden_WinUI.Interop;
+using Bitwarden_WinUI.Controls;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Automation;
 using Microsoft.UI.Xaml.Controls;
@@ -258,7 +259,7 @@ internal sealed class VaultEditorDialog
                 Element = _text; return;
             }
             _password = new PasswordBox { Header = label, Password = value, PasswordRevealMode = PasswordRevealMode.Peek };
-            if (!multiline) { Element = _password; return; }
+            if (!multiline) { Element = PasswordVisibility.WithToggle(_password); return; }
             var panel = new StackPanel { Spacing = 6 };
             _text = new TextBox { Header = label, AcceptsReturn = true, TextWrapping = TextWrapping.Wrap, MinHeight = 120, MaxHeight = 260, Visibility = Visibility.Collapsed };
             _reveal = new ToggleSwitch { Header = $"明文编辑{label}", IsOn = false, OnContent = "显示", OffContent = "隐藏" };

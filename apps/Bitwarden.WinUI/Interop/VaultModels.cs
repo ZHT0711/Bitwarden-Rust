@@ -3,7 +3,8 @@ namespace Bitwarden_WinUI.Interop;
 internal sealed record VaultOverview(VaultItem[] Items, VaultFolder[] Folders, DateTimeOffset LastSync, int Failures);
 internal sealed record VaultFolder(string Id, string Name);
 public sealed record VaultItem(string Id, string Name, string Subtitle, int ItemType, bool Favorite,
-    string? FolderId, string? OrganizationId, bool Deleted, bool Archived, bool Reprompt, bool Restricted, string RevisionDate = "")
+    string? FolderId, string? OrganizationId, bool Deleted, bool Archived, bool Reprompt, bool Restricted, string RevisionDate = "",
+    string? WebsiteHost = null)
 {
     public string DisplayName => string.IsNullOrEmpty(Name) ? "（未命名条目）" : Name;
     public override string ToString() => DisplayName;

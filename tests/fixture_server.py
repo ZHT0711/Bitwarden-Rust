@@ -134,8 +134,25 @@ class FixtureState:
         self.initial = checked_fixture(fixture)
         # Modern Bitwarden and Vaultwarden include wrapped account keys in the sync profile.
         self.initial["profile"]["accountKeys"] = {
-            "publicKeyEncryptionKeyPair": {"wrappedPrivateKey": private_key},
+            "publicKeyEncryptionKeyPair": {
+                "wrappedPrivateKey": private_key,
+                "object": "publicKeyEncryptionKeyPair",
+                "Object": "publicKeyEncryptionKeyPair",
+            },
             "object": "privateKeys",
+            "Object": "privateKeys",
+        }
+        self.initial["userDecryption"] = {"masterPasswordUnlock": {
+            "kdf": {"kdfType": 0, "iterations": 600000},
+            "salt": PUBLIC_EMAIL, "masterKeyEncryptedUserKey": PUBLIC_WRAPPED_USER_KEY,
+        }}
+        self.initial["UserDecryption"] = {
+            "MasterPasswordUnlock": {
+                "Kdf": {"KdfType": 0, "Iterations": 600000},
+                "Salt": PUBLIC_EMAIL, "MasterKeyEncryptedUserKey": PUBLIC_WRAPPED_USER_KEY,
+            },
+            "WebAuthnPrfOptions": [],
+            "UserKeyId": None,
         }
         self._last_revision = dt.datetime(1970, 1, 1, tzinfo=UTC)
         self.token = _encode({"alg": "fixture-only"}) + "." + _encode({
@@ -153,6 +170,8 @@ class FixtureState:
                 "salt": PUBLIC_EMAIL, "masterKeyEncryptedUserKey": PUBLIC_WRAPPED_USER_KEY,
             }},
         }
+        # NodeWarden emits the same decryption options under both spellings.
+        self.identity["UserDecryptionOptions"] = copy.deepcopy(self.identity["userDecryptionOptions"])
         self.require_new_device_verification = False
         self.new_device_otp = "246810"
         self.challenged_device_identifier = None
@@ -171,6 +190,7 @@ class FixtureState:
             self.drop_next_create_response = False
             self.fail_next_sync = False
             self.require_new_device_verification = False
+            self.require_authenticator = False
             self.challenged_device_identifier = None
 
     def revision(self) -> str:
@@ -304,6 +324,14 @@ class FixtureHandler(BaseHTTPRequestHandler):
         if path == "/health":
             self.reply({"fixture": True})
             return
+        if path == "/icons/example.com/icon.png":
+            icon = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAIAAABvFaqvAAAAKklEQVR4nGMwD2ukCmIYNYh8g170OkIQHpFRg0YNGjVoOBpEKho1iDACAE0Rlr98kVxNAAAAAElFTkSuQmCC")
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(icon)))
+            self.end_headers()
+            self.wfile.write(icon)
+            return
         if path == "/control/snapshot":
             with state.lock:
                 self.reply({"cipherCount": len(state.ciphers), "ids": sorted(state.ciphers)})
@@ -336,7 +364,10 @@ class FixtureHandler(BaseHTTPRequestHandler):
                 if str(value.get("email", "")).strip().lower() != PUBLIC_EMAIL:
                     self.fail("Only the public synthetic account is accepted.", 403)
                 else:
-                    self.reply({"kdf": 0, "kdfIterations": 600000})
+                    self.reply({"kdf": 0, "kdfIterations": 600000,
+                                "kdfSettings": {"kdfType": 0, "iterations": 600000, "memory": None, "parallelism": None},
+                                "KdfSettings": {"KdfType": 0, "Iterations": 600000, "Memory": None, "Parallelism": None},
+                                "salt": None, "Salt": PUBLIC_EMAIL})
             return
         if path == "/identity/connect/token":
             try:
@@ -363,6 +394,13 @@ class FixtureHandler(BaseHTTPRequestHandler):
                                     "ErrorModel": {"Message": "invalid new device otp", "Object": "error"}}, 400)
                         return
                     state.require_new_device_verification = False
+                if grant == "password" and state.require_authenticator:
+                    provider = form.get("twoFactorProvider", [""])[0]
+                    token = form.get("twoFactorToken", [""])[0]
+                    if provider != "0" or token != "287349":
+                        self.reply({"error": "invalid_grant", "error_description": "Two factor required.",
+                                    "TwoFactorProviders2": {"0": None}}, 400)
+                        return
                 self.reply(state.identity)
             else:
                 self.fail("Only the public synthetic account is accepted.", 403)
@@ -383,6 +421,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
             "/control/conflict-next-write": "conflict_next_write",
             "/control/drop-next-write-response": "drop_next_create_response",
             "/control/fail-next-sync": "fail_next_sync",
+            "/control/require-authenticator": "require_authenticator",
         }
         if path in controls:
             with state.lock:
@@ -397,7 +436,10 @@ class FixtureHandler(BaseHTTPRequestHandler):
         if path == "/control/change-master-password-wrapper":
             with state.lock:
                 # Change the wrapped key reported by sync while keeping the same fixture ciphers.
-                state.sync_template["profile"]["key"] = PUBLIC_WRAPPED_USER_KEY[:-2] + "A="
+                wrapper = PUBLIC_WRAPPED_USER_KEY[:-2] + "A="
+                state.sync_template["profile"]["key"] = wrapper
+                state.sync_template["userDecryption"]["masterPasswordUnlock"]["masterKeyEncryptedUserKey"] = wrapper
+                state.sync_template["UserDecryption"]["MasterPasswordUnlock"]["MasterKeyEncryptedUserKey"] = wrapper
             self.reply({"ok": True})
             return
         if path == "/control/reset":

@@ -6,6 +6,7 @@ using System.Net;
 using System.Threading.Tasks;
 using Bitwarden_WinUI.Interop;
 using Bitwarden_WinUI.Pages;
+using Bitwarden_WinUI.Controls;
 
 namespace Bitwarden_WinUI;
 
@@ -27,6 +28,7 @@ public sealed partial class MainWindow : Window
             _unlockRequest?.Cancel();
             if (NavFrame.Content is HomePage page) page.ClearSensitiveState();
             if (NavFrame.Content is GeneratorPage generator) generator.ClearSensitiveState();
+            WebsiteIcons.ClearCache();
             ClipboardCleaner.ClearOwned();
             try { RustCore.Logout(); } catch (Exception error) when (IsCoreUnavailable(error)) { }
         };
@@ -195,7 +197,7 @@ public sealed partial class MainWindow : Window
         var statusText = new TextBlock { Name = "LoginStatus", TextWrapping = TextWrapping.Wrap };
         var content = new StackPanel { Spacing = 12, MinWidth = 320, MaxWidth = 440 };
         foreach (var element in new UIElement[] { serverBox, serverUrlBox, serverHelp, emailBox,
-            passwordBox, deviceOtpBox, resendDeviceOtpButton, providerBox, tokenBox, sendEmailButton, progress, statusText })
+            PasswordVisibility.WithToggle(passwordBox), deviceOtpBox, resendDeviceOtpButton, providerBox, tokenBox, sendEmailButton, progress, statusText })
         {
             content.Children.Add(element);
         }
@@ -405,6 +407,7 @@ public sealed partial class MainWindow : Window
                     deviceVerificationRequired = false;
                     pendingDeviceOtp = string.Empty;
                     if (_closed) return;
+                    WebsiteIcons.SetServer(mode, url);
                     UpdateSessionControls(VaultSessionState.Unlocked);
                     if (NavFrame.Content is HomePage page) page.ShowAuthenticated();
                     return;

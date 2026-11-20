@@ -25,8 +25,12 @@ internal static class NativeLifecycle
             check(resend == AuthStatus.Authenticated, "native client resends new-device code with SDK-derived master-password hash");
             var invalidCode = RustCore.Login("test@bitwarden.com", FixturePassword, 0, string.Empty, "000000", 2, address, deviceIdentifier);
             check(invalidCode.Status == AuthStatus.InvalidNewDeviceVerificationCode, $"invalid new-device code remains distinct from invalid credentials ({invalidCode.Status})");
-            var login = await Task.Run(() => RustCore.Login("test@bitwarden.com", FixturePassword, 0, string.Empty, "246810", 2, address, deviceIdentifier));
-            check(login.Status == AuthStatus.Authenticated, "real DLL logs into loopback public SDK fixture");
+            await Control("require-authenticator");
+            var secondFactor = RustCore.Login("test@bitwarden.com", FixturePassword, 0, string.Empty, "246810", 2, address, deviceIdentifier);
+            check(secondFactor.Status == AuthStatus.TwoFactorRequired && (secondFactor.AvailableTwoFactorMethods & 1) != 0,
+                "NodeWarden null authenticator challenge keeps its verification method");
+            var login = await Task.Run(() => RustCore.Login("test@bitwarden.com", FixturePassword, 0, "287349", "246810", 2, address, deviceIdentifier));
+            check(login.Status == AuthStatus.Authenticated, "real DLL handles equivalent NodeWarden casing aliases during prelogin and token exchange");
             check(RustCore.Lock() && RustCore.SessionState == VaultSessionState.Locked, "account can lock before its first sync");
             RustCore.Unlock(FixturePassword, CancellationToken.None);
             ExpectCode(() => RustCore.GetVaultOverview(), "notFound", "unlock before first sync leaves the unsynced vault empty");
@@ -34,11 +38,13 @@ internal static class NativeLifecycle
             check(initial.Items.Length == 2, "real DLL syncs a profile with wrapped account keys without a host state bridge");
             var draft = new VaultEditorData(null, "ABI synthetic login", 1, null, false, true, null, "synthetic notes",
                 new() { ["username"] = "abi-user", ["password"] = "synthetic-abi-secret", ["totp"] = "SYNTHETIC-TOTP" },
-                [new("https://example.invalid/abi", 3)], [new("fixture field", "synthetic hidden value", 1, null)],
+                [new("https://example.com/abi?fixture=synthetic", 3)], [new("fixture field", "synthetic hidden value", 1, null)],
                 true, false, false, false, false);
             var created = RustCore.CreateVaultItem(draft, CancellationToken.None);
             var id = created.Id ?? throw new Exception("Create returned no id.");
             check(created.Overview.Items.Any(item => item.Id == id && item.Name == draft.Name), "create returns server-confirmed list metadata");
+            check(created.Overview.Items.Single(item => item.Id == id).WebsiteHost == "example.com",
+                "icon projection exposes only the validated hostname");
             ExpectCode(() => RustCore.GetVaultEditor(id, string.Empty, CancellationToken.None), "passwordRequired", "editor reprompt enforced through ABI");
             var editor = RustCore.GetVaultEditor(id, FixturePassword, CancellationToken.None);
             check(editor.Values["password"] == "synthetic-abi-secret" && editor.Uris.Single().Match == 3, "SDK-decrypted editor values and URI mode survive ABI");

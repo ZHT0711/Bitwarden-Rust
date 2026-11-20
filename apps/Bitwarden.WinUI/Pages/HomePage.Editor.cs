@@ -1,4 +1,5 @@
 using Bitwarden_WinUI.Interop;
+using Bitwarden_WinUI.Controls;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 
@@ -184,7 +185,7 @@ public sealed partial class HomePage
     private async Task<string?> PromptMasterPasswordAsync()
     {
         var password = new PasswordBox { Header = "主密码" };
-        _actionDialog = new ContentDialog { XamlRoot = XamlRoot, Title = "验证主密码", Content = password,
+        _actionDialog = new ContentDialog { XamlRoot = XamlRoot, Title = "验证主密码", Content = PasswordVisibility.WithToggle(password),
             PrimaryButtonText = "继续", CloseButtonText = "取消", DefaultButton = ContentDialogButton.Primary };
         try { return await _actionDialog.ShowAsync() == ContentDialogResult.Primary ? password.Password : null; }
         finally { password.Password = string.Empty; _actionDialog = null; }
