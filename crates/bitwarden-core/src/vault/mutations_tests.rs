@@ -17,6 +17,228 @@ use serde_json::{json, Value};
 use super::*;
 
 const ORIGINAL_REVISION: &str = "2026-11-20T01:02:03.456Z";
+
+fn registration_request() -> crate::vault::passkeys::PasskeyOperation {
+    crate::vault::passkeys::PasskeyOperation {
+        creating: true,
+        rp_id: "passkeys.example.invalid".to_owned(),
+        user_name: Some("synthetic-passkey-user".to_owned()),
+        user_display_name: Some("Synthetic user".to_owned()),
+        user_handle: vec![42; 16],
+        client_data_hash: vec![17; 32],
+        credential_ids: vec![],
+        algorithms: vec![-7],
+    }
+}
+
+#[tokio::test]
+async fn passkey_creation_requires_a_confirmed_persisted_private_key() {
+    for lose_ack in [true, false] {
+        let client = Client::init_test_account_with_api_client(
+            test_bitwarden_com_account(),
+            ApiClient::new_mocked(move |mock| {
+                mock.ciphers_api
+                    .expect_post()
+                    .times(1)
+                    .returning(move |request| {
+                        if lose_ack {
+                            return Err(api_failure(503, "Synthetic unconfirmed write"));
+                        }
+                        let mut response =
+                            response_for_request(request.unwrap(), uuid::Uuid::new_v4());
+                        response.login.as_mut().unwrap().fido2_credentials = None;
+                        Ok(response)
+                    });
+            }),
+        )
+        .await;
+        let mut cache = seeded_cache(&client, vec![], false).await;
+        let op = registration_request();
+        assert!(matches!(
+            cache.perform_passkey(&client, &op, "", "", 0, "").await,
+            Err(VaultError::WriteUncertain)
+        ));
+        assert!(cache.needs_reconciliation());
+        assert!(matches!(
+            cache.perform_passkey(&client, &op, "", "", 0, "").await,
+            Err(VaultError::NotSynced)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn passkey_registration_persists_encrypted_key_then_signs_bound_assertions() {
+    use crate::vault::passkeys::PasskeyResult;
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use p256::{
+        ecdsa::{signature::Verifier, Signature, VerifyingKey},
+        pkcs8::DecodePrivateKey,
+        SecretKey,
+    };
+    use sha2::{Digest, Sha256};
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let capture = sent.clone();
+    let client = Client::init_test_account_with_api_client(
+        test_bitwarden_com_account(),
+        ApiClient::new_mocked(move |mock| {
+            let capture = capture.clone();
+            mock.ciphers_api
+                .expect_post()
+                .times(1)
+                .returning(move |request| {
+                    let request = request.unwrap();
+                    capture
+                        .lock()
+                        .unwrap()
+                        .push(serde_json::to_value(&request).unwrap());
+                    Ok(response_for_request(request, uuid::Uuid::new_v4()))
+                });
+        }),
+    )
+    .await;
+    let mut cache = seeded_cache(&client, vec![], false).await;
+    let op = registration_request();
+    let result = cache
+        .perform_passkey(&client, &op, "", "", 0, "")
+        .await
+        .unwrap();
+    let PasskeyResult::Created {
+        authenticator_data,
+        credential_id,
+    } = result
+    else {
+        panic!("expected registration")
+    };
+    assert_eq!(
+        &authenticator_data[..32],
+        &Sha256::digest(op.rp_id.as_bytes())[..]
+    );
+    assert_eq!(authenticator_data[32] & 5, 5);
+    let choices = cache
+        .passkey_choices(
+            &client,
+            &crate::vault::passkeys::PasskeyOperation {
+                creating: false,
+                ..op.clone()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(choices.len(), 1);
+    let choice = &choices[0];
+    let cipher = cache.find_cipher(&choice.id).unwrap();
+    let view = client.vault().ciphers().decrypt(cipher).await.unwrap();
+    let stored = view.get_fido2_credentials().remove(0);
+    assert_eq!(
+        bitwarden_fido::string_to_guid_bytes(&stored.credential_id).unwrap(),
+        credential_id
+    );
+    let key_bytes = URL_SAFE_NO_PAD.decode(&stored.key_value).unwrap();
+    let secret = SecretKey::from_pkcs8_der(&key_bytes).unwrap();
+    let key = VerifyingKey::from(secret.public_key());
+    assert!(!sent.lock().unwrap()[0]
+        .to_string()
+        .contains(&stored.key_value));
+    assert!(!sent.lock().unwrap()[0]
+        .to_string()
+        .contains("synthetic-passkey-user"));
+    let assertion = crate::vault::passkeys::PasskeyOperation {
+        creating: false,
+        credential_ids: vec![credential_id.clone()],
+        client_data_hash: vec![23; 32],
+        ..op.clone()
+    };
+    let result = cache
+        .perform_passkey(&client, &assertion, &choice.id, &choice.revision, 0, "")
+        .await
+        .unwrap();
+    let PasskeyResult::Assertion {
+        credential_id: returned_id,
+        authenticator_data,
+        signature,
+        user_handle,
+    } = result
+    else {
+        panic!("expected assertion")
+    };
+    assert_eq!(returned_id, credential_id);
+    assert_eq!(user_handle, op.user_handle);
+    assert_eq!(authenticator_data[32] & 5, 5);
+    let mut signed = authenticator_data;
+    signed.extend(&assertion.client_data_hash);
+    key.verify(&signed, &Signature::from_der(&signature).unwrap())
+        .unwrap();
+    signed.push(0);
+    assert!(key
+        .verify(&signed, &Signature::from_der(&signature).unwrap())
+        .is_err());
+    let wrong_rp = crate::vault::passkeys::PasskeyOperation {
+        rp_id: "other.example.invalid".to_owned(),
+        ..assertion.clone()
+    };
+    assert!(cache
+        .passkey_choices(&client, &wrong_rp)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(cache
+        .perform_passkey(&client, &wrong_rp, &choice.id, &choice.revision, 0, "")
+        .await
+        .is_err());
+    let excluded = crate::vault::passkeys::PasskeyOperation {
+        credential_ids: vec![credential_id],
+        ..op
+    };
+    assert!(cache
+        .perform_passkey(&client, &excluded, "", "", 0, "")
+        .await
+        .is_err());
+    assert_eq!(cache.overview().unwrap().items.len(), 1);
+}
+
+#[tokio::test]
+async fn passkey_registration_into_existing_login_preserves_secrets_and_checks_revision() {
+    let client = Client::init_test_account_with_api_client(
+        test_bitwarden_com_account(),
+        ApiClient::new_mocked(|mock| {
+            mock.ciphers_api
+                .expect_put()
+                .times(1)
+                .returning(|id, request| Ok(response_for_request(request.unwrap(), id)));
+        }),
+    )
+    .await;
+    let original = seed_view();
+    let id = original.id.unwrap().to_string();
+    let mut cache = seeded_cache(&client, vec![original], false).await;
+    let op = registration_request();
+    assert!(matches!(
+        cache
+            .perform_passkey(&client, &op, &id, "2026-11-19T00:00:00Z", 0, "")
+            .await,
+        Err(VaultError::Conflict)
+    ));
+    cache
+        .perform_passkey(&client, &op, &id, ORIGINAL_REVISION, 0, "")
+        .await
+        .unwrap();
+    let view = client
+        .vault()
+        .ciphers()
+        .decrypt(cache.find_cipher(&id).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(view.notes.as_deref(), Some("original synthetic notes"));
+    let login = view.login.as_ref().unwrap();
+    assert_eq!(login.password.as_deref(), Some("original-secret"));
+    assert_eq!(login.totp.as_deref(), Some("SYNTHETIC-TOTP"));
+    assert_eq!(view.get_fido2_credentials().len(), 1);
+    assert!(cache
+        .passkey_choices(&client, &op)
+        .await
+        .unwrap()
+        .is_empty());
+}
 const NEXT_REVISION: &str = "2026-11-20T01:03:04.789Z";
 const FIXTURE_ORG: &str = "1bc9ac1e-f5aa-45f2-94bf-b181009709b8";
 // Public, synthetic SDK fixture ciphertext, not a real user's key.

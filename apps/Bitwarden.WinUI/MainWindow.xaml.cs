@@ -22,9 +22,13 @@ public sealed partial class MainWindow : Window
         AppWindow.SetIcon("Assets/AppIcon.ico");
         NavFrame.Navigated += NavFrame_Navigated;
         NavFrame.Navigate(typeof(HomePage), "vault");
+        StartPasskeyProvider();
+        Activated += (_, _) => { if (NavFrame.Content is SettingsPage settings) settings.RefreshPasskeyStatus(); };
         Closed += (_, _) =>
         {
             _closed = true;
+            _passkeyTimer?.Stop();
+            _passkeyDialog?.Hide();
             _unlockRequest?.Cancel();
             if (NavFrame.Content is HomePage page) page.ClearSensitiveState();
             if (NavFrame.Content is GeneratorPage generator) generator.ClearSensitiveState();

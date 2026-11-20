@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "crates/bitwarden-core",
 ]
-exclude = ["vendor/sdk-internal"]
+exclude = ["vendor/sdk-internal", "vendor/win_webauthn"]
 
 [workspace.package]
 version = "0.2.0"
@@ -16,6 +16,7 @@ async-trait = "0.1"
 argon2 = "0.5"
 base64 = "0.22"
 bitwarden-generators = { git = "https://github.com/bitwarden/sdk-internal", rev = "56c7617b23501af70221094cdee59e10b2a9d8d2" }
+bitwarden-fido = { git = "https://github.com/bitwarden/sdk-internal", rev = "56c7617b23501af70221094cdee59e10b2a9d8d2" }
 bitwarden-auth = { git = "https://github.com/bitwarden/sdk-internal", rev = "56c7617b23501af70221094cdee59e10b2a9d8d2" }
 bitwarden-api-api = { git = "https://github.com/bitwarden/sdk-internal", rev = "56c7617b23501af70221094cdee59e10b2a9d8d2" }
 bitwarden-vault = { git = "https://github.com/bitwarden/sdk-internal", rev = "56c7617b23501af70221094cdee59e10b2a9d8d2" }

@@ -24,6 +24,9 @@ use bw_sdk_core::{
 use url::Url;
 use zeroize::{Zeroize, Zeroizing};
 
+#[cfg(windows)]
+mod passkeys;
+
 use crate::auth_request::{self, RequestError};
 use crate::protocol_compat::{self, ResponseKind, SyncCompatibility};
 use crate::vault::{VaultCache, VaultEditorData, VaultError, VaultMutationResult, VaultTotp};
@@ -783,6 +786,8 @@ pub extern "C" fn bw_auth_session_state() -> u8 {
 
 #[no_mangle]
 pub extern "C" fn bw_auth_logout() {
+    #[cfg(windows)]
+    crate::passkey_provider::cancel("");
     // Wake an in-flight network operation before waiting for its session guard.
     auth_request::begin();
     let mut session = auth_client()
@@ -792,10 +797,14 @@ pub extern "C" fn bw_auth_logout() {
         active.clear_vault_keys();
     }
     SESSION_STATE.store(SESSION_SIGNED_OUT, Ordering::Release);
+    #[cfg(windows)]
+    crate::passkey_provider::clear_metadata();
 }
 
 #[no_mangle]
 pub extern "C" fn bw_auth_lock() -> u8 {
+    #[cfg(windows)]
+    crate::passkey_provider::cancel("");
     catch_unwind(AssertUnwindSafe(|| {
         auth_request::begin();
         let mut guard = auth_client()
@@ -931,6 +940,11 @@ pub extern "C" fn bw_vault_sync(request_id: u64) -> *mut c_char {
             Ok(Ok(cache)) if auth_request::is_current(request_id) => {
                 cache.activate(&session.client);
                 session.vault = cache;
+                #[cfg(windows)]
+                runtime.block_on(crate::passkey_provider::sync_metadata(
+                    &session.vault,
+                    &session.client,
+                ));
                 vault_success(
                     session
                         .vault
@@ -1129,7 +1143,14 @@ fn perform_vault_write(command: VaultWriteCommand, request_id: u64) -> *mut c_ch
         }));
         match result {
             // An acknowledged success is authoritative even if cancellation races its return.
-            Ok(Ok(Ok(result))) => vault_write_success(&result),
+            Ok(Ok(Ok(result))) => {
+                #[cfg(windows)]
+                runtime.block_on(crate::passkey_provider::sync_metadata(
+                    &session.vault,
+                    &session.client,
+                ));
+                vault_write_success(&result)
+            }
             Ok(Ok(Err(error))) => vault_error(&error.to_string()),
             _ if session.vault.write_in_flight() => {
                 session.vault.mark_write_uncertain();

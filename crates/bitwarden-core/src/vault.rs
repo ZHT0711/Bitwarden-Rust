@@ -6,6 +6,7 @@ use std::{
 };
 
 mod mutations;
+pub(crate) mod passkeys;
 mod repository;
 mod totp;
 pub(crate) use mutations::{VaultEditorData, VaultMutationResult};
@@ -59,6 +60,10 @@ pub(crate) enum VaultError {
     AttachmentUnavailable,
     #[error("internal")]
     Internal,
+    #[error("credentialExcluded")]
+    CredentialExcluded,
+    #[error("passkeyProvider:{0}")]
+    PasskeyProvider(String),
 }
 
 #[derive(Clone, Serialize)]

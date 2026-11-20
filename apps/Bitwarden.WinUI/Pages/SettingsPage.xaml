@@ -15,7 +15,8 @@
             <TextBlock Style="{StaticResource TitleTextBlockStyle}" Text="设置" />
             <TextBlock Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="应用偏好与安全选项。" />
         </StackPanel>
-        <StackPanel Grid.Row="1" MaxWidth="720" Spacing="16">
+        <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+        <StackPanel MaxWidth="720" Spacing="16">
             <Border Padding="20" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1" CornerRadius="8">
                 <StackPanel Spacing="8">
                     <TextBlock Style="{StaticResource BodyStrongTextBlockStyle}" Text="外观" />
@@ -31,9 +32,13 @@
             <Border Padding="20" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1" CornerRadius="8">
                 <StackPanel Spacing="8">
                     <TextBlock Style="{StaticResource BodyStrongTextBlockStyle}" Text="安全" />
+                    <Button x:Name="RegisterPasskeysButton" Content="注册 Windows 通行密钥提供程序" Click="RegisterPasskeys_Click" AutomationProperties.AutomationId="RegisterPasskeysButton" />
+                    <Button Content="打开 Windows 通行密钥设置" Click="OpenPasskeySettings_Click" />
+                    <TextBlock x:Name="PasskeyStatus" TextWrapping="Wrap" />
                     <TextBlock Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="登录后可从窗口顶部手动锁定保险库，并使用主密码解锁。关闭应用会结束当前会话。" TextWrapping="Wrap" />
                 </StackPanel>
             </Border>
         </StackPanel>
+        </ScrollViewer>
     </Grid>
 </Page>

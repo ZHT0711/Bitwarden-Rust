@@ -15,6 +15,11 @@ internal static class NativeLifecycle
         if (!health.GetProperty("fixture").GetBoolean()) throw new Exception("Not a synthetic fixture server.");
         await Control("reset");
         RustCore.Logout();
+        check(string.IsNullOrEmpty(RustCore.PendingPasskey().Id), "native passkey ABI has no unsigned pending operation");
+        RustCore.CancelPasskey("forged-synthetic-request");
+        check(!RustCore.IsPasskeyActive("forged-synthetic-request"), "arbitrary UI identifiers cannot create a passkey request");
+        try { RustCore.RespondPasskey("forged-synthetic-request", null, "", 0); throw new Exception("Unsigned passkey request accepted."); }
+        catch (OperationCanceledException) { check(true, "passkey approval requires a current Windows-signed operation"); }
         var deviceIdentifier = Guid.NewGuid().ToString("D");
         try
         {

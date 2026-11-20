@@ -5,7 +5,7 @@ using System.Text.Json;
 
 namespace Bitwarden_WinUI.Interop;
 
-internal static class RustCore
+internal static partial class RustCore
 {
     private const string LibraryName = "bitwarden_core.dll";
 

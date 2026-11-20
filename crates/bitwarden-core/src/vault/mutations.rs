@@ -59,7 +59,7 @@ pub(crate) struct VaultMutationResult {
 }
 
 impl VaultCache {
-    fn ensure_synced(&self) -> Result<(), VaultError> {
+    pub(super) fn ensure_synced(&self) -> Result<(), VaultError> {
         if self.overview.is_none() || self.write_uncertain {
             Err(VaultError::NotSynced)
         } else {
@@ -67,14 +67,14 @@ impl VaultCache {
         }
     }
 
-    fn find_cipher(&self, id: &str) -> Result<Cipher, VaultError> {
+    pub(super) fn find_cipher(&self, id: &str) -> Result<Cipher, VaultError> {
         self.ciphers
             .find(id)
             .map_err(|_| VaultError::Internal)?
             .ok_or(VaultError::NotFound)
     }
 
-    async fn check_reprompt(
+    pub(super) async fn check_reprompt(
         &self,
         client: &Client,
         cipher: &Cipher,
@@ -226,7 +226,10 @@ impl VaultCache {
         Ok(())
     }
 
-    fn check_revision(cipher: &Cipher, revision: Option<&str>) -> Result<(), VaultError> {
+    pub(super) fn check_revision(
+        cipher: &Cipher,
+        revision: Option<&str>,
+    ) -> Result<(), VaultError> {
         let revision = revision
             .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
             .ok_or(VaultError::Validation)?;
@@ -516,7 +519,7 @@ impl VaultCache {
         .await
     }
 
-    fn uncertain(&mut self) -> VaultError {
+    pub(super) fn uncertain(&mut self) -> VaultError {
         self.write_uncertain = true;
         VaultError::WriteUncertain
     }
@@ -604,7 +607,10 @@ impl VaultCache {
         self.uncertain()
     }
 
-    fn classify_create_error(&mut self, error: bitwarden_vault::CreateCipherError) -> VaultError {
+    pub(super) fn classify_create_error(
+        &mut self,
+        error: bitwarden_vault::CreateCipherError,
+    ) -> VaultError {
         match error {
             bitwarden_vault::CreateCipherError::Api(error) => self.classify_api_error(error),
             bitwarden_vault::CreateCipherError::NotAuthenticated(_) => {
@@ -614,7 +620,10 @@ impl VaultCache {
             _ => self.uncertain(),
         }
     }
-    fn classify_edit_error(&mut self, error: bitwarden_vault::EditCipherError) -> VaultError {
+    pub(super) fn classify_edit_error(
+        &mut self,
+        error: bitwarden_vault::EditCipherError,
+    ) -> VaultError {
         match error {
             bitwarden_vault::EditCipherError::Api(error) => self.classify_api_error(error),
             bitwarden_vault::EditCipherError::NotAuthenticated(_) => {
@@ -637,7 +646,7 @@ impl VaultCache {
         }
     }
 
-    async fn finish_write(
+    pub(super) async fn finish_write(
         &mut self,
         client: &Client,
         id: Option<String>,
@@ -779,7 +788,7 @@ fn project_values(view: &CipherView) -> Result<HashMap<String, String>, VaultErr
         .collect())
 }
 
-fn new_view(kind: u8) -> Result<CipherView, VaultError> {
+pub(super) fn new_view(kind: u8) -> Result<CipherView, VaultError> {
     let property = match kind {
         1 => "login",
         2 => "secureNote",
@@ -900,7 +909,7 @@ fn apply_input(view: &mut CipherView, input: &VaultEditorData) -> Result<(), Vau
     Ok(())
 }
 
-fn view_type(view: &CipherView) -> Result<CipherViewType, VaultError> {
+pub(super) fn view_type(view: &CipherView) -> Result<CipherViewType, VaultError> {
     match view.r#type as u8 {
         1 => view.login.clone().map(CipherViewType::Login),
         2 => view.secure_note.clone().map(CipherViewType::SecureNote),

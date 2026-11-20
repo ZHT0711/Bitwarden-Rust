@@ -30,8 +30,16 @@ public partial class App : Application
     /// Invoked when the application is launched.
     /// </summary>
     /// <param name="args">Details about the launch request and process.</param>
-    protected override void OnLaunched(Microsoft.UI.Xaml.LaunchActivatedEventArgs args)
+    protected override async void OnLaunched(Microsoft.UI.Xaml.LaunchActivatedEventArgs args)
     {
+        var instance = Microsoft.Windows.AppLifecycle.AppInstance.FindOrRegisterForKey("primary");
+        if (!instance.IsCurrent)
+        {
+            await instance.RedirectActivationToAsync(Microsoft.Windows.AppLifecycle.AppInstance.GetCurrent().GetActivatedEventArgs());
+            Environment.Exit(0);
+            return;
+        }
+        instance.Activated += (_, _) => _window?.DispatcherQueue.TryEnqueue(() => _window.Activate());
         _window = new MainWindow();
         _window.Activate();
     }

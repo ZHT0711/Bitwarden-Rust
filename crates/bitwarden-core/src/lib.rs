@@ -2,6 +2,8 @@ mod auth_request;
 mod crypto;
 mod ffi;
 mod model;
+#[cfg(windows)]
+mod passkey_provider;
 mod protocol_compat;
 mod storage;
 mod vault;

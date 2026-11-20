@@ -19,6 +19,7 @@ bitwarden-state.workspace = true
 bitwarden-crypto.workspace = true
 bitwarden-crypto-sync-handler.workspace = true
 bitwarden-generators.workspace = true
+bitwarden-fido.workspace = true
 bw-sdk-core = { workspace = true, features = ["internal"] }
 chrono.workspace = true
 hmac.workspace = true
@@ -36,6 +37,11 @@ url.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+win_webauthn = { path = "../../vendor/win_webauthn" }
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+
 [dev-dependencies]
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
 bw-sdk-core = { workspace = true, features = ["internal", "test-fixtures"] }
 bitwarden-api-api = { workspace = true, features = ["mockall"] }
