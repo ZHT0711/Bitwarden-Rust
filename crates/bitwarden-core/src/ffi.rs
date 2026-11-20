@@ -1,9 +1,231 @@
-use std::ffi::{c_char, CStr, CString};
+use std::{
+    ffi::{c_char, CStr, CString},
+    panic::{catch_unwind, AssertUnwindSafe},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex, OnceLock,
+    },
+};
 
+use bitwarden_auth::token_management::PasswordManagerTokenHandler;
 use bitwarden_generators::{
     GeneratorClientsExt, PassphraseGeneratorRequest, PasswordGeneratorRequest,
 };
-use bw_sdk_core::Client;
+use bw_sdk_core::{
+    auth::login::{PasswordLoginRequest, TwoFactorProvider, TwoFactorRequest},
+    client::{ClientSettings, DeviceType},
+    Client, ClientBuilder,
+};
+use url::Url;
+use zeroize::{Zeroize, Zeroizing};
+
+const AUTH_FAILED: u32 = 0;
+const AUTHENTICATED: u32 = 1;
+const TWO_FACTOR_REQUIRED: u32 = 2;
+const TWO_FACTOR_MASK_SHIFT: u32 = 8;
+const TWO_FACTOR_AUTHENTICATOR: u32 = 1 << 0;
+const TWO_FACTOR_EMAIL: u32 = 1 << 1;
+const TWO_FACTOR_YUBIKEY: u32 = 1 << 3;
+
+static AUTHENTICATED_STATE: AtomicBool = AtomicBool::new(false);
+static AUTH_CLIENT: OnceLock<Mutex<Option<AuthSession>>> = OnceLock::new();
+static ASYNC_RUNTIME: OnceLock<Option<tokio::runtime::Runtime>> = OnceLock::new();
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AuthServer {
+    api_url: String,
+    identity_url: String,
+}
+
+struct AuthSession {
+    server: AuthServer,
+    client: Client,
+}
+
+struct SensitiveLoginRequest(PasswordLoginRequest);
+
+impl Drop for SensitiveLoginRequest {
+    fn drop(&mut self) {
+        self.0.password.zeroize();
+        if let Some(two_factor) = self.0.two_factor.as_mut() {
+            two_factor.token.zeroize();
+        }
+    }
+}
+
+struct SensitiveEmailRequest(bw_sdk_core::auth::login::TwoFactorEmailRequest);
+
+impl Drop for SensitiveEmailRequest {
+    fn drop(&mut self) {
+        self.0.password.zeroize();
+    }
+}
+
+fn runtime() -> Option<&'static tokio::runtime::Runtime> {
+    ASYNC_RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .ok()
+        })
+        .as_ref()
+}
+
+fn auth_client() -> &'static Mutex<Option<AuthSession>> {
+    AUTH_CLIENT.get_or_init(|| Mutex::new(None))
+}
+
+fn auth_server(mode: u32, base_url: &str) -> Option<AuthServer> {
+    match mode {
+        0 => Some(AuthServer {
+            api_url: "https://api.bitwarden.com".to_owned(),
+            identity_url: "https://identity.bitwarden.com".to_owned(),
+        }),
+        1 => Some(AuthServer {
+            api_url: "https://api.bitwarden.eu".to_owned(),
+            identity_url: "https://identity.bitwarden.eu".to_owned(),
+        }),
+        2 => custom_auth_server(base_url),
+        _ => None,
+    }
+}
+
+fn custom_auth_server(base_url: &str) -> Option<AuthServer> {
+    let base_url = Url::parse(base_url.trim()).ok()?;
+    let is_loopback = match base_url.host()? {
+        url::Host::Domain(domain) => domain.eq_ignore_ascii_case("localhost"),
+        url::Host::Ipv4(address) => address.is_loopback(),
+        url::Host::Ipv6(address) => address.is_loopback(),
+    };
+    if (base_url.scheme() != "https" && !(base_url.scheme() == "http" && is_loopback))
+        || !base_url.username().is_empty()
+        || base_url.password().is_some()
+        || base_url.query().is_some()
+        || base_url.fragment().is_some()
+    {
+        return None;
+    }
+
+    let final_path_segment = base_url.path_segments()?.next_back().unwrap_or_default();
+    if matches!(final_path_segment, "api" | "identity") {
+        return None;
+    }
+
+    fn append_endpoint(base_url: &Url, endpoint: &str) -> Option<String> {
+        let mut url = base_url.clone();
+        url.path_segments_mut().ok()?.pop_if_empty().push(endpoint);
+        Some(url.into())
+    }
+
+    Some(AuthServer {
+        api_url: append_endpoint(&base_url, "api")?,
+        identity_url: append_endpoint(&base_url, "identity")?,
+    })
+}
+
+fn build_auth_client(server: &AuthServer) -> Client {
+    let settings = ClientSettings {
+        api_url: server.api_url.clone(),
+        identity_url: server.identity_url.clone(),
+        device_type: DeviceType::WindowsDesktop,
+        user_agent: format!(
+            "Bitwarden-Rust/{} (Windows Desktop)",
+            env!("CARGO_PKG_VERSION")
+        ),
+        bitwarden_client_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+        bitwarden_package_type: Some("msix".to_owned()),
+        ..ClientSettings::default()
+    };
+
+    ClientBuilder::new()
+        .with_settings(settings)
+        .with_token_handler(std::sync::Arc::new(PasswordManagerTokenHandler::default()))
+        .build()
+}
+
+fn auth_client_for_server<'a>(
+    session: &'a mut Option<AuthSession>,
+    server: &AuthServer,
+) -> &'a Client {
+    if session
+        .as_ref()
+        .is_none_or(|current| current.server != *server)
+    {
+        *session = Some(AuthSession {
+            server: server.clone(),
+            client: build_auth_client(server),
+        });
+        AUTHENTICATED_STATE.store(false, Ordering::Release);
+    }
+
+    &session
+        .as_ref()
+        .expect("auth session was initialized")
+        .client
+}
+
+unsafe fn read_utf8(value: *const c_char) -> Option<String> {
+    if value.is_null() {
+        return None;
+    }
+
+    unsafe { CStr::from_ptr(value) }
+        .to_str()
+        .ok()
+        .map(str::to_owned)
+}
+
+fn two_factor_provider(value: u32) -> Option<TwoFactorProvider> {
+    match value {
+        0 => Some(TwoFactorProvider::Authenticator),
+        1 => Some(TwoFactorProvider::Email),
+        3 => Some(TwoFactorProvider::Yubikey),
+        _ => None,
+    }
+}
+
+fn supported_two_factor_methods(
+    response: &bw_sdk_core::auth::login::response::two_factor::TwoFactorProviders,
+) -> u32 {
+    let mut methods = 0;
+    if response.authenticator.is_some() {
+        methods |= TWO_FACTOR_AUTHENTICATOR;
+    }
+    if response.email.is_some() {
+        methods |= TWO_FACTOR_EMAIL;
+    }
+    if response.yubi_key.is_some() {
+        methods |= TWO_FACTOR_YUBIKEY;
+    }
+    methods
+}
+
+fn login_status(
+    result: Result<
+        bw_sdk_core::auth::login::PasswordLoginResponse,
+        bw_sdk_core::auth::login::LoginError,
+    >,
+) -> u32 {
+    match result {
+        Ok(response) if response.authenticated => {
+            AUTHENTICATED_STATE.store(true, Ordering::Release);
+            AUTHENTICATED
+        }
+        Ok(response) => {
+            AUTHENTICATED_STATE.store(false, Ordering::Release);
+            let Some(providers) = response.two_factor else {
+                return AUTH_FAILED;
+            };
+            let methods = supported_two_factor_methods(&providers);
+            TWO_FACTOR_REQUIRED | (methods << TWO_FACTOR_MASK_SHIFT)
+        }
+        Err(_) => {
+            AUTHENTICATED_STATE.store(false, Ordering::Release);
+            AUTH_FAILED
+        }
+    }
+}
 
 fn generate_password(
     length: u32,
@@ -56,7 +278,7 @@ fn into_raw_string(value: String) -> *mut c_char {
 
 #[no_mangle]
 pub extern "C" fn bw_core_version() -> *const c_char {
-    b"0.2.0\0".as_ptr().cast()
+    c"0.2.0".as_ptr()
 }
 
 #[no_mangle]
@@ -96,6 +318,141 @@ pub unsafe extern "C" fn bw_generate_passphrase(
     .unwrap_or(std::ptr::null_mut())
 }
 
+/// Authenticate through the official Bitwarden Rust SDK. The result's low byte is a status;
+/// when status is TWO_FACTOR_REQUIRED, the upper bits contain a supported-provider bitmask.
+#[no_mangle]
+pub unsafe extern "C" fn bw_auth_login(
+    email: *const c_char,
+    password: *const c_char,
+    provider: u32,
+    token: *const c_char,
+    server_mode: u32,
+    server_url: *const c_char,
+) -> u32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(email) = (unsafe { read_utf8(email) }) else {
+            return AUTH_FAILED;
+        };
+        let Some(password) = (unsafe { read_utf8(password) }) else {
+            return AUTH_FAILED;
+        };
+        let password = Zeroizing::new(password);
+        let Some(token) = (unsafe { read_utf8(token) }) else {
+            return AUTH_FAILED;
+        };
+        let token = Zeroizing::new(token);
+        let Some(server_url) = (unsafe { read_utf8(server_url) }) else {
+            return AUTH_FAILED;
+        };
+        let Some(server) = auth_server(server_mode, &server_url) else {
+            return AUTH_FAILED;
+        };
+
+        let email = email.trim().to_owned();
+        if email.is_empty() || password.is_empty() {
+            return AUTH_FAILED;
+        }
+        let two_factor = if token.is_empty() {
+            None
+        } else {
+            let Some(provider) = two_factor_provider(provider) else {
+                return AUTH_FAILED;
+            };
+            Some(TwoFactorRequest {
+                token: token.to_string(),
+                provider,
+                remember: false,
+            })
+        };
+
+        let request = SensitiveLoginRequest(PasswordLoginRequest {
+            email,
+            password: password.to_string(),
+            two_factor,
+        });
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let runtime = runtime().ok_or(())?;
+            let mut session = auth_client()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let client = auth_client_for_server(&mut session, &server);
+            Ok::<_, ()>(runtime.block_on(client.auth().login_password(&request.0)))
+        }));
+
+        match result {
+            Ok(Ok(result)) => login_status(result),
+            Ok(Err(())) | Err(_) => {
+                AUTHENTICATED_STATE.store(false, Ordering::Release);
+                AUTH_FAILED
+            }
+        }
+    }))
+    .unwrap_or(AUTH_FAILED)
+}
+
+/// Send a Bitwarden email two-factor authentication code for the supplied account.
+#[no_mangle]
+pub unsafe extern "C" fn bw_auth_send_two_factor_email(
+    email: *const c_char,
+    password: *const c_char,
+    server_mode: u32,
+    server_url: *const c_char,
+) -> u8 {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(password) = (unsafe { read_utf8(password) }) else {
+            return 0;
+        };
+        let password = Zeroizing::new(password);
+        let Some(email) = (unsafe { read_utf8(email) }) else {
+            return 0;
+        };
+        let Some(server_url) = (unsafe { read_utf8(server_url) }) else {
+            return 0;
+        };
+        let Some(server) = auth_server(server_mode, &server_url) else {
+            return 0;
+        };
+        let email = email.trim().to_owned();
+        if email.is_empty() || password.is_empty() {
+            return 0;
+        }
+        let request = SensitiveEmailRequest(bw_sdk_core::auth::login::TwoFactorEmailRequest {
+            email,
+            password: password.to_string(),
+        });
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let runtime = runtime().ok_or(())?;
+            let mut session = auth_client()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let client = auth_client_for_server(&mut session, &server);
+            Ok::<_, ()>(runtime.block_on(client.auth().send_two_factor_email(&request.0)))
+        }));
+
+        match result {
+            Ok(Ok(Ok(()))) => 1,
+            _ => 0,
+        }
+    }))
+    .unwrap_or(0)
+}
+
+#[no_mangle]
+pub extern "C" fn bw_auth_is_authenticated() -> u8 {
+    u8::from(AUTHENTICATED_STATE.load(Ordering::Acquire))
+}
+
+#[no_mangle]
+pub extern "C" fn bw_auth_logout() {
+    let mut session = auth_client()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *session = None;
+    AUTHENTICATED_STATE.store(false, Ordering::Release);
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn bw_string_free(value: *mut c_char) {
     if value.is_null() {
@@ -110,7 +467,7 @@ pub unsafe extern "C" fn bw_string_free(value: *mut c_char) {
 
 #[cfg(test)]
 mod tests {
-    use super::{generate_passphrase, generate_password};
+    use super::{auth_server, custom_auth_server, generate_passphrase, generate_password};
     use bitwarden_generators::{GeneratorClientsExt, PasswordGeneratorRequest};
     use bw_sdk_core::Client;
 
@@ -176,5 +533,104 @@ mod tests {
             .password(PasswordGeneratorRequest::default())
             .expect("generator does not require a vault session");
         assert_eq!(generated.len(), 16);
+    }
+
+    #[test]
+    fn auth_rejects_empty_credentials_without_network_access() {
+        let email = std::ffi::CString::new(" ").expect("email has no NUL");
+        let password = std::ffi::CString::new("test-password").expect("password has no NUL");
+        let token = std::ffi::CString::new("").expect("token has no NUL");
+        let server_url = std::ffi::CString::new("").expect("server URL has no NUL");
+        let result = unsafe {
+            super::bw_auth_login(
+                email.as_ptr(),
+                password.as_ptr(),
+                0,
+                token.as_ptr(),
+                0,
+                server_url.as_ptr(),
+            )
+        };
+        assert_eq!(result, super::AUTH_FAILED);
+    }
+
+    #[test]
+    fn auth_rejects_unimplemented_two_factor_provider_without_network_access() {
+        let email = std::ffi::CString::new("user@example.com").expect("email has no NUL");
+        let password = std::ffi::CString::new("test-password").expect("password has no NUL");
+        let token = std::ffi::CString::new("123456").expect("token has no NUL");
+        let server_url = std::ffi::CString::new("").expect("server URL has no NUL");
+        let result = unsafe {
+            super::bw_auth_login(
+                email.as_ptr(),
+                password.as_ptr(),
+                2,
+                token.as_ptr(),
+                0,
+                server_url.as_ptr(),
+            )
+        };
+        assert_eq!(result, super::AUTH_FAILED);
+    }
+
+    #[test]
+    fn auth_logout_clears_in_memory_session_state() {
+        super::AUTHENTICATED_STATE.store(true, std::sync::atomic::Ordering::Release);
+        super::bw_auth_logout();
+        assert_eq!(super::bw_auth_is_authenticated(), 0);
+    }
+
+    #[test]
+    fn built_in_server_regions_use_their_matching_api_and_identity_hosts() {
+        let us = auth_server(0, "").expect("US cloud region");
+        assert_eq!(us.api_url, "https://api.bitwarden.com");
+        assert_eq!(us.identity_url, "https://identity.bitwarden.com");
+
+        let eu = auth_server(1, "").expect("EU cloud region");
+        assert_eq!(eu.api_url, "https://api.bitwarden.eu");
+        assert_eq!(eu.identity_url, "https://identity.bitwarden.eu");
+        assert!(auth_server(3, "").is_none());
+    }
+
+    #[test]
+    fn custom_server_builds_api_and_identity_urls_from_server_base() {
+        let server =
+            custom_auth_server(" https://vault.example.com/ ").expect("valid server base URL");
+        assert_eq!(server.api_url, "https://vault.example.com/api");
+        assert_eq!(server.identity_url, "https://vault.example.com/identity");
+
+        let nested = custom_auth_server("https://vault.example.com/bitwarden/")
+            .expect("valid server base URL with path prefix");
+        assert_eq!(nested.api_url, "https://vault.example.com/bitwarden/api");
+        assert_eq!(
+            nested.identity_url,
+            "https://vault.example.com/bitwarden/identity"
+        );
+    }
+
+    #[test]
+    fn custom_server_rejects_unsafe_or_ambiguous_urls() {
+        for value in [
+            "",
+            "vault.example.com",
+            "ftp://vault.example.com",
+            "https://user:password@vault.example.com",
+            "https://vault.example.com?tenant=one",
+            "https://vault.example.com/#fragment",
+            "http://vault.example.com",
+            "https://vault.example.com/api",
+            "https://vault.example.com/identity",
+        ] {
+            assert!(
+                custom_auth_server(value).is_none(),
+                "unexpectedly accepted {value}"
+            );
+        }
+        assert_eq!(
+            custom_auth_server("http://localhost:8080")
+                .expect("loopback HTTP server")
+                .api_url,
+            "http://localhost:8080/api"
+        );
     }
 }

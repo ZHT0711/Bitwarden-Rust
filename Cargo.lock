@@ -270,18 +270,51 @@ dependencies = [
 ]
 
 [[package]]
+name = "bitwarden-auth"
+version = "4.0.0"
+source = "git+https://github.com/bitwarden/sdk-internal?rev=56c7617b23501af70221094cdee59e10b2a9d8d2#56c7617b23501af70221094cdee59e10b2a9d8d2"
+dependencies = [
+ "async-trait",
+ "bitwarden-api-api",
+ "bitwarden-api-identity",
+ "bitwarden-api-key-connector",
+ "bitwarden-core 4.0.0",
+ "bitwarden-crypto",
+ "bitwarden-encoding",
+ "bitwarden-error",
+ "bitwarden-ffi",
+ "bitwarden-policies",
+ "bitwarden-state",
+ "chrono",
+ "ciborium",
+ "http",
+ "reqwest",
+ "reqwest-middleware",
+ "serde",
+ "serde_bytes",
+ "serde_repr",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "bitwarden-core"
 version = "0.2.0"
 dependencies = [
  "aes-gcm 0.10.3",
  "argon2 0.5.3",
  "base64 0.22.1",
+ "bitwarden-auth",
  "bitwarden-core 4.0.0",
  "bitwarden-generators",
  "rand 0.8.8",
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
+ "url",
  "uuid",
  "zeroize",
 ]
@@ -490,6 +523,44 @@ dependencies = [
 ]
 
 [[package]]
+name = "bitwarden-organizations"
+version = "4.0.0"
+source = "git+https://github.com/bitwarden/sdk-internal?rev=56c7617b23501af70221094cdee59e10b2a9d8d2#56c7617b23501af70221094cdee59e10b2a9d8d2"
+dependencies = [
+ "bitwarden-core 4.0.0",
+ "bitwarden-crypto",
+ "bitwarden-ffi",
+ "bitwarden-state",
+ "bitwarden-uuid",
+ "chrono",
+ "serde",
+ "serde_repr",
+ "uuid",
+]
+
+[[package]]
+name = "bitwarden-policies"
+version = "4.0.0"
+source = "git+https://github.com/bitwarden/sdk-internal?rev=56c7617b23501af70221094cdee59e10b2a9d8d2#56c7617b23501af70221094cdee59e10b2a9d8d2"
+dependencies = [
+ "async-trait",
+ "bitwarden-api-api",
+ "bitwarden-core 4.0.0",
+ "bitwarden-ffi",
+ "bitwarden-organizations",
+ "bitwarden-state",
+ "bitwarden-sync",
+ "bitwarden-uuid",
+ "chrono",
+ "serde",
+ "serde_json",
+ "serde_repr",
+ "thiserror",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "bitwarden-random"
 version = "4.0.0"
 source = "git+https://github.com/bitwarden/sdk-internal?rev=56c7617b23501af70221094cdee59e10b2a9d8d2#56c7617b23501af70221094cdee59e10b2a9d8d2"
@@ -538,6 +609,22 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "bitwarden-sync"
+version = "4.0.0"
+source = "git+https://github.com/bitwarden/sdk-internal?rev=56c7617b23501af70221094cdee59e10b2a9d8d2#56c7617b23501af70221094cdee59e10b2a9d8d2"
+dependencies = [
+ "async-trait",
+ "bitwarden-api-api",
+ "bitwarden-core 4.0.0",
+ "bitwarden-state",
+ "chrono",
+ "serde",
+ "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1059,7 +1146,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c54e03a951783e8b327515db3f2a2fd0e3bed362a96b066f341ce66ed49b4ead"
 dependencies = [
  "data-encoding",
- "syn 2.0.119",
+ "syn 3.0.10",
 ]
 
 [[package]]

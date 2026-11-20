@@ -1,4 +1,6 @@
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using System.Text;
 
 namespace Bitwarden_WinUI.Interop;
 
@@ -22,7 +24,122 @@ internal static class RustCore
     [DllImport(LibraryName, EntryPoint = "bw_string_free", CallingConvention = CallingConvention.Cdecl)]
     private static extern void FreeStringNative(IntPtr value);
 
+    [DllImport(LibraryName, EntryPoint = "bw_auth_login", CallingConvention = CallingConvention.Cdecl)]
+    private static extern uint LoginNative(
+        IntPtr email,
+        IntPtr password,
+        uint provider,
+        IntPtr token,
+        uint serverMode,
+        IntPtr serverUrl);
+
+    [DllImport(LibraryName, EntryPoint = "bw_auth_send_two_factor_email", CallingConvention = CallingConvention.Cdecl)]
+    private static extern byte SendTwoFactorEmailNative(
+        IntPtr email,
+        IntPtr password,
+        uint serverMode,
+        IntPtr serverUrl);
+
+    [DllImport(LibraryName, EntryPoint = "bw_auth_is_authenticated", CallingConvention = CallingConvention.Cdecl)]
+    private static extern byte IsAuthenticatedNative();
+
+    [DllImport(LibraryName, EntryPoint = "bw_auth_logout", CallingConvention = CallingConvention.Cdecl)]
+    private static extern void LogoutNative();
+
     internal static string Version => Marshal.PtrToStringUTF8(GetVersionNative()) ?? "unknown";
+    internal static bool IsAuthenticated => IsAuthenticatedNative() != 0;
+
+    internal static AuthResult Login(
+        string email,
+        string password,
+        uint provider,
+        string token,
+        uint serverMode,
+        string serverUrl)
+    {
+        var emailPointer = AllocateUtf8(email, out var emailLength);
+        var passwordPointer = AllocateUtf8(password, out var passwordLength);
+        var tokenPointer = AllocateUtf8(token, out var tokenLength);
+        var serverPointer = AllocateUtf8(serverUrl, out var serverLength);
+
+        try
+        {
+            var result = LoginNative(emailPointer, passwordPointer, provider, tokenPointer, serverMode, serverPointer);
+            return new AuthResult(result & 0xff, result >> 8);
+        }
+        finally
+        {
+            ZeroAndFree(emailPointer, emailLength);
+            ZeroAndFree(passwordPointer, passwordLength);
+            ZeroAndFree(tokenPointer, tokenLength);
+            ZeroAndFree(serverPointer, serverLength);
+        }
+    }
+
+    internal static void Logout() => LogoutNative();
+
+    internal static bool SendTwoFactorEmail(string email, string password, uint serverMode, string serverUrl)
+    {
+        var emailPointer = AllocateUtf8(email, out var emailLength);
+        var passwordPointer = AllocateUtf8(password, out var passwordLength);
+        var serverPointer = AllocateUtf8(serverUrl, out var serverLength);
+        try
+        {
+            return SendTwoFactorEmailNative(emailPointer, passwordPointer, serverMode, serverPointer) != 0;
+        }
+        finally
+        {
+            ZeroAndFree(emailPointer, emailLength);
+            ZeroAndFree(passwordPointer, passwordLength);
+            ZeroAndFree(serverPointer, serverLength);
+        }
+    }
+
+    private static IntPtr AllocateUtf8(string value, out int byteLength)
+    {
+        var bytes = Encoding.UTF8.GetBytes(value);
+        byteLength = bytes.Length;
+        var pointer = IntPtr.Zero;
+        try
+        {
+            pointer = Marshal.AllocHGlobal(byteLength + 1);
+            Marshal.Copy(bytes, 0, pointer, byteLength);
+            Marshal.WriteByte(pointer, byteLength, 0);
+            return pointer;
+        }
+        catch
+        {
+            if (pointer != IntPtr.Zero)
+            {
+                Marshal.FreeHGlobal(pointer);
+            }
+            throw;
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(bytes);
+        }
+    }
+
+    private static void ZeroAndFree(IntPtr pointer, int byteLength)
+    {
+        if (pointer == IntPtr.Zero)
+        {
+            return;
+        }
+
+        try
+        {
+            for (var index = 0; index <= byteLength; index++)
+            {
+                Marshal.WriteByte(pointer, index, 0);
+            }
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(pointer);
+        }
+    }
 
     internal static string GeneratePassword(
         uint length,
@@ -83,3 +200,5 @@ internal static class RustCore
         }
     }
 }
+
+internal readonly record struct AuthResult(uint Status, uint AvailableTwoFactorMethods);

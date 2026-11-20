@@ -46,7 +46,7 @@
                         QuerySubmitted="SearchBox_QuerySubmitted" />
                     <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8">
                         <Button Content="同步" IsEnabled="False" ToolTipService.ToolTip="账户同步将在后续迭代接入" />
-                        <Button Content="登录" Click="SignIn_Click" />
+                        <Button x:Name="SignInButton" Content="登录" Click="SignIn_Click" />
                     </StackPanel>
                 </Grid>
             </NavigationView.Header>

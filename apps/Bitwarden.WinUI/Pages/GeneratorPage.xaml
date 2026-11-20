@@ -14,7 +14,7 @@
 
         <StackPanel Spacing="4">
             <TextBlock Style="{StaticResource TitleTextBlockStyle}" Text="密码生成器" />
-            <TextBlock Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="使用与 Bitwarden Desktop 2026.10.4 对齐的密码设置生成本地密码。" TextWrapping="Wrap" />
+            <TextBlock Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="按 Bitwarden Desktop 2026.11.0 的默认参数生成密码和密码短语。" TextWrapping="Wrap" />
         </StackPanel>
 
         <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">

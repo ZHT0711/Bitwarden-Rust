@@ -7,12 +7,18 @@ namespace Bitwarden_WinUI.Pages;
 
 public sealed partial class HomePage : Page
 {
+    public event EventHandler? SignInRequested;
+
     public HomePage()
     {
         InitializeComponent();
         try
         {
             CoreStatus.Text = $"Rust 核心版本 {RustCore.Version} 已加载。";
+            if (RustCore.IsAuthenticated)
+            {
+                ShowAuthenticated();
+            }
         }
         catch (DllNotFoundException)
         {
@@ -47,15 +53,23 @@ public sealed partial class HomePage : Page
         ConnectionNotice.IsOpen = true;
     }
 
-    public void ShowConnectionNotice()
+    public void ShowAuthenticated()
     {
+        ConnectionNotice.Title = "账户认证成功";
+        ConnectionNotice.Message = "已通过 Bitwarden Rust SDK 完成身份认证。保险库同步和条目加载仍在开发中。";
+        ConnectionNotice.Severity = InfoBarSeverity.Success;
         ConnectionNotice.IsOpen = true;
-        ConnectionNotice.Title = "登录功能尚未接入";
-        ConnectionNotice.Message = "不会在此版本收集或处理账户密码。认证流程将在后续迭代接入。";
-        ConnectionNotice.Severity = InfoBarSeverity.Warning;
     }
 
-    private void ConnectAccount_Click(object sender, RoutedEventArgs e) => ShowConnectionNotice();
+    public void ShowLoggedOut()
+    {
+        ConnectionNotice.Title = "账户已退出";
+        ConnectionNotice.Message = "当前没有活跃的账户会话。";
+        ConnectionNotice.Severity = InfoBarSeverity.Informational;
+        ConnectionNotice.IsOpen = true;
+    }
+
+    private void ConnectAccount_Click(object sender, RoutedEventArgs e) => SignInRequested?.Invoke(this, EventArgs.Empty);
 
     private void OpenGenerator_Click(object sender, RoutedEventArgs e) => Frame.Navigate(typeof(GeneratorPage));
 }

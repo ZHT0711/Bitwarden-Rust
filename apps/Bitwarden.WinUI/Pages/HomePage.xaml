@@ -48,7 +48,7 @@
                         Text="登录、加密同步和条目管理正在分阶段用 Rust 核心实现。"
                         TextAlignment="Center"
                         TextWrapping="Wrap" />
-                    <Button Content="连接账户" Click="ConnectAccount_Click" IsEnabled="False" />
+                    <Button Content="连接账户" Click="ConnectAccount_Click" />
                 </StackPanel>
             </Border>
 
