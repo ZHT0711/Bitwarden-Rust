@@ -36,8 +36,9 @@ internal static class NativeLifecycle
             ExpectCode(() => RustCore.GetVaultOverview(), "notFound", "unlock before first sync leaves the unsynced vault empty");
             var initial = RustCore.SyncVault(CancellationToken.None);
             check(initial.Items.Length == 2, "real DLL syncs a profile with wrapped account keys without a host state bridge");
+            const string seed = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
             var draft = new VaultEditorData(null, "ABI synthetic login", 1, null, false, true, null, "synthetic notes",
-                new() { ["username"] = "abi-user", ["password"] = "synthetic-abi-secret", ["totp"] = "SYNTHETIC-TOTP" },
+                new() { ["username"] = "abi-user", ["password"] = "synthetic-abi-secret", ["totp"] = $"otpauth://totp/Synthetic?secret={seed}&digits=8&period=17" },
                 [new("https://example.com/abi?fixture=synthetic", 3)], [new("fixture field", "synthetic hidden value", 1, null)],
                 true, false, false, false, false);
             var created = RustCore.CreateVaultItem(draft, CancellationToken.None);
@@ -45,6 +46,15 @@ internal static class NativeLifecycle
             check(created.Overview.Items.Any(item => item.Id == id && item.Name == draft.Name), "create returns server-confirmed list metadata");
             check(created.Overview.Items.Single(item => item.Id == id).WebsiteHost == "example.com",
                 "icon projection exposes only the validated hostname");
+            ExpectCode(() => RustCore.GetVaultDetail(id, string.Empty, CancellationToken.None), "passwordRequired", "TOTP requires item reprompt");
+            var detail = RustCore.GetVaultDetail(id, FixturePassword, CancellationToken.None);
+            var requestForTotp = detail.TotpRequestId ?? throw new Exception("TOTP access was not granted.");
+            check(detail.Totp is { Status: "ready", Value: { Period: 17 } totp }
+                && totp.Code.Length == 8 && totp.ValidUntil - totp.ValidFrom == 17, "details contain the generated code and custom period");
+            check(!JsonSerializer.Serialize(detail).Contains(seed, StringComparison.Ordinal), "detail ABI keeps the TOTP seed in Rust");
+            check(RustCore.RefreshTotp(requestForTotp).Code.Length == 8, "a verified item refreshes its code without another password");
+            RustCore.CloseTotp(requestForTotp);
+            ExpectCode(() => RustCore.RefreshTotp(requestForTotp), "totpViewExpired", "closing details revokes code generation");
             ExpectCode(() => RustCore.GetVaultEditor(id, string.Empty, CancellationToken.None), "passwordRequired", "editor reprompt enforced through ABI");
             var editor = RustCore.GetVaultEditor(id, FixturePassword, CancellationToken.None);
             check(editor.Values["password"] == "synthetic-abi-secret" && editor.Uris.Single().Match == 3, "SDK-decrypted editor values and URI mode survive ABI");
@@ -58,10 +68,12 @@ internal static class NativeLifecycle
             var latest = RustCore.GetVaultEditor(id, FixturePassword, CancellationToken.None);
             check(latest.Values["password"] == "synthetic-abi-updated" && latest.CustomFields.Single().Value == "synthetic hidden value", "edit retains hidden custom fields and changed password");
 
+            var totpBeforeLock = RustCore.GetVaultDetail(id, FixturePassword, CancellationToken.None).TotpRequestId!.Value;
             await Control("fail-next-sync");
             check(RustCore.Lock() && RustCore.SessionState == VaultSessionState.Locked && !RustCore.IsAuthenticated,
                 "lock closes native vault access while keeping the account session");
             ExpectCode(() => RustCore.GetVaultOverview(), "locked", "locked overview is inaccessible");
+            ExpectCode(() => RustCore.RefreshTotp(totpBeforeLock), "locked", "lock revokes live TOTP access");
             ExpectCode(() => RustCore.GetVaultDetail(id, FixturePassword, CancellationToken.None), "locked", "item reprompt cannot bypass vault lock");
             ExpectCode(() => RustCore.GetVaultEditor(id, FixturePassword, CancellationToken.None), "locked", "locked account cannot open an editor");
             ExpectCode(() => RustCore.SyncVault(CancellationToken.None), "locked", "locked account cannot synchronize");
@@ -69,11 +81,19 @@ internal static class NativeLifecycle
             ExpectCode(() => RustCore.Unlock("wrong synthetic password", CancellationToken.None), "wrongPassword", "incorrect password does not unlock");
             check(RustCore.SessionState == VaultSessionState.Locked, "wrong password leaves native state locked");
             RustCore.Unlock(FixturePassword, CancellationToken.None);
+            ExpectCode(() => RustCore.RefreshTotp(totpBeforeLock), "totpViewExpired", "unlock does not reauthorize a dismissed detail");
             var reopened = RustCore.GetVaultOverview();
             check(RustCore.SessionState == VaultSessionState.Unlocked && reopened.LastSync == initial.LastSync &&
                 reopened.Items.Single(item => item.Id == id).Name == changed.Name, "unlock restores the cached vault and confirmed edits without resyncing");
             ExpectCode(() => RustCore.SyncVault(CancellationToken.None), "network", "offline unlock did not consume the pending sync request");
             ExpectCode(() => RustCore.GetVaultEditor(id, string.Empty, CancellationToken.None), "passwordRequired", "unlock preserves item-level reprompt");
+            await Control("disable-premium");
+            RustCore.SyncVault(CancellationToken.None);
+            var freeDetail = RustCore.GetVaultDetail(id, FixturePassword, CancellationToken.None);
+            check(freeDetail.Totp is { Status: "premiumRequired", Value: null } && freeDetail.TotpRequestId is null,
+                "a free account can store its key while code generation requires its entitlement");
+            await Control("enable-premium");
+            RustCore.SyncVault(CancellationToken.None);
 
             var favored = Action("favorite", string.Empty);
             check(favored.Overview.Items.Single(item => item.Id == id).Favorite, "favorite on reprompt item requires no password");

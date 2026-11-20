@@ -87,6 +87,9 @@ internal static class RustCore
     [DllImport(LibraryName, EntryPoint = "bw_vault_detail", CallingConvention = CallingConvention.Cdecl)]
     private static extern IntPtr VaultDetailNative(IntPtr id, IntPtr password, ulong requestId);
 
+    [DllImport(LibraryName, EntryPoint = "bw_vault_totp_refresh", CallingConvention = CallingConvention.Cdecl)]
+    private static extern IntPtr VaultTotpRefreshNative(ulong requestId);
+
     [DllImport(LibraryName, EntryPoint = "bw_vault_editor", CallingConvention = CallingConvention.Cdecl)]
     private static extern IntPtr VaultEditorNative(IntPtr id, IntPtr password, ulong requestId);
     [DllImport(LibraryName, EntryPoint = "bw_vault_create", CallingConvention = CallingConvention.Cdecl)]
@@ -109,6 +112,10 @@ internal static class RustCore
         using var passwordBuffer = new Utf8Buffer(password);
         return RunVaultRequest<VaultDetail>(requestId => VaultDetailNative(idBuffer.Pointer, passwordBuffer.Pointer, requestId), token);
     }
+
+    internal static TotpCode RefreshTotp(ulong requestId) => ReadJson<TotpCode>(VaultTotpRefreshNative(requestId));
+
+    internal static void CloseTotp(ulong requestId) => CancelAuthRequestNative(requestId);
 
     internal static VaultEditorData GetVaultEditor(string id, string password, CancellationToken token)
     {

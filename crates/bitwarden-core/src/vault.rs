@@ -7,8 +7,10 @@ use std::{
 
 mod mutations;
 mod repository;
+mod totp;
 pub(crate) use mutations::{VaultEditorData, VaultMutationResult};
 use repository::CipherRepository;
+pub(crate) use totp::{TotpCode, VaultTotp};
 
 use bitwarden_api_api::models::SyncResponseModel;
 use bitwarden_crypto::UnsignedSharedKey;
@@ -103,6 +105,7 @@ pub(crate) struct VaultCache {
     parse_failures: usize,
     base_failures: usize,
     can_archive: bool,
+    can_generate_totp: bool,
     write_uncertain: bool,
     write_started: bool,
 }
@@ -124,6 +127,8 @@ pub(crate) struct VaultDetail {
     restricted: bool,
     password_hidden: bool,
     attachments: usize,
+    pub(crate) totp: Option<VaultTotp>,
+    pub(crate) totp_request_id: Option<u64>,
 }
 
 impl VaultCache {
@@ -277,18 +282,22 @@ impl VaultCache {
             .iter()
             .filter_map(|raw| Folder::try_from(raw.clone()).ok())
             .collect::<Vec<_>>();
+        let organization_premium = profile
+            .organizations
+            .iter()
+            .flatten()
+            .any(|org| org.users_get_premium.unwrap_or(false));
         let mut cache = Self {
             ciphers: Arc::new(CipherRepository::from(ciphers)),
             org_keys,
             parse_failures: failures + api_folders.len() - folders.len(),
             folders,
             encrypted_user_key: profile.key.clone(),
-            can_archive: profile.premium.unwrap_or(false)
+            can_archive: profile.premium.unwrap_or(false) || organization_premium,
+            can_generate_totp: profile.premium.unwrap_or(false)
                 || profile
-                    .organizations
-                    .iter()
-                    .flatten()
-                    .any(|org| org.users_get_premium.unwrap_or(false)),
+                    .premium_from_organization
+                    .unwrap_or(organization_premium),
             last_sync: Some(Utc::now().to_rfc3339()),
             ..Self::default()
         };
@@ -442,13 +451,57 @@ impl VaultCache {
                 .await
                 .map_err(|_| VaultError::WrongPassword)?;
         }
-        let view = client
+        let mut view = client
             .vault()
             .ciphers()
             .decrypt(cipher.clone())
             .await
             .map_err(|_| VaultError::DecryptionFailed)?;
-        Ok(display_detail(view))
+        let totp = self.take_totp(&mut view);
+        let mut detail = display_detail(view);
+        detail.totp = totp;
+        Ok(detail)
+    }
+
+    pub(crate) async fn refresh_totp(
+        &self,
+        client: &Client,
+        id: &str,
+    ) -> Result<TotpCode, VaultError> {
+        if self.write_uncertain {
+            return Err(VaultError::NotSynced);
+        }
+        let cipher = self
+            .ciphers
+            .find(id)
+            .map_err(|_| VaultError::Internal)?
+            .ok_or(VaultError::NotFound)?;
+        let mut view = client
+            .vault()
+            .ciphers()
+            .decrypt(cipher)
+            .await
+            .map_err(|_| VaultError::DecryptionFailed)?;
+        match self.take_totp(&mut view) {
+            Some(VaultTotp::Ready { value }) => Ok(value),
+            _ => Err(VaultError::PermissionDenied),
+        }
+    }
+
+    fn take_totp(&self, view: &mut CipherView) -> Option<VaultTotp> {
+        use zeroize::Zeroizing;
+
+        let key = Zeroizing::new(view.login.as_mut()?.totp.take()?);
+        if view.partial || !view.view_password || key.trim().is_empty() {
+            return None;
+        }
+        if !self.can_generate_totp {
+            return Some(VaultTotp::PremiumRequired);
+        }
+        Some(match TotpCode::generate(&key, Utc::now()) {
+            Some(value) => VaultTotp::Ready { value },
+            None => VaultTotp::Invalid,
+        })
     }
 }
 
@@ -615,6 +668,8 @@ fn display_detail(view: CipherView) -> VaultDetail {
         restricted: view.partial,
         password_hidden: !view.view_password,
         attachments: view.attachments.as_ref().map_or(0, Vec::len),
+        totp: None,
+        totp_request_id: None,
     }
 }
 
@@ -909,8 +964,12 @@ mod tests {
             std::env::var("BITWARDEN_FIXTURE_OUTPUT").expect("set an explicit fixture output path");
         let client = Client::init_test_account(test_bitwarden_com_account()).await;
         let mut icon_item = test_view();
-        icon_item.login.as_mut().unwrap().uris.as_mut().unwrap()[0].uri =
+        let login = icon_item.login.as_mut().unwrap();
+        login.uris.as_mut().unwrap()[0].uri =
             Some("https://example.com/synthetic-icon-fixture".to_owned());
+        login.totp = Some(
+            "otpauth://totp/Simulation?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&period=5".to_owned(),
+        );
         let mut response = response_for(&client, icon_item).await;
         let mut guarded = test_view();
         guarded.name = "Synthetic protected item".to_owned();

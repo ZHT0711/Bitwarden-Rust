@@ -23,7 +23,7 @@
 | 生成器 | 官方密码 / 密码短语生成 | 用户名 / 转发服务、历史与设置持久化 |
 | 条目写入 | 新增、编辑、收藏修改、归档、软删除、还原、永久删除；修订冲突与不确定结果同步恢复 | 移动条目 / 文件夹、真实账户覆盖与生产服务兼容性 |
 | 本地状态与锁定 | 进程内会话，手动锁定销毁解密密钥、清除列表和详情，并清理应用拥有的剪贴板内容。主密码可在同一进程中离线解锁已同步数据，退出结束会话 | 跨重启的加密缓存与会话恢复、自动锁定、PIN、Windows Hello、托盘、快捷键、开机启动与真实账户验证 |
-| 附件 / TOTP / 通行密钥 | 报告附件数量，尚无对应操作 | 上传下载、TOTP、通行密钥创建 / 使用、SSH 代理 |
+| 附件 / TOTP / 通行密钥 | 报告附件数量。登录条目支持手动录入验证器密钥、离线生成验证码、倒计时与复制 | 附件上传下载、TOTP 二维码录入、通行密钥创建 / 使用、SSH 代理 |
 | Send / 导入导出 | 未实现 | 完整 Send、文本 / 文件、导入格式、加密 / 明文导出与确认 |
 | 其他桌面功能 | 关于页、基础设置占位 | 设置、语言、通知、更新、账户 / 组织策略、帮助等逐项对照 |
 | 构建发布 | 本地 x64 WinUI / Rust、未签名 MSIX；增加 Windows CI | CI 通过、干净构建、签名分发、ARM64 / x86、更新与回滚 |
@@ -49,7 +49,8 @@
 - 在本机 Vaultwarden 1.37.5 复现了登录成功后首次同步返回 `internal`。同步资料包含 `accountKeys` 时，旧实现会调用依赖状态桥的 SDK 同步处理器。原生客户端目前使用进程内状态，已按 SDK 状态桥的注册状态调用处理器，并继续校验账户密钥资料。修复后用同一个合成账户同步、创建条目并再次同步成功。CI 模拟的同步资料也加入了 `accountKeys`。对照了 [官方桌面共享同步实现](https://github.com/bitwarden/clients/blob/desktop-v2026.11.0/libs/common/src/platform/sync/default-sync.service.ts) 和 [Vaultwarden 1.37.5 同步实现](https://github.com/dani-garcia/vaultwarden/blob/1.37.5/src/api/core/ciphers.rs)。
 - NodeWarden 的公开预登录响应同时返回两套字段名，旧的 SDK 兼容层会拒绝解析。回归测试加入两套预登录参数、令牌解锁参数和同步资料，并覆盖值为 `null` 的认证器挑战。自托管联机验收仍需用户账户确认。对照了 [NodeWarden 身份验证实现](https://github.com/shuaiplus/NodeWarden/blob/main/src/handlers/identity.ts) 和 [同步实现](https://github.com/shuaiplus/NodeWarden/blob/main/src/handlers/sync.ts)。
 - 修复生成器初始化时控件尚未就绪导致的崩溃，WinUI 界面验证密码重新生成及六词密码短语。
+- 对照 [官方桌面 TOTP 服务](https://github.com/bitwarden/clients/blob/desktop-v2026.11.0/libs/common/src/vault/services/totp.service.ts) 接入条目验证码。Rust 测试覆盖 RFC 向量、周期边界和 Steam，DLL 测试覆盖会员权限、主密码复验、隐藏密钥及锁定后的授权撤销。WinUI 中验证了倒计时、验证码轮换和保险库锁定后清除显示。
 
 ## 后续顺序
 
-接入自动锁定和跨重启的加密本地状态，逐项完成附件、TOTP、Send、导入导出和桌面集成，再对真实账户与官方客户端逐项验证。桌面功能验收完成后进入 Firefox 联动阶段。
+接入系统通行密钥提供程序、自动锁定及跨重启的加密本地状态，逐项完成附件、Send、导入导出和桌面集成，再对真实账户与官方客户端逐项验证。桌面功能验收完成后进入 Firefox 联动阶段。

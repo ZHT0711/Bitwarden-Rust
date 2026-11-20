@@ -16,6 +16,7 @@ public sealed partial class HomePage : Page
     private bool _syncing;
     private int _version;
     private CancellationTokenSource? _operation;
+    private TotpCodeView? _totpView;
 
     public HomePage()
     {
@@ -190,6 +191,7 @@ public sealed partial class HomePage : Page
             var detail = await Task.Run(() => RustCore.GetVaultDetail(item.Id, password, token), token);
             password = string.Empty;
             if (IsCurrent(version, token)) ShowDetail(detail);
+            else if (detail.TotpRequestId is { } staleRequest) RustCore.CloseTotp(staleRequest);
         }
         catch (OperationCanceledException) { }
         catch (VaultException error)
@@ -213,6 +215,24 @@ public sealed partial class HomePage : Page
         DetailPanel.Children.Add(new TextBlock { Text = VaultTypes.Label(detail.ItemType) });
         if (detail.Restricted || detail.PasswordHidden) DetailPanel.Children.Add(new InfoBar { IsOpen = true, IsClosable = false, Severity = InfoBarSeverity.Warning,
             Message = detail.Restricted ? "此条目受组织访问策略限制，仅显示可用的信息。" : "组织权限禁止查看密码和隐藏字段。" });
+        if (detail.Totp is { Status: "ready", Value: { } code } && detail.TotpRequestId is { } requestId)
+        {
+            _totpView = new TotpCodeView(code, requestId);
+            DetailPanel.Children.Add(_totpView.Element);
+        }
+        else if (detail.Totp is { } totp)
+        {
+            DetailPanel.Children.Add(new InfoBar
+            {
+                IsOpen = true,
+                IsClosable = false,
+                Title = "验证码（TOTP）",
+                Severity = InfoBarSeverity.Informational,
+                Message = totp.Status == "premiumRequired"
+                    ? "生成验证码需要个人或组织的高级会员资格。"
+                    : "请在编辑条目中检查验证器密钥或 otpauth 链接。",
+            });
+        }
         foreach (var field in detail.Fields)
         {
             var panel = new StackPanel { Spacing = 6 };
@@ -235,7 +255,14 @@ public sealed partial class HomePage : Page
     }
 
     private bool IsCurrent(int version, CancellationToken token) => _loaded && version == _version && !token.IsCancellationRequested;
-    private void CancelOperation() { _operation?.Cancel(); _operation?.Dispose(); _operation = null; }
+    private void CancelOperation()
+    {
+        _totpView?.Dispose();
+        _totpView = null;
+        _operation?.Cancel();
+        _operation?.Dispose();
+        _operation = null;
+    }
     private void SetBusy(bool busy)
     {
         _busy = busy;

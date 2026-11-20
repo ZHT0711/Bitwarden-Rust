@@ -24,12 +24,15 @@ bitwarden-crypto = { git = "https://github.com/bitwarden/sdk-internal", rev = "5
 bitwarden-crypto-sync-handler = { git = "https://github.com/bitwarden/sdk-internal", rev = "56c7617b23501af70221094cdee59e10b2a9d8d2" }
 bw-sdk-core = { package = "bitwarden-core", git = "https://github.com/bitwarden/sdk-internal", rev = "56c7617b23501af70221094cdee59e10b2a9d8d2" }
 chrono = { version = "0.4", features = ["serde"] }
+hmac = "0.13"
 http = "1"
 rand = "0.8"
 reqwest = { version = "0.13", default-features = false, features = ["form", "json"] }
 reqwest-middleware = { version = "0.5", features = ["form", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha1 = "0.11"
+sha2 = "0.11"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "time", "net", "sync", "macros"] }
 url = "2"

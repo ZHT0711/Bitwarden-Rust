@@ -442,6 +442,11 @@ class FixtureHandler(BaseHTTPRequestHandler):
                 state.sync_template["UserDecryption"]["MasterPasswordUnlock"]["MasterKeyEncryptedUserKey"] = wrapper
             self.reply({"ok": True})
             return
+        if path in ("/control/disable-premium", "/control/enable-premium"):
+            with state.lock:
+                state.sync_template["profile"]["premium"] = path == "/control/enable-premium"
+            self.reply({"ok": True})
+            return
         if path == "/control/reset":
             state.reset()
             self.reply({"ok": True})

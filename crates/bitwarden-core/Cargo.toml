@@ -21,12 +21,15 @@ bitwarden-crypto-sync-handler.workspace = true
 bitwarden-generators.workspace = true
 bw-sdk-core = { workspace = true, features = ["internal"] }
 chrono.workspace = true
+hmac.workspace = true
 http.workspace = true
 rand.workspace = true
 reqwest.workspace = true
 reqwest-middleware.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha1.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 url.workspace = true

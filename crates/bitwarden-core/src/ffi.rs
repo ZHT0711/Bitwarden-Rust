@@ -3,7 +3,7 @@ use std::{
     panic::{catch_unwind, AssertUnwindSafe},
     sync::{
         atomic::{AtomicU8, Ordering},
-        Arc, Mutex, OnceLock,
+        Arc, Mutex, OnceLock, TryLockError,
     },
 };
 
@@ -26,7 +26,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::auth_request::{self, RequestError};
 use crate::protocol_compat::{self, ResponseKind, SyncCompatibility};
-use crate::vault::{VaultCache, VaultEditorData, VaultError, VaultMutationResult};
+use crate::vault::{VaultCache, VaultEditorData, VaultError, VaultMutationResult, VaultTotp};
 
 const AUTH_FAILED: u32 = 0;
 const AUTHENTICATED: u32 = 1;
@@ -62,10 +62,12 @@ struct AuthSession {
     device_login_middleware: Arc<DeviceLoginMiddleware>,
     unlock_data: Option<PasswordLoginUnlockData>,
     vault: VaultCache,
+    totp_detail: Option<(u64, String)>,
 }
 
 impl AuthSession {
     fn clear_vault_keys(&mut self) -> bool {
+        self.totp_detail = None;
         self.vault.discard_overview();
         catch_unwind(AssertUnwindSafe(|| {
             self.client.internal.get_key_store().clear()
@@ -295,6 +297,7 @@ fn auth_client_for_server<'a>(
             device_login_middleware: middleware,
             unlock_data: None,
             vault: VaultCache::default(),
+            totp_detail: None,
         });
     }
 
@@ -960,11 +963,11 @@ pub unsafe extern "C" fn bw_vault_detail(
         let Some(runtime) = runtime() else {
             return vault_error("internal");
         };
-        let guard = auth_client()
+        let mut guard = auth_client()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(session) = guard
-            .as_ref()
+            .as_mut()
             .filter(|_| bw_auth_session_state() == SESSION_UNLOCKED)
         else {
             return vault_access_error();
@@ -973,8 +976,61 @@ pub unsafe extern "C" fn bw_vault_detail(
             request_id,
             session.vault.detail(&session.client, &id, &password),
         )) {
-            Ok(Ok(detail)) if auth_request::is_current(request_id) => vault_success(&detail),
+            Ok(Ok(mut detail)) if auth_request::is_current(request_id) => {
+                // The request generation acts as the lifetime of the currently open item.
+                // Store only its id. Each refresh decrypts the encrypted record again.
+                session.totp_detail = if matches!(detail.totp, Some(VaultTotp::Ready { .. })) {
+                    detail.totp_request_id = Some(request_id);
+                    Some((request_id, id))
+                } else {
+                    None
+                };
+                vault_success(&detail)
+            }
             Ok(Ok(_)) | Err(RequestError::Cancelled) => vault_error("cancelled"),
+            Err(RequestError::TimedOut) => vault_error("timedOut"),
+            Ok(Err(error)) => vault_error(&error.to_string()),
+        }
+    }))
+    .unwrap_or_else(|_| vault_error("internal"))
+}
+
+#[no_mangle]
+pub extern "C" fn bw_vault_totp_refresh(request_id: u64) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        if bw_auth_session_state() != SESSION_UNLOCKED {
+            return vault_access_error();
+        }
+        if !auth_request::is_current(request_id) {
+            return vault_error("totpViewExpired");
+        }
+        let guard = match auth_client().try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => return vault_error("totpBusy"),
+            Err(TryLockError::Poisoned(error)) => error.into_inner(),
+        };
+        let Some(session) = guard
+            .as_ref()
+            .filter(|_| bw_auth_session_state() == SESSION_UNLOCKED)
+        else {
+            return vault_access_error();
+        };
+        let Some((_, id)) = session
+            .totp_detail
+            .as_ref()
+            .filter(|(active, _)| *active == request_id)
+        else {
+            return vault_error("totpViewExpired");
+        };
+        let Some(runtime) = runtime() else {
+            return vault_error("internal");
+        };
+        match runtime.block_on(auth_request::run(
+            request_id,
+            session.vault.refresh_totp(&session.client, id),
+        )) {
+            Ok(Ok(code)) if auth_request::is_current(request_id) => vault_success(&code),
+            Ok(Ok(_)) | Err(RequestError::Cancelled) => vault_error("totpViewExpired"),
             Err(RequestError::TimedOut) => vault_error("timedOut"),
             Ok(Err(error)) => vault_error(&error.to_string()),
         }

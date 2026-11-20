@@ -12,8 +12,10 @@ public sealed record VaultItem(string Id, string Name, string Subtitle, int Item
     public string StatusLabel => Restricted ? "访问受限" : Deleted ? "已删除" : Archived ? "已归档" : Favorite ? "收藏" : TypeLabel;
 }
 internal sealed record VaultDetail(string Name, int ItemType, DisplayField[] Fields, DateTimeOffset RevisionDate,
-    bool Restricted, bool PasswordHidden, int Attachments);
+    bool Restricted, bool PasswordHidden, int Attachments, VaultTotp? Totp = null, ulong? TotpRequestId = null);
 internal sealed record DisplayField(string Label, string Value, bool Sensitive);
+internal sealed record VaultTotp(string Status, TotpCode? Value);
+internal sealed record TotpCode(string Code, uint Period, long ValidFrom, long ValidUntil);
 
 internal sealed class VaultException(string code) : Exception(code)
 {
@@ -37,6 +39,7 @@ internal sealed class VaultException(string code) : Exception(code)
         "conflict" => "此条目已经发生变化。草稿已保留，请先同步并核对最新版本，避免覆盖其他修改。",
         "writeUncertain" => "服务器可能已经保存了此操作，但未能确认结果。草稿已保留，请先同步核对，勿直接重复创建或提交。",
         "notSynced" => "请先成功同步保险库，再继续读取或写入条目。",
+        "totpViewExpired" => "请重新打开条目以查看验证码。",
         "unsupported" => "此条目或操作暂不受支持。",
         _ => "Rust 核心未能完成操作，请重试或修复应用安装。",
     };
