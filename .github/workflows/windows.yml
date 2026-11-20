@@ -83,7 +83,7 @@ jobs:
               $server.Refresh()
               if ($server.HasExited) { throw "Fixture server exited before readiness (code $($server.ExitCode))." }
               if (Test-Path -LiteralPath $portFile) {
-                $portText = (Get-Content -LiteralPath $portFile -Raw).Trim()
+                $portText = ([string](Get-Content -LiteralPath $portFile -Raw)).Trim()
                 $port = 0
                 if ([int]::TryParse($portText, [ref]$port) -and $port -ge 1 -and $port -le 65535) {
                   $baseUrl = "http://127.0.0.1:$port"

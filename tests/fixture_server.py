@@ -730,7 +730,12 @@ def main() -> int:
     if args.port_file:
         port_file = Path(args.port_file)
         port_file.parent.mkdir(parents=True, exist_ok=True)
-        port_file.write_text(str(server.server_port) + "\n", encoding="ascii")
+        pending = port_file.with_name(f".{port_file.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            pending.write_text(str(server.server_port) + "\n", encoding="ascii")
+            pending.replace(port_file)
+        finally:
+            pending.unlink(missing_ok=True)
     print(json.dumps({"fixture": True, "host": host, "port": server.server_port}, separators=(",", ":")), flush=True)
     try:
         server.serve_forever(poll_interval=0.1)
