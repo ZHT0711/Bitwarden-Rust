@@ -63,7 +63,7 @@ pub extern "C" fn bw_passkey_pending() -> *mut c_char {
                 return vault_access_error();
             };
             if is_vault_registration(&session.server, &request.operation) {
-                request.reject_before_approval(VaultError::PermissionDenied);
+                request.reject_before_approval(VaultError::NotFound);
                 return vault_success(&serde_json::json!({"id":""}));
             }
             let Some(runtime) = runtime() else {
@@ -177,7 +177,7 @@ pub unsafe extern "C" fn bw_passkey_respond(
             let mut guard = auth_client().lock().map_err(|_| VaultError::Internal)?;
             let session = guard.as_mut().filter(|_| bw_auth_session_state() == SESSION_UNLOCKED).ok_or(VaultError::NotAuthenticated)?;
             if !request.is_current() { return Err(VaultError::NotFound); }
-            if is_vault_registration(&session.server, &request.operation) { return Err(VaultError::PermissionDenied); }
+            if is_vault_registration(&session.server, &request.operation) { return Err(VaultError::NotFound); }
             let runtime = runtime().ok_or(VaultError::Internal)?;
             session.vault.reset_write_attempt();
             let result = catch_unwind(AssertUnwindSafe(|| runtime.block_on(async {
