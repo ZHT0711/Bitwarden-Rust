@@ -3,7 +3,7 @@ namespace Bitwarden_WinUI.Interop;
 internal sealed record VaultOverview(VaultItem[] Items, VaultFolder[] Folders, DateTimeOffset LastSync, int Failures);
 internal sealed record VaultFolder(string Id, string Name);
 public sealed record VaultItem(string Id, string Name, string Subtitle, int ItemType, bool Favorite,
-    string? FolderId, string? OrganizationId, bool Deleted, bool Archived, bool Reprompt, bool Restricted)
+    string? FolderId, string? OrganizationId, bool Deleted, bool Archived, bool Reprompt, bool Restricted, string RevisionDate = "")
 {
     public string DisplayName => string.IsNullOrEmpty(Name) ? "（未命名条目）" : Name;
     public override string ToString() => DisplayName;
@@ -27,6 +27,14 @@ internal sealed class VaultException(string code) : Exception(code)
         "passwordRequired" => "此条目需要重新验证主密码。",
         "wrongPassword" => "主密码验证失败，请重试。",
         "timedOut" => "服务器响应超时，请检查网络连接后重试。",
+        "validation" => "条目信息无效，请检查名称、日期、URI 匹配模式和自定义字段。",
+        "permissionDenied" => "当前账户没有执行此操作所需的权限。",
+        "premiumRequired" => "归档需要个人或组织提供的高级会员资格；取消归档仍然可用。",
+        "attachmentUnavailable" => "此条目有未能解密的附件。为避免编辑时丢失附件引用，请先同步并处理附件问题。",
+        "conflict" => "此条目已经发生变化。草稿已保留，请先同步并核对最新版本，避免覆盖其他修改。",
+        "writeUncertain" => "服务器可能已经保存了此操作，但未能确认结果。草稿已保留，请先同步核对，勿直接重复创建或提交。",
+        "notSynced" => "请先成功同步保险库，再继续读取或写入条目。",
+        "unsupported" => "此条目或操作暂不受支持。",
         _ => "Rust 核心未能完成操作，请重试或修复应用安装。",
     };
 }

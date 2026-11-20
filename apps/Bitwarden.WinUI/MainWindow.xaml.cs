@@ -184,11 +184,13 @@ public sealed partial class MainWindow : Window
         var providerBox = new ComboBox { Header = "二步验证方式", Visibility = Visibility.Collapsed, HorizontalAlignment = HorizontalAlignment.Stretch };
         var tokenBox = new TextBox { Header = "验证码", PlaceholderText = "输入一次性验证码", Visibility = Visibility.Collapsed };
         var sendEmailButton = new Button { Content = "发送邮箱验证码", Visibility = Visibility.Collapsed, HorizontalAlignment = HorizontalAlignment.Left };
+        var deviceOtpBox = new TextBox { Header = "新设备邮箱验证码", PlaceholderText = "输入新设备验证邮件中的验证码", Visibility = Visibility.Collapsed };
+        var resendDeviceOtpButton = new Button { Content = "重新发送新设备验证码", Visibility = Visibility.Collapsed, HorizontalAlignment = HorizontalAlignment.Left };
         var progress = new ProgressBar { IsIndeterminate = true, Visibility = Visibility.Collapsed };
         var statusText = new TextBlock { Name = "LoginStatus", TextWrapping = TextWrapping.Wrap };
         var content = new StackPanel { Spacing = 12, MinWidth = 320, MaxWidth = 440 };
         foreach (var element in new UIElement[] { serverBox, serverUrlBox, serverHelp, emailBox,
-            passwordBox, providerBox, tokenBox, sendEmailButton, progress, statusText })
+            passwordBox, deviceOtpBox, resendDeviceOtpButton, providerBox, tokenBox, sendEmailButton, progress, statusText })
         {
             content.Children.Add(element);
         }
@@ -206,6 +208,9 @@ public sealed partial class MainWindow : Window
         var busy = false;
         var closingRequested = false;
         var unsupportedTwoFactor = false;
+        var deviceVerificationRequired = false;
+        var pendingDeviceOtp = string.Empty;
+        var deviceIdentifier = LoginEnvironment.GetDeviceIdentifier();
         CancellationTokenSource? requestCancellation = null;
 
         (uint Mode, string Url) GetServerSelection()
@@ -222,7 +227,7 @@ public sealed partial class MainWindow : Window
             serverBox.IsEnabled = serverUrlBox.IsEnabled = !value;
             emailBox.IsEnabled = passwordBox.IsEnabled = !value;
             providerBox.IsEnabled = tokenBox.IsEnabled = !value;
-            sendEmailButton.IsEnabled = !value;
+            deviceOtpBox.IsEnabled = sendEmailButton.IsEnabled = resendDeviceOtpButton.IsEnabled = !value;
             dialog.IsPrimaryButtonEnabled = !value && !unsupportedTwoFactor;
             dialog.CloseButtonText = value ? "取消请求" : "取消";
         }
@@ -231,8 +236,12 @@ public sealed partial class MainWindow : Window
         {
             if (busy) return;
             unsupportedTwoFactor = false;
+            deviceVerificationRequired = false;
+            pendingDeviceOtp = string.Empty;
             providerBox.Items.Clear();
             providerBox.Visibility = tokenBox.Visibility = sendEmailButton.Visibility = Visibility.Collapsed;
+            deviceOtpBox.Visibility = resendDeviceOtpButton.Visibility = Visibility.Collapsed;
+            deviceOtpBox.Text = string.Empty;
             tokenBox.Text = string.Empty;
             statusText.Text = string.Empty;
             dialog.IsPrimaryButtonEnabled = true;
@@ -324,6 +333,34 @@ public sealed partial class MainWindow : Window
             finally { FinishRequest(); }
         };
 
+        resendDeviceOtpButton.Click += async (_, _) =>
+        {
+            if (busy) return;
+            try
+            {
+                var email = emailBox.Text.Trim();
+                var password = passwordBox.Password;
+                var (mode, url) = GetServerSelection();
+                if (!Validate(email, password, mode, url)) return;
+                requestCancellation = new CancellationTokenSource();
+                var cancellationToken = requestCancellation.Token;
+                SetBusy(true);
+                statusText.Text = "正在重新发送新设备验证码…";
+                var result = await Task.Run(() => RustCore.ResendNewDeviceVerification(
+                    email, password, deviceIdentifier, mode, url, cancellationToken));
+                statusText.Text = result switch
+                {
+                    AuthStatus.Authenticated => "已请求重新发送验证码。请检查账户邮箱。",
+                    AuthStatus.TimedOut => "服务器响应超时，请检查网络后重试。",
+                    AuthStatus.Cancelled => "请求已取消。",
+                    _ => "无法重新发送验证码。请确认登录信息后重试。",
+                };
+            }
+            catch (OperationCanceledException) { statusText.Text = "请求已取消。"; }
+            catch (Exception error) when (IsCoreUnavailable(error)) { statusText.Text = "Rust 核心未能加载，请重新构建或修复应用安装。"; }
+            finally { FinishRequest(); }
+        };
+
         dialog.PrimaryButtonClick += async (_, args) =>
         {
             args.Cancel = true;
@@ -343,23 +380,50 @@ public sealed partial class MainWindow : Window
                     tokenBox.Focus(FocusState.Programmatic);
                     return;
                 }
+                var deviceOtp = deviceVerificationRequired ? deviceOtpBox.Text.Trim() : pendingDeviceOtp;
+                if (deviceVerificationRequired && deviceOtp.Length == 0)
+                {
+                    statusText.Text = "请输入新设备验证邮件中的验证码。";
+                    deviceOtpBox.Focus(FocusState.Programmatic);
+                    return;
+                }
                 var provider = providerBox.SelectedItem is ComboBoxItem item && item.Tag is uint id ? id : 0;
                 requestCancellation = new CancellationTokenSource();
                 var cancellationToken = requestCancellation.Token;
                 SetBusy(true);
                 statusText.Text = "正在验证账户…";
                 var result = await Task.Run(() => RustCore.Login(email, password, provider,
-                    needsToken ? token : string.Empty, mode, url, cancellationToken));
+                    needsToken ? token : string.Empty, deviceOtp, mode, url, deviceIdentifier, cancellationToken));
                 if (result.Status == AuthStatus.Authenticated)
                 {
                     authenticated = true;
+                    deviceVerificationRequired = false;
+                    pendingDeviceOtp = string.Empty;
                     SignInButton.Content = "退出登录";
                     SyncButton.IsEnabled = true;
                     if (NavFrame.Content is HomePage page) page.ShowAuthenticated();
                     return;
                 }
+                if (result.Status is AuthStatus.NewDeviceVerificationRequired or AuthStatus.InvalidNewDeviceVerificationCode)
+                {
+                    deviceVerificationRequired = true;
+                    deviceOtpBox.Visibility = resendDeviceOtpButton.Visibility = Visibility.Visible;
+                    providerBox.Visibility = tokenBox.Visibility = sendEmailButton.Visibility = Visibility.Collapsed;
+                    tokenBox.Text = string.Empty;
+                    statusText.Text = result.Status == AuthStatus.InvalidNewDeviceVerificationCode
+                        ? "新设备验证码无效或已过期。请重新输入或重新发送。"
+                        : "此账户要求验证新设备。服务器已发送验证码，请检查账户邮箱后输入。";
+                    if (result.Status == AuthStatus.NewDeviceVerificationRequired) deviceOtpBox.Text = string.Empty;
+                    return;
+                }
                 if (result.Status == AuthStatus.TwoFactorRequired)
                 {
+                    if (deviceVerificationRequired)
+                    {
+                        pendingDeviceOtp = deviceOtp;
+                        deviceVerificationRequired = false;
+                        deviceOtpBox.Visibility = resendDeviceOtpButton.Visibility = Visibility.Collapsed;
+                    }
                     var previousProvider = providerBox.SelectedItem is ComboBoxItem previous ? previous.Tag : null;
                     PopulateTwoFactorMethods(providerBox, result.AvailableTwoFactorMethods);
                     foreach (var candidate in providerBox.Items.OfType<ComboBoxItem>())
@@ -369,6 +433,8 @@ public sealed partial class MainWindow : Window
                     providerBox.Visibility = Visibility.Visible;
                     tokenBox.Visibility = Visibility.Visible;
                     tokenBox.Text = string.Empty;
+                    sendEmailButton.Visibility = providerBox.SelectedItem is ComboBoxItem selected && selected.Tag is uint selectedProvider && selectedProvider == 1
+                        ? Visibility.Visible : Visibility.Collapsed;
                     unsupportedTwoFactor = providerBox.Items.Count == 0;
                     statusText.Text = unsupportedTwoFactor
                         ? "此账户的二步验证方式暂不受支持。当前支持身份验证器、邮箱验证码和 YubiKey。"
@@ -379,6 +445,7 @@ public sealed partial class MainWindow : Window
                 {
                     AuthStatus.TimedOut => "服务器响应超时，请检查服务器地址和网络连接后重试。",
                     AuthStatus.Cancelled => "请求已取消。",
+                    AuthStatus.Failed when deviceVerificationRequired && !needsToken => "新设备验证码无效或已过期。请重新输入或重新发送。",
                     _ => "登录失败。请检查账户、主密码、验证码和服务器地址后重试。",
                 };
             }
@@ -400,6 +467,8 @@ public sealed partial class MainWindow : Window
             requestCancellation?.Cancel();
             requestCancellation?.Dispose();
             passwordBox.Password = string.Empty;
+            deviceOtpBox.Text = string.Empty;
+            pendingDeviceOtp = string.Empty;
             tokenBox.Text = string.Empty;
             // Server preferences are not account credentials and can be saved without logging in.
             var (mode, url) = GetServerSelection();

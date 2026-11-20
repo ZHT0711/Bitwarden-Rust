@@ -15,9 +15,33 @@ jobs:
         with:
           dotnet-version: 10.0.x
       - name: Prepare Rust
+        id: rust-toolchain
+        shell: pwsh
         run: |
           rustup update stable --no-self-update
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           rustup component add rustfmt clippy
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $version = (& rustc --version).Trim()
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $version = $version -replace '[^A-Za-z0-9._-]', '_'
+          "version=$version" | Add-Content -LiteralPath $env:GITHUB_OUTPUT
+      - name: Restore Cargo dependencies and build cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        continue-on-error: true
+        timeout-minutes: 5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ steps.rust-toolchain.outputs.version }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-${{ steps.rust-toolchain.outputs.version }}-
+          enableCrossOsArchive: false
+          fail-on-cache-miss: false
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: 5
       - name: Formatting, native tests and Clippy
         shell: pwsh
         run: |
@@ -29,8 +53,85 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cargo clippy --locked -p bitwarden-core@0.2.0 --all-targets -- -D warnings
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-      - name: Managed filters and native interop
-        run: dotnet run --project tests/Bitwarden.Interop.Tests -- target/debug/bitwarden_core.dll
+          New-Item -ItemType Directory -Force -Path work | Out-Null
+          $env:BITWARDEN_FIXTURE_OUTPUT = Join-Path $env:GITHUB_WORKSPACE 'work/ci-fixture.json'
+          cargo test --locked -p bitwarden-core@0.2.0 write_synthetic_ui_fixture -- --ignored
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Managed filters and native HTTP lifecycle
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python tests/fixture_server.py --self-test
+          if ($LASTEXITCODE) { throw "Fixture server self-tests failed with exit code $LASTEXITCODE." }
+          $work = Join-Path $env:GITHUB_WORKSPACE 'work'
+          $portFile = Join-Path $work 'ci-port.txt'
+          $stdout = Join-Path $work 'ci-fixture.stdout.log'
+          $stderr = Join-Path $work 'ci-fixture.stderr.log'
+          if (Test-Path -LiteralPath $portFile) { Remove-Item -LiteralPath $portFile -Force -ErrorAction Stop }
+          $server = $null
+          $baseUrl = $null
+          $ready = $false
+          try {
+            $python = (Get-Command python -ErrorAction Stop).Source
+            $server = Start-Process -FilePath $python -ArgumentList @(
+              '-u', 'tests/fixture_server.py', '--fixture', 'work/ci-fixture.json',
+              '--port-file', 'work/ci-port.txt'
+            ) -WorkingDirectory $env:GITHUB_WORKSPACE -WindowStyle Hidden -PassThru `
+              -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+            $deadline = [DateTime]::UtcNow.AddSeconds(30)
+            while ([DateTime]::UtcNow -lt $deadline) {
+              $server.Refresh()
+              if ($server.HasExited) { throw "Fixture server exited before readiness (code $($server.ExitCode))." }
+              if (Test-Path -LiteralPath $portFile) {
+                $portText = (Get-Content -LiteralPath $portFile -Raw).Trim()
+                $port = 0
+                if ([int]::TryParse($portText, [ref]$port) -and $port -ge 1 -and $port -le 65535) {
+                  $baseUrl = "http://127.0.0.1:$port"
+                  try {
+                    $health = Invoke-RestMethod -Uri "$baseUrl/health" -TimeoutSec 2
+                    if ($health.fixture -is [bool] -and $health.fixture) { $ready = $true; break }
+                  } catch {
+                    # Allow startup only while this same process is still live and within its deadline.
+                  }
+                }
+              }
+              Start-Sleep -Milliseconds 250
+            }
+            if (-not $ready) { throw 'Fixture server readiness timed out after 30 seconds.' }
+            $server.Refresh()
+            if ($server.HasExited) { throw 'Fixture server exited before the native lifecycle checks.' }
+            dotnet run --project tests/Bitwarden.Interop.Tests -- target/debug/bitwarden_core.dll $baseUrl
+            if ($LASTEXITCODE) { throw "Managed/native lifecycle checks failed with exit code $LASTEXITCODE." }
+          } catch {
+            if (-not $ready) {
+              # This loopback-only helper never emits request bodies or authentication tokens.
+              foreach ($log in @($stdout, $stderr)) {
+                if (Test-Path -LiteralPath $log) {
+                  Write-Host "Fixture startup log: $([IO.Path]::GetFileName($log))"
+                  Get-Content -LiteralPath $log -Tail 80
+                }
+              }
+            }
+            throw
+          } finally {
+            if ($null -ne $server) {
+              try {
+                $server.Refresh()
+                if (-not $server.HasExited) {
+                  if ($null -ne $baseUrl) {
+                    try { Invoke-RestMethod -Method Post -Uri "$baseUrl/control/stop" -TimeoutSec 2 | Out-Null } catch { }
+                  }
+                  if (-not $server.WaitForExit(5000)) {
+                    try { Stop-Process -Id $server.Id -Force -ErrorAction Stop } catch {
+                      $server.Refresh()
+                      if (-not $server.HasExited) { throw }
+                    }
+                    if (-not $server.WaitForExit(5000)) { throw 'Fixture server did not stop after termination.' }
+                  }
+                }
+              } finally { $server.Dispose() }
+            }
+          }
       - name: Build unsigned x64 MSIX preview
         run: dotnet build apps/Bitwarden.WinUI/Bitwarden.WinUI.csproj -p:Platform=x64 -p:GenerateAppxPackageOnBuild=true -p:AppxPackageSigningEnabled=false --nologo
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

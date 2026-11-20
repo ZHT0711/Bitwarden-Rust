@@ -1,6 +1,14 @@
 //! The account vault uses official SDK ciphertext and crypto, never the local snapshot prototype.
 //! Only display metadata is cached in plaintext. Secrets are decrypted for one selected item.
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
+
+mod mutations;
+mod repository;
+pub(crate) use mutations::{VaultEditorData, VaultMutationResult};
+use repository::CipherRepository;
 
 use bitwarden_api_api::models::SyncResponseModel;
 use bitwarden_crypto_sync_handler::{CryptoSyncData, CryptoSyncHandlerClientExt};
@@ -26,6 +34,24 @@ pub(crate) enum VaultError {
     PasswordRequired,
     #[error("wrongPassword")]
     WrongPassword,
+    #[error("validation")]
+    Validation,
+    #[error("permissionDenied")]
+    PermissionDenied,
+    #[error("conflict")]
+    Conflict,
+    #[error("writeUncertain")]
+    WriteUncertain,
+    #[error("notSynced")]
+    NotSynced,
+    #[error("unsupported")]
+    Unsupported,
+    #[error("premiumRequired")]
+    PremiumRequired,
+    #[error("attachmentUnavailable")]
+    AttachmentUnavailable,
+    #[error("internal")]
+    Internal,
 }
 
 #[derive(Clone, Serialize)]
@@ -42,6 +68,7 @@ pub(crate) struct VaultItem {
     archived: bool,
     reprompt: bool,
     restricted: bool,
+    revision_date: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -61,9 +88,13 @@ pub(crate) struct VaultOverview {
 
 #[derive(Default)]
 pub(crate) struct VaultCache {
-    ciphers: HashMap<String, Cipher>,
+    ciphers: Arc<CipherRepository>,
     encrypted_user_key: Option<String>,
     overview: Option<VaultOverview>,
+    base_failures: usize,
+    can_archive: bool,
+    write_uncertain: bool,
+    write_started: bool,
 }
 
 #[derive(Serialize)]
@@ -86,6 +117,28 @@ pub(crate) struct VaultDetail {
 }
 
 impl VaultCache {
+    /// The same encrypted map is used by this cache and the SDK's high-level write clients.
+    /// Registration is synchronous, so a cancelled sync cannot partially replace SDK storage.
+    pub(crate) fn activate(&self, client: &Client) {
+        client
+            .platform()
+            .state()
+            .register_client_managed(self.ciphers.clone());
+    }
+
+    pub(crate) fn mark_write_uncertain(&mut self) {
+        self.write_uncertain = true;
+    }
+    pub(crate) fn write_in_flight(&self) -> bool {
+        self.write_started
+    }
+    pub(crate) fn needs_reconciliation(&self) -> bool {
+        self.write_uncertain
+    }
+    pub(crate) fn reset_write_attempt(&mut self) {
+        self.write_started = false;
+    }
+
     pub(crate) fn overview(&self) -> Result<&VaultOverview, VaultError> {
         self.overview.as_ref().ok_or(VaultError::NotFound)
     }
@@ -119,11 +172,15 @@ impl VaultCache {
             .profile
             .as_deref()
             .ok_or(VaultError::InvalidResponse)?;
-        if let Some(user_id) = client.internal.get_user_id() {
-            if profile.id.map(|id| id.to_string()) != Some(user_id.to_string()) {
-                return Err(VaultError::InvalidResponse);
-            }
-        }
+        // The SDK's legacy password-login helper initializes crypto/tokens but not its user id.
+        // Bind it from this authenticated sync response before high-level writes need encrypted_for.
+        // init_user_id accepts the same id and rejects every later cross-account reassignment.
+        let user_id = profile.id.ok_or(VaultError::InvalidResponse)?;
+        client
+            .internal
+            .init_user_id(bw_sdk_core::UserId::new(user_id))
+            .await
+            .map_err(|_| VaultError::InvalidResponse)?;
         let crypto =
             CryptoSyncData::try_from(&response).map_err(|_| VaultError::InvalidResponse)?;
         // Let the official SDK handle security-state transitions and key upgrades.
@@ -174,6 +231,7 @@ impl VaultCache {
             .await
             .map_err(|_| VaultError::DecryptionFailed)?;
         failures += result.failures.len();
+        let decryption_failures = result.failures.len();
         let mut items = Vec::new();
         for view in result.successes {
             let Some(id) = view.id.map(|id| id.to_string()) else {
@@ -192,6 +250,7 @@ impl VaultCache {
                 archived: view.archived_date.is_some(),
                 reprompt: view.reprompt as u8 != 0,
                 restricted: view.partial,
+                revision_date: view.revision_date.to_rfc3339(),
             });
         }
         items.sort_by_cached_key(|item| item.name.to_lowercase());
@@ -220,8 +279,17 @@ impl VaultCache {
         }
         folders.sort_by_cached_key(|folder| folder.name.to_lowercase());
         Ok(Self {
-            ciphers,
+            ciphers: Arc::new(CipherRepository::from(ciphers)),
             encrypted_user_key: profile.key.clone(),
+            base_failures: failures.saturating_sub(decryption_failures),
+            can_archive: profile.premium.unwrap_or(false)
+                || profile
+                    .organizations
+                    .iter()
+                    .flatten()
+                    .any(|org| org.users_get_premium.unwrap_or(false)),
+            write_uncertain: false,
+            write_started: false,
             overview: Some(VaultOverview {
                 items,
                 folders,
@@ -237,7 +305,14 @@ impl VaultCache {
         id: &str,
         password: &str,
     ) -> Result<VaultDetail, VaultError> {
-        let cipher = self.ciphers.get(id).ok_or(VaultError::NotFound)?;
+        if self.write_uncertain {
+            return Err(VaultError::NotSynced);
+        }
+        let cipher = self
+            .ciphers
+            .find(id)
+            .map_err(|_| VaultError::Internal)?
+            .ok_or(VaultError::NotFound)?;
         if cipher.reprompt as u8 != 0 {
             if password.is_empty() {
                 return Err(VaultError::PasswordRequired);

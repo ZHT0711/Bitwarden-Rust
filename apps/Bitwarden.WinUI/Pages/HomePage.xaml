@@ -5,10 +5,24 @@
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
     xmlns:interop="using:Bitwarden_WinUI.Interop">
     <Grid Padding="24,8,24,24" RowSpacing="14" RowDefinitions="Auto,Auto,Auto,*">
-        <StackPanel Spacing="4">
-            <TextBlock x:Name="PageTitle" Style="{StaticResource TitleTextBlockStyle}" Text="我的保险库" />
-            <TextBlock x:Name="PageSubtitle" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="密码、笔记与敏感信息都集中在这里。" TextWrapping="Wrap" />
-        </StackPanel>
+        <Grid ColumnDefinitions="*,Auto" ColumnSpacing="12">
+            <StackPanel Spacing="4">
+                <TextBlock x:Name="PageTitle" Style="{StaticResource TitleTextBlockStyle}" Text="我的保险库" />
+                <TextBlock x:Name="PageSubtitle" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="密码、笔记与敏感信息都集中在这里。" TextWrapping="Wrap" />
+            </StackPanel>
+            <CommandBar Grid.Column="1" Background="Transparent" VerticalAlignment="Center" DefaultLabelPosition="Right"
+                ClosedDisplayMode="Compact" IsDynamicOverflowEnabled="True" MaxWidth="280">
+                <AppBarButton x:Name="NewItemButton" Icon="Add" Label="新增" Click="NewItem_Click" IsEnabled="False" />
+                <AppBarButton x:Name="EditItemButton" Icon="Edit" Label="编辑" Click="EditItem_Click" IsEnabled="False" />
+                <CommandBar.SecondaryCommands>
+                    <AppBarButton x:Name="FavoriteItemButton" Icon="Favorite" Label="收藏" Tag="favorite" Click="ItemAction_Click" IsEnabled="False" />
+                    <AppBarButton x:Name="ArchiveItemButton" Icon="Folder" Label="归档" Tag="archive" Click="ItemAction_Click" IsEnabled="False" />
+                    <AppBarButton x:Name="TrashItemButton" Icon="Delete" Label="移至回收站" Tag="trash" Click="ItemAction_Click" IsEnabled="False" />
+                    <AppBarButton x:Name="RestoreItemButton" Icon="Undo" Label="还原" Tag="restore" Click="ItemAction_Click" IsEnabled="False" Visibility="Collapsed" />
+                    <AppBarButton x:Name="DeleteItemButton" Icon="Delete" Label="永久删除" Tag="delete" Click="ItemAction_Click" IsEnabled="False" Visibility="Collapsed" />
+                </CommandBar.SecondaryCommands>
+            </CommandBar>
+        </Grid>
         <InfoBar x:Name="ConnectionNotice" Grid.Row="1" IsClosable="False" IsOpen="True"
             Title="请先登录" Message="登录后同步并在本机解密你的 Bitwarden 保险库。" Severity="Informational" />
         <Grid Grid.Row="2" ColumnSpacing="12" ColumnDefinitions="Auto,*,Auto,Auto">

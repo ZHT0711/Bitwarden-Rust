@@ -58,9 +58,12 @@ public sealed partial class HomePage : Page
 
     public void ClearSensitiveState()
     {
+        AbortMutationFlow();
         _version++;
         CancelOperation();
         _overview = null;
+        _editorOpen = false;
+        _requiresSync = false;
         _syncing = false;
         VaultList.ItemsSource = null;
         DetailPanel.Children.Clear();
@@ -72,7 +75,7 @@ public sealed partial class HomePage : Page
 
     public async Task RefreshAsync(bool forceSync)
     {
-        if (!_loaded || _syncing) return;
+        if (!_loaded || _syncing || _editorOpen) return;
         CancelOperation();
         var version = ++_version;
         var cancellation = _operation = new CancellationTokenSource();
@@ -92,12 +95,13 @@ public sealed partial class HomePage : Page
                 result = forceSync ? await Task.Run(() => RustCore.SyncVault(token), token)
                     : await Task.Run(RustCore.GetVaultOverview, token);
             }
-            catch (VaultException error) when (!forceSync && error.Code == "notFound")
+            catch (VaultException error) when (!forceSync && (error.Code is "notFound" or "notSynced"))
             {
                 result = await Task.Run(() => RustCore.SyncVault(token), token);
             }
             if (!IsCurrent(version, token)) return;
             _overview = result;
+            _requiresSync = false;
             PopulateFolders();
             ApplyFilters();
             SetNotice(result.Failures > 0 ? "保险库已加载，部分条目无法读取" : "保险库已加载",
@@ -135,11 +139,12 @@ public sealed partial class HomePage : Page
         ItemCount.Text = $"{items.Length} 个条目";
         EmptyState.Visibility = items.Length == 0 ? Visibility.Visible : Visibility.Collapsed;
         EmptyMessage.Text = _overview is null ? "登录或同步以查看你的保险库" : _query.Length > 0 ? "没有匹配的条目" : "此分类或文件夹中没有条目";
+        UpdateMutationCommands();
     }
 
     private async void VaultList_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
-        if (_syncing) return;
+        if (_syncing || _editorOpen) return;
         if (VaultList.SelectedItem is not VaultItem item)
         {
             CancelOperation();
@@ -218,9 +223,11 @@ public sealed partial class HomePage : Page
     private void CancelOperation() { _operation?.Cancel(); _operation?.Dispose(); _operation = null; }
     private void SetBusy(bool busy)
     {
+        _busy = busy;
         LoadingRing.IsActive = busy;
         LoadingRing.Visibility = CancelRequestButton.Visibility = busy ? Visibility.Visible : Visibility.Collapsed;
         FolderFilter.IsEnabled = !busy;
+        UpdateMutationCommands();
     }
     private void SetNotice(string title, string message, InfoBarSeverity severity)
     { ConnectionNotice.Title = title; ConnectionNotice.Message = message; ConnectionNotice.Severity = severity; ConnectionNotice.IsOpen = true; }

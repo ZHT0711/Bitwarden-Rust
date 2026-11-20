@@ -43,7 +43,7 @@ if (args.Length > 0)
     listener.Start();
     using var cancellation = new CancellationTokenSource();
     var port = ((IPEndPoint)listener.LocalEndpoint).Port;
-    var login = Task.Run(() => RustCore.Login("fixture@example.invalid", "synthetic-password", 0, "", 2, $"http://127.0.0.1:{port}", cancellation.Token));
+    var login = Task.Run(() => RustCore.Login("fixture@example.invalid", "synthetic-password", 0, "", "", 2, $"http://127.0.0.1:{port}", Guid.NewGuid().ToString("D"), cancellation.Token));
     try
     {
         using var connection = await listener.AcceptTcpClientAsync().WaitAsync(TimeSpan.FromSeconds(10));
@@ -53,5 +53,6 @@ if (args.Length > 0)
         Check(!RustCore.IsAuthenticated, "cancelled login leaves no authenticated session");
     }
     finally { cancellation.Cancel(); listener.Stop(); RustCore.Logout(); }
+    if (args.Length > 1) await NativeLifecycle.RunAsync(args[1], Check);
 }
 Console.WriteLine($"{count} checks passed.");

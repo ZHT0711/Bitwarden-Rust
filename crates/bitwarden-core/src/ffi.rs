@@ -3,30 +3,34 @@ use std::{
     panic::{catch_unwind, AssertUnwindSafe},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Mutex, OnceLock,
+        Arc, Mutex, OnceLock,
     },
 };
 
+use async_trait::async_trait;
 use bitwarden_auth::token_management::PasswordManagerTokenHandler;
 use bitwarden_generators::{
     GeneratorClient, GeneratorClientsExt, PassphraseGeneratorRequest, PasswordGeneratorRequest,
 };
 use bw_sdk_core::{
-    auth::login::{PasswordLoginRequest, TwoFactorProvider, TwoFactorRequest},
+    auth::login::{LoginError, PasswordLoginRequest, TwoFactorProvider, TwoFactorRequest},
     client::{ClientSettings, DeviceType},
+    key_management::MasterPasswordAuthenticationData,
     Client, ClientBuilder,
 };
 use url::Url;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::auth_request::{self, RequestError};
-use crate::vault::{VaultCache, VaultError};
+use crate::vault::{VaultCache, VaultEditorData, VaultError, VaultMutationResult};
 
 const AUTH_FAILED: u32 = 0;
 const AUTHENTICATED: u32 = 1;
 const TWO_FACTOR_REQUIRED: u32 = 2;
 const AUTH_TIMED_OUT: u32 = 3;
 const AUTH_CANCELLED: u32 = 4;
+const DEVICE_VERIFICATION_REQUIRED: u32 = 5;
+const DEVICE_VERIFICATION_INVALID: u32 = 6;
 const TWO_FACTOR_MASK_SHIFT: u32 = 8;
 const TWO_FACTOR_AUTHENTICATOR: u32 = 1 << 0;
 const TWO_FACTOR_EMAIL: u32 = 1 << 1;
@@ -45,8 +49,85 @@ struct AuthServer {
 
 struct AuthSession {
     server: AuthServer,
+    device_identifier: String,
     client: Client,
+    device_login_middleware: Arc<DeviceLoginMiddleware>,
     vault: VaultCache,
+}
+
+struct DeviceLoginMiddleware {
+    device_identifier: String,
+    pending_otp: Mutex<Option<Zeroizing<String>>>,
+}
+
+impl DeviceLoginMiddleware {
+    fn new(device_identifier: String) -> Self {
+        Self {
+            device_identifier,
+            pending_otp: Mutex::new(None),
+        }
+    }
+
+    fn arm(&self, otp: &str) {
+        let mut pending = self
+            .pending_otp
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *pending = (!otp.is_empty()).then(|| Zeroizing::new(otp.to_owned()));
+    }
+
+    fn rewrite_login_request(&self, request: &mut reqwest::Request, new_device_otp: Option<&str>) {
+        let Some(body) = request.body().and_then(reqwest::Body::as_bytes) else {
+            return;
+        };
+        let mut fields: Vec<(String, String)> =
+            url::form_urlencoded::parse(body).into_owned().collect();
+        let mut form = url::form_urlencoded::Serializer::new(String::new());
+        for (key, value) in &fields {
+            if matches!(
+                key.as_str(),
+                "deviceType" | "deviceIdentifier" | "deviceName" | "newDeviceOtp"
+            ) {
+                continue;
+            }
+            form.append_pair(key, value);
+        }
+        form.append_pair("deviceType", "6");
+        form.append_pair("deviceIdentifier", &self.device_identifier);
+        form.append_pair("deviceName", "BitwardenWinUI");
+        if let Some(otp) = new_device_otp {
+            form.append_pair("newDeviceOtp", otp);
+        }
+        let encoded = form.finish();
+        for (key, value) in &mut fields {
+            if key == "password" {
+                value.zeroize();
+            }
+        }
+        *request.body_mut() = Some(reqwest::Body::from(encoded));
+    }
+}
+
+#[async_trait]
+impl reqwest_middleware::Middleware for DeviceLoginMiddleware {
+    async fn handle(
+        &self,
+        mut request: reqwest::Request,
+        extensions: &mut http::Extensions,
+        next: reqwest_middleware::Next<'_>,
+    ) -> reqwest_middleware::Result<reqwest::Response> {
+        if request.url().path().ends_with("/connect/token")
+            && request.method() == reqwest::Method::POST
+        {
+            let otp = self
+                .pending_otp
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            self.rewrite_login_request(&mut request, otp.as_deref().map(String::as_str));
+        }
+        next.run(request, extensions).await
+    }
 }
 
 struct SensitiveLoginRequest(PasswordLoginRequest);
@@ -135,7 +216,7 @@ fn custom_auth_server(base_url: &str) -> Option<AuthServer> {
     })
 }
 
-fn build_auth_client(server: &AuthServer) -> Client {
+fn build_auth_client(server: &AuthServer, middleware: Arc<DeviceLoginMiddleware>) -> Client {
     let settings = ClientSettings {
         api_url: server.api_url.clone(),
         identity_url: server.identity_url.clone(),
@@ -152,20 +233,30 @@ fn build_auth_client(server: &AuthServer) -> Client {
     ClientBuilder::new()
         .with_settings(settings)
         .with_token_handler(std::sync::Arc::new(PasswordManagerTokenHandler::default()))
+        .with_identity_middleware(vec![middleware])
         .build()
 }
 
 fn auth_client_for_server<'a>(
     session: &'a mut Option<AuthSession>,
     server: &AuthServer,
+    device_identifier: &str,
 ) -> &'a Client {
-    if session
-        .as_ref()
-        .is_none_or(|current| current.server != *server)
-    {
+    if session.as_ref().is_none_or(|current| {
+        current.server != *server || current.device_identifier != device_identifier
+    }) {
+        let device_identifier = if uuid::Uuid::parse_str(device_identifier).is_ok() {
+            device_identifier.to_owned()
+        } else {
+            // Never share one global device identifier across installations.
+            uuid::Uuid::new_v4().to_string()
+        };
+        let middleware = Arc::new(DeviceLoginMiddleware::new(device_identifier.clone()));
         *session = Some(AuthSession {
             server: server.clone(),
-            client: build_auth_client(server),
+            device_identifier,
+            client: build_auth_client(server, middleware.clone()),
+            device_login_middleware: middleware,
             vault: VaultCache::default(),
         });
         AUTHENTICATED_STATE.store(false, Ordering::Release);
@@ -231,6 +322,18 @@ fn login_status(
             };
             let methods = supported_two_factor_methods(&providers);
             TWO_FACTOR_REQUIRED | (methods << TWO_FACTOR_MASK_SHIFT)
+        }
+        Err(LoginError::IdentityFail(error))
+            if error.to_string().trim() == "new device verification required" =>
+        {
+            AUTHENTICATED_STATE.store(false, Ordering::Release);
+            DEVICE_VERIFICATION_REQUIRED
+        }
+        Err(LoginError::IdentityFail(error))
+            if error.to_string().trim() == "invalid new device otp" =>
+        {
+            AUTHENTICATED_STATE.store(false, Ordering::Release);
+            DEVICE_VERIFICATION_INVALID
         }
         Err(_) => {
             AUTHENTICATED_STATE.store(false, Ordering::Release);
@@ -363,6 +466,8 @@ pub unsafe extern "C" fn bw_auth_login(
     token: *const c_char,
     server_mode: u32,
     server_url: *const c_char,
+    device_identifier: *const c_char,
+    device_otp: *const c_char,
     request_id: u64,
 ) -> u32 {
     catch_unwind(AssertUnwindSafe(|| {
@@ -380,6 +485,13 @@ pub unsafe extern "C" fn bw_auth_login(
         let Some(server_url) = (unsafe { read_utf8(server_url) }) else {
             return AUTH_FAILED;
         };
+        let Some(device_identifier) = (unsafe { read_utf8(device_identifier) }) else {
+            return AUTH_FAILED;
+        };
+        let Some(device_otp) = (unsafe { read_utf8(device_otp) }) else {
+            return AUTH_FAILED;
+        };
+        let device_otp = Zeroizing::new(device_otp);
         let Some(server) = auth_server(server_mode, &server_url) else {
             return AUTH_FAILED;
         };
@@ -412,17 +524,27 @@ pub unsafe extern "C" fn bw_auth_login(
             let mut session = auth_client()
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let client = auth_client_for_server(&mut session, &server);
+            auth_client_for_server(&mut session, &server, &device_identifier);
+            let active_session = session
+                .as_ref()
+                .expect("authentication session was initialized");
+            active_session.device_login_middleware.arm(&device_otp);
             let response = runtime.block_on(auth_request::run(
                 request_id,
-                client.auth().login_password(&request.0),
+                active_session.client.auth().login_password(&request.0),
             ));
             let status = match response {
                 Ok(response) => login_status(response),
                 Err(RequestError::TimedOut) => AUTH_TIMED_OUT,
                 Err(RequestError::Cancelled) => AUTH_CANCELLED,
             };
-            if status & 0xff != AUTHENTICATED && status & 0xff != TWO_FACTOR_REQUIRED {
+            if !matches!(
+                status & 0xff,
+                AUTHENTICATED
+                    | TWO_FACTOR_REQUIRED
+                    | DEVICE_VERIFICATION_REQUIRED
+                    | DEVICE_VERIFICATION_INVALID
+            ) {
                 // Includes partially authenticated state if a request failed after setting tokens.
                 *session = None;
                 AUTHENTICATED_STATE.store(false, Ordering::Release);
@@ -478,7 +600,11 @@ pub unsafe extern "C" fn bw_auth_send_two_factor_email(
             let mut session = auth_client()
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let client = auth_client_for_server(&mut session, &server);
+            let device_identifier = session
+                .as_ref()
+                .map(|current| current.device_identifier.clone())
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            let client = auth_client_for_server(&mut session, &server, &device_identifier);
             let response = runtime.block_on(auth_request::run(
                 request_id,
                 client.auth().send_two_factor_email(&request.0),
@@ -502,6 +628,97 @@ pub unsafe extern "C" fn bw_auth_send_two_factor_email(
         }
     }))
     .unwrap_or(0)
+}
+
+/// Resend the email code for Bitwarden new-device verification.
+#[no_mangle]
+pub unsafe extern "C" fn bw_auth_resend_new_device_verification(
+    email: *const c_char,
+    password: *const c_char,
+    device_identifier: *const c_char,
+    server_mode: u32,
+    server_url: *const c_char,
+    request_id: u64,
+) -> u8 {
+    catch_unwind(AssertUnwindSafe(|| {
+        let (Some(email), Some(password), Some(device_identifier), Some(server_url)) = (
+            unsafe { read_utf8(email) },
+            unsafe { read_utf8(password) },
+            unsafe { read_utf8(device_identifier) },
+            unsafe { read_utf8(server_url) },
+        ) else {
+            return AUTH_FAILED as u8;
+        };
+        let password = Zeroizing::new(password);
+        let email = email.trim().to_owned();
+        let Some(server) = auth_server(server_mode, &server_url) else {
+            return AUTH_FAILED as u8;
+        };
+        if email.is_empty()
+            || password.is_empty()
+            || uuid::Uuid::parse_str(&device_identifier).is_err()
+        {
+            return AUTH_FAILED as u8;
+        }
+
+        let result = catch_unwind(AssertUnwindSafe(|| -> Result<u8, ()> {
+            let runtime = runtime().ok_or(())?;
+            let mut session = auth_client()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            auth_client_for_server(&mut session, &server, &device_identifier);
+            let active_session = session
+                .as_ref()
+                .expect("authentication session was initialized");
+            let kdf = runtime.block_on(auth_request::run(
+                request_id,
+                active_session.client.auth().prelogin(email.clone()),
+            ));
+            let kdf = match kdf {
+                Ok(Ok(kdf)) => kdf,
+                Err(RequestError::TimedOut) => return Ok(AUTH_TIMED_OUT as u8),
+                Err(RequestError::Cancelled) => return Ok(AUTH_CANCELLED as u8),
+                Ok(Err(_)) => return Ok(AUTH_FAILED as u8),
+            };
+            let auth_data = MasterPasswordAuthenticationData::derive(&password, &kdf, &email)
+                .map_err(|_| ())?;
+            let password_hash =
+                Zeroizing::new(auth_data.master_password_authentication_hash.to_string());
+            drop(auth_data);
+            let config = active_session.client.internal.get_api_configurations();
+            let endpoint = format!(
+                "{}/accounts/resend-new-device-otp",
+                config.api_config.base_path.trim_end_matches('/')
+            );
+            #[derive(serde::Serialize)]
+            #[serde(rename_all = "camelCase")]
+            struct ResendRequest<'a> {
+                email: &'a str,
+                master_password_hash: &'a str,
+            }
+            let request = config
+                .api_config
+                .client
+                .post(endpoint)
+                .header("Device-Identifier", &device_identifier)
+                .json(&ResendRequest {
+                    email: &email,
+                    master_password_hash: &password_hash,
+                });
+            match runtime.block_on(auth_request::run(request_id, request.send())) {
+                Ok(Ok(response)) if response.status().is_success() => Ok(AUTHENTICATED as u8),
+                Ok(Ok(_)) | Ok(Err(_)) => Ok(AUTH_FAILED as u8),
+                Err(RequestError::TimedOut) => Ok(AUTH_TIMED_OUT as u8),
+                Err(RequestError::Cancelled) => Ok(AUTH_CANCELLED as u8),
+            }
+        }));
+
+        match result {
+            Ok(Ok(status)) => status,
+            _ => AUTH_FAILED as u8,
+        }
+    }))
+    .unwrap_or(AUTH_FAILED as u8)
 }
 
 #[no_mangle]
@@ -540,6 +757,9 @@ pub extern "C" fn bw_vault_overview() -> *mut c_char {
         else {
             return vault_error("notAuthenticated");
         };
+        if session.vault.needs_reconciliation() {
+            return vault_error("notSynced");
+        }
         match session.vault.overview() {
             Ok(overview) => vault_success(overview),
             Err(error) => vault_error(&error.to_string()),
@@ -568,6 +788,7 @@ pub extern "C" fn bw_vault_sync(request_id: u64) -> *mut c_char {
             VaultCache::fetch(&session.client),
         )) {
             Ok(Ok(cache)) if auth_request::is_current(request_id) => {
+                cache.activate(&session.client);
                 session.vault = cache;
                 vault_success(
                     session
@@ -619,6 +840,185 @@ pub unsafe extern "C" fn bw_vault_detail(
             Err(RequestError::TimedOut) => vault_error("timedOut"),
             Ok(Err(error)) => vault_error(&error.to_string()),
         }
+    }))
+    .unwrap_or_else(|_| vault_error("internal"))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn bw_vault_editor(
+    id: *const c_char,
+    password: *const c_char,
+    request_id: u64,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(id) = (unsafe { read_utf8(id) }) else {
+            return vault_error("notFound");
+        };
+        let Some(password) = (unsafe { read_utf8(password) }) else {
+            return vault_error("passwordRequired");
+        };
+        let password = Zeroizing::new(password);
+        let Some(runtime) = runtime() else {
+            return vault_error("internal");
+        };
+        let guard = auth_client()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(session) = guard
+            .as_ref()
+            .filter(|_| AUTHENTICATED_STATE.load(Ordering::Acquire))
+        else {
+            return vault_error("notAuthenticated");
+        };
+        match runtime.block_on(auth_request::run(
+            request_id,
+            session.vault.editor(&session.client, &id, &password),
+        )) {
+            Ok(Ok(data)) if auth_request::is_current(request_id) => vault_success(&data),
+            Ok(Ok(_)) | Err(RequestError::Cancelled) => vault_error("cancelled"),
+            Err(RequestError::TimedOut) => vault_error("timedOut"),
+            Ok(Err(error)) => vault_error(&error.to_string()),
+        }
+    }))
+    .unwrap_or_else(|_| vault_error("internal"))
+}
+
+enum VaultWriteCommand {
+    Create(VaultEditorData),
+    Update(VaultEditorData, Zeroizing<String>),
+    Action {
+        id: String,
+        action: String,
+        revision: String,
+        password: Zeroizing<String>,
+    },
+}
+
+fn perform_vault_write(command: VaultWriteCommand, request_id: u64) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(runtime) = runtime() else {
+            return vault_error("internal");
+        };
+        let mut guard = auth_client()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(session) = guard
+            .as_mut()
+            .filter(|_| AUTHENTICATED_STATE.load(Ordering::Acquire))
+        else {
+            return vault_error("notAuthenticated");
+        };
+        session.vault.reset_write_attempt();
+        // Catch inside the session guard: a panic after sending a write must force reconciliation.
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            runtime.block_on(auth_request::run(request_id, async {
+                match command {
+                    VaultWriteCommand::Create(data) => {
+                        session.vault.create(&session.client, data).await
+                    }
+                    VaultWriteCommand::Update(data, password) => {
+                        session.vault.update(&session.client, data, &password).await
+                    }
+                    VaultWriteCommand::Action {
+                        id,
+                        action,
+                        revision,
+                        password,
+                    } => {
+                        session
+                            .vault
+                            .action(&session.client, &id, &action, &revision, &password)
+                            .await
+                    }
+                }
+            }))
+        }));
+        match result {
+            // An acknowledged success is authoritative even if cancellation races its return.
+            Ok(Ok(Ok(result))) => vault_write_success(&result),
+            Ok(Ok(Err(error))) => vault_error(&error.to_string()),
+            _ if session.vault.write_in_flight() => {
+                session.vault.mark_write_uncertain();
+                vault_error("writeUncertain")
+            }
+            Ok(Err(RequestError::Cancelled)) => vault_error("cancelled"),
+            Ok(Err(RequestError::TimedOut)) => vault_error("timedOut"),
+            Err(_) => vault_error("internal"),
+        }
+    }))
+    .unwrap_or_else(|_| vault_error("internal"))
+}
+
+fn vault_write_success(result: &VaultMutationResult) -> *mut c_char {
+    vault_success(result)
+}
+
+unsafe fn read_editor_json(value: *const c_char) -> Option<VaultEditorData> {
+    let json = Zeroizing::new(unsafe { read_utf8(value) }?);
+    if json.len() > 1_048_576 {
+        return None;
+    }
+    serde_json::from_str(&json).ok()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn bw_vault_create(json: *const c_char, request_id: u64) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(data) = (unsafe { read_editor_json(json) }) else {
+            return vault_error("validation");
+        };
+        perform_vault_write(VaultWriteCommand::Create(data), request_id)
+    }))
+    .unwrap_or_else(|_| vault_error("internal"))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn bw_vault_update(
+    json: *const c_char,
+    password: *const c_char,
+    request_id: u64,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(data) = (unsafe { read_editor_json(json) }) else {
+            return vault_error("validation");
+        };
+        let Some(password) = (unsafe { read_utf8(password) }) else {
+            return vault_error("passwordRequired");
+        };
+        perform_vault_write(
+            VaultWriteCommand::Update(data, Zeroizing::new(password)),
+            request_id,
+        )
+    }))
+    .unwrap_or_else(|_| vault_error("internal"))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn bw_vault_action(
+    id: *const c_char,
+    action: *const c_char,
+    revision: *const c_char,
+    password: *const c_char,
+    request_id: u64,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let (Some(id), Some(action), Some(revision), Some(password)) = (
+            unsafe { read_utf8(id) },
+            unsafe { read_utf8(action) },
+            unsafe { read_utf8(revision) },
+            unsafe { read_utf8(password) },
+        ) else {
+            return vault_error("validation");
+        };
+        perform_vault_write(
+            VaultWriteCommand::Action {
+                id,
+                action,
+                revision,
+                password: Zeroizing::new(password),
+            },
+            request_id,
+        )
     }))
     .unwrap_or_else(|_| vault_error("internal"))
 }
@@ -719,6 +1119,10 @@ mod tests {
                 token.as_ptr(),
                 0,
                 server_url.as_ptr(),
+                std::ffi::CString::new("11111111-1111-4111-8111-111111111111")
+                    .unwrap()
+                    .as_ptr(),
+                token.as_ptr(),
                 0,
             )
         };
@@ -739,6 +1143,10 @@ mod tests {
                 token.as_ptr(),
                 0,
                 server_url.as_ptr(),
+                std::ffi::CString::new("11111111-1111-4111-8111-111111111111")
+                    .unwrap()
+                    .as_ptr(),
+                token.as_ptr(),
                 0,
             )
         };

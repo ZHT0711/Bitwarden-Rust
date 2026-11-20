@@ -33,12 +33,23 @@ internal static class RustCore
         IntPtr token,
         uint serverMode,
         IntPtr serverUrl,
+        IntPtr deviceIdentifier,
+        IntPtr deviceOtp,
         ulong requestId);
 
     [DllImport(LibraryName, EntryPoint = "bw_auth_send_two_factor_email", CallingConvention = CallingConvention.Cdecl)]
     private static extern byte SendTwoFactorEmailNative(
         IntPtr email,
         IntPtr password,
+        uint serverMode,
+        IntPtr serverUrl,
+        ulong requestId);
+
+    [DllImport(LibraryName, EntryPoint = "bw_auth_resend_new_device_verification", CallingConvention = CallingConvention.Cdecl)]
+    private static extern byte ResendNewDeviceVerificationNative(
+        IntPtr email,
+        IntPtr password,
+        IntPtr deviceIdentifier,
         uint serverMode,
         IntPtr serverUrl,
         ulong requestId);
@@ -67,6 +78,15 @@ internal static class RustCore
     [DllImport(LibraryName, EntryPoint = "bw_vault_detail", CallingConvention = CallingConvention.Cdecl)]
     private static extern IntPtr VaultDetailNative(IntPtr id, IntPtr password, ulong requestId);
 
+    [DllImport(LibraryName, EntryPoint = "bw_vault_editor", CallingConvention = CallingConvention.Cdecl)]
+    private static extern IntPtr VaultEditorNative(IntPtr id, IntPtr password, ulong requestId);
+    [DllImport(LibraryName, EntryPoint = "bw_vault_create", CallingConvention = CallingConvention.Cdecl)]
+    private static extern IntPtr VaultCreateNative(IntPtr json, ulong requestId);
+    [DllImport(LibraryName, EntryPoint = "bw_vault_update", CallingConvention = CallingConvention.Cdecl)]
+    private static extern IntPtr VaultUpdateNative(IntPtr json, IntPtr password, ulong requestId);
+    [DllImport(LibraryName, EntryPoint = "bw_vault_action", CallingConvention = CallingConvention.Cdecl)]
+    private static extern IntPtr VaultActionNative(IntPtr id, IntPtr action, IntPtr revision, IntPtr password, ulong requestId);
+
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
     internal static VaultOverview GetVaultOverview() => ReadJson<VaultOverview>(VaultOverviewNative());
@@ -81,13 +101,42 @@ internal static class RustCore
         return RunVaultRequest<VaultDetail>(requestId => VaultDetailNative(idBuffer.Pointer, passwordBuffer.Pointer, requestId), token);
     }
 
-    private static T RunVaultRequest<T>(Func<ulong, IntPtr> operation, CancellationToken token)
+    internal static VaultEditorData GetVaultEditor(string id, string password, CancellationToken token)
+    {
+        using var idBuffer = new Utf8Buffer(id);
+        using var passwordBuffer = new Utf8Buffer(password);
+        return RunVaultRequest<VaultEditorData>(requestId => VaultEditorNative(idBuffer.Pointer, passwordBuffer.Pointer, requestId), token);
+    }
+
+    internal static VaultMutationResult CreateVaultItem(VaultEditorData data, CancellationToken token)
+    {
+        using var json = new Utf8Buffer(JsonSerializer.Serialize(data, JsonOptions));
+        return RunVaultRequest<VaultMutationResult>(requestId => VaultCreateNative(json.Pointer, requestId), token, acknowledgedWrite: true);
+    }
+
+    internal static VaultMutationResult UpdateVaultItem(VaultEditorData data, string password, CancellationToken token)
+    {
+        using var json = new Utf8Buffer(JsonSerializer.Serialize(data, JsonOptions));
+        using var passwordBuffer = new Utf8Buffer(password);
+        return RunVaultRequest<VaultMutationResult>(requestId => VaultUpdateNative(json.Pointer, passwordBuffer.Pointer, requestId), token, acknowledgedWrite: true);
+    }
+
+    internal static VaultMutationResult VaultAction(string id, string action, string revisionDate, string password, CancellationToken token)
+    {
+        using var idBuffer = new Utf8Buffer(id);
+        using var actionBuffer = new Utf8Buffer(action);
+        using var revisionBuffer = new Utf8Buffer(revisionDate);
+        using var passwordBuffer = new Utf8Buffer(password);
+        return RunVaultRequest<VaultMutationResult>(requestId => VaultActionNative(idBuffer.Pointer, actionBuffer.Pointer, revisionBuffer.Pointer, passwordBuffer.Pointer, requestId), token, acknowledgedWrite: true);
+    }
+
+    private static T RunVaultRequest<T>(Func<ulong, IntPtr> operation, CancellationToken token, bool acknowledgedWrite = false)
     {
         token.ThrowIfCancellationRequested();
         var requestId = BeginAuthRequestNative();
         using var cancellation = token.Register(() => CancelAuthRequestNative(requestId));
         var result = ReadJson<T>(operation(requestId));
-        token.ThrowIfCancellationRequested();
+        if (!acknowledgedWrite) token.ThrowIfCancellationRequested();
         return result;
     }
 
@@ -121,20 +170,24 @@ internal static class RustCore
         string password,
         uint provider,
         string token,
+        string deviceOtp,
         uint serverMode,
         string serverUrl,
+        string deviceIdentifier,
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         using var emailBuffer = new Utf8Buffer(email);
         using var passwordBuffer = new Utf8Buffer(password);
         using var tokenBuffer = new Utf8Buffer(token);
+        using var deviceOtpBuffer = new Utf8Buffer(deviceOtp);
         using var serverBuffer = new Utf8Buffer(serverUrl);
+        using var deviceIdentifierBuffer = new Utf8Buffer(deviceIdentifier);
         var requestId = BeginAuthRequestNative();
         using var cancellation = cancellationToken.Register(() => CancelAuthRequestNative(requestId));
 
         var result = LoginNative(emailBuffer.Pointer, passwordBuffer.Pointer, provider, tokenBuffer.Pointer,
-            serverMode, serverBuffer.Pointer, requestId);
+            serverMode, serverBuffer.Pointer, deviceIdentifierBuffer.Pointer, deviceOtpBuffer.Pointer, requestId);
         if (cancellationToken.IsCancellationRequested)
         {
             LogoutNative();
@@ -160,6 +213,27 @@ internal static class RustCore
         using var cancellation = cancellationToken.Register(() => CancelAuthRequestNative(requestId));
         var status = (AuthStatus)SendTwoFactorEmailNative(emailBuffer.Pointer, passwordBuffer.Pointer,
             serverMode, serverBuffer.Pointer, requestId);
+        if (cancellationToken.IsCancellationRequested)
+        {
+            LogoutNative();
+            return AuthStatus.Cancelled;
+        }
+        return status;
+    }
+
+    internal static AuthStatus ResendNewDeviceVerification(
+        string email, string password, string deviceIdentifier, uint serverMode, string serverUrl,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        using var emailBuffer = new Utf8Buffer(email);
+        using var passwordBuffer = new Utf8Buffer(password);
+        using var deviceIdentifierBuffer = new Utf8Buffer(deviceIdentifier);
+        using var serverBuffer = new Utf8Buffer(serverUrl);
+        var requestId = BeginAuthRequestNative();
+        using var cancellation = cancellationToken.Register(() => CancelAuthRequestNative(requestId));
+        var status = (AuthStatus)ResendNewDeviceVerificationNative(emailBuffer.Pointer, passwordBuffer.Pointer,
+            deviceIdentifierBuffer.Pointer, serverMode, serverBuffer.Pointer, requestId);
         if (cancellationToken.IsCancellationRequested)
         {
             LogoutNative();
@@ -295,6 +369,8 @@ internal enum AuthStatus : uint
     TwoFactorRequired = 2,
     TimedOut = 3,
     Cancelled = 4,
+    NewDeviceVerificationRequired = 5,
+    InvalidNewDeviceVerificationCode = 6,
 }
 
 internal readonly record struct AuthResult(AuthStatus Status, uint AvailableTwoFactorMethods);
