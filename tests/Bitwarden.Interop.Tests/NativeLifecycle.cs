@@ -129,6 +129,26 @@ internal static class NativeLifecycle
             check(!Action("restore", FixturePassword).Overview.Items.Single(item => item.Id == id).Deleted, "restore returns trashed item through ABI");
             Action("trash", FixturePassword);
             check(Action("delete", FixturePassword).Overview.Items.All(item => item.Id != id), "permanent delete removes server-confirmed item");
+
+            var passkeyId = RustCore.GetVaultOverview().Items.Single(item => item.Name == "Synthetic login").Id;
+            var passkeyDetail = RustCore.GetVaultDetail(passkeyId, string.Empty, CancellationToken.None);
+            check(passkeyDetail.Passkeys is [{ RelyingParty: "example.com", UserName: "fixture-user" }],
+                "detail exposes the saved passkey's display metadata");
+            var passkeyDetailJson = JsonSerializer.Serialize(passkeyDetail);
+            check(!passkeyDetailJson.Contains("SYNTHETIC-PASSKEY-PRIVATE", StringComparison.Ordinal) &&
+                !passkeyDetailJson.Contains("SYNTHETIC-SITE-HANDLE", StringComparison.Ordinal) &&
+                !passkeyDetailJson.Contains("SYNTHETIC-CREDENTIAL", StringComparison.Ordinal),
+                "passkey detail never exposes the private key, credential id or user handle");
+            var passkeyEditor = RustCore.GetVaultEditor(passkeyId, string.Empty, CancellationToken.None);
+            RustCore.UpdateVaultItem(passkeyEditor with { Notes = "synthetic edit keeps passkey" }, string.Empty, CancellationToken.None);
+            var retained = RustCore.GetVaultEditor(passkeyId, string.Empty, CancellationToken.None);
+            check(retained.Passkeys?.Length == 1, "normal edit keeps the existing passkey");
+            RustCore.UpdateVaultItem(retained with { RemoveSavedPasskey = true }, string.Empty, CancellationToken.None);
+            RustCore.SyncVault(CancellationToken.None);
+            var removed = RustCore.GetVaultDetail(passkeyId, string.Empty, CancellationToken.None);
+            check(removed.Passkeys?.Length == 0 && removed.Totp is { Status: "ready" },
+                "saving passkey removal persists through sync and preserves the login TOTP");
+
             await Control("change-master-password-wrapper");
             RustCore.SyncVault(CancellationToken.None);
             check(RustCore.Lock(), "account can lock again after a complete write lifecycle");

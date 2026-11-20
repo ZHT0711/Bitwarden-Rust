@@ -24,6 +24,7 @@ internal sealed class VaultEditorDialog
     private readonly ComboBox _folder = new() { Header = "文件夹", HorizontalAlignment = HorizontalAlignment.Stretch };
     private readonly CheckBox _favorite = new() { Content = "收藏" };
     private readonly CheckBox _reprompt = new() { Content = "查看此条目时重新验证主密码" };
+    private readonly CheckBox _removePasskey = new();
     private readonly TextBox _notes = new() { Header = "备注", AcceptsReturn = true, TextWrapping = TextWrapping.Wrap, MinHeight = 90, MaxHeight = 220 };
     private readonly InfoBar _notice = new() { IsOpen = false, IsClosable = false, Severity = InfoBarSeverity.Error };
     private readonly ProgressBar _progress = new() { IsIndeterminate = true, Visibility = Visibility.Collapsed };
@@ -83,6 +84,27 @@ internal sealed class VaultEditorDialog
         _form.Children.Add(_favorite);
         _form.Children.Add(_reprompt);
         _form.Children.Add(_typeFields);
+        if (data.Passkeys is { Length: > 0 } passkeys)
+        {
+            var section = new StackPanel { Spacing = 6 };
+            section.Children.Add(new TextBlock
+            {
+                Text = "通行密钥",
+                Style = (Style)Application.Current.Resources["BodyStrongTextBlockStyle"],
+            });
+            foreach (var passkey in passkeys)
+            {
+                section.Children.Add(new TextBlock
+                {
+                    Text = $"{passkey.DisplayText}\n创建于 {passkey.CreatedAt.ToLocalTime():yyyy-MM-dd HH:mm}",
+                    TextWrapping = TextWrapping.Wrap,
+                });
+            }
+            _removePasskey.Content = passkeys.Length == 1 ? "保存时移除通行密钥" : "保存时移除全部通行密钥";
+            AutomationProperties.SetAutomationId(_removePasskey, "VaultEditorRemovePasskey");
+            section.Children.Add(_removePasskey);
+            _form.Children.Add(section);
+        }
         _uriSection = Section("网站 / URI", _uriRows, "添加网站", () => AddUri(new VaultUri(string.Empty, null)));
         _form.Children.Add(_uriSection);
         _form.Children.Add(_notes);
@@ -155,6 +177,7 @@ internal sealed class VaultEditorDialog
                 Favorite = _favorite.IsChecked == true, Reprompt = _reprompt.IsChecked == true, Notes = _original.Notes is null && _notes.Text.Length == 0 ? null : _notes.Text,
                 Values = ReadValues(), Uris = _activeType == 1 ? _uris.Select(row => row.Read()).ToArray() : [],
                 CustomFields = _custom.Select(row => row.Read()).ToArray(),
+                RemoveSavedPasskey = _removePasskey.IsChecked == true,
             };
         }
         catch (InvalidOperationException error) { Error(error.Message); return; }

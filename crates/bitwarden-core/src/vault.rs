@@ -22,7 +22,7 @@ use bw_sdk_core::{
     OrganizationId,
 };
 use chrono::Utc;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[derive(Debug, thiserror::Error)]
@@ -129,6 +129,30 @@ pub(crate) struct VaultDetail {
     attachments: usize,
     pub(crate) totp: Option<VaultTotp>,
     pub(crate) totp_request_id: Option<u64>,
+    passkeys: Vec<VaultPasskey>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct VaultPasskey {
+    relying_party: String,
+    user_name: Option<String>,
+    created_at: String,
+}
+
+fn passkey_summaries(view: &CipherView) -> Vec<VaultPasskey> {
+    if view.partial || !view.view_password {
+        return Vec::new();
+    }
+    view.login
+        .iter()
+        .flat_map(|login| login.fido2_credentials.iter().flatten())
+        .map(|credential| VaultPasskey {
+            relying_party: credential.rp_id.clone(),
+            user_name: credential.user_name.clone(),
+            created_at: credential.creation_date.to_rfc3339(),
+        })
+        .collect()
 }
 
 impl VaultCache {
@@ -541,6 +565,7 @@ fn website_host(value: &str) -> Option<String> {
 
 fn display_detail(view: CipherView) -> VaultDetail {
     let mut fields = Vec::new();
+    let passkeys = passkey_summaries(&view);
     // Explicit projections keep cipher keys, passkey private material and password history out of FFI.
     if let Some(login) = &view.login {
         add_field(&mut fields, "用户名", login.username.as_deref(), false);
@@ -670,6 +695,7 @@ fn display_detail(view: CipherView) -> VaultDetail {
         attachments: view.attachments.as_ref().map_or(0, Vec::len),
         totp: None,
         totp_request_id: None,
+        passkeys,
     }
 }
 
@@ -969,6 +995,22 @@ mod tests {
             Some("https://example.com/synthetic-icon-fixture".to_owned());
         login.totp = Some(
             "otpauth://totp/Simulation?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&period=5".to_owned(),
+        );
+        login.fido2_credentials = Some(
+            serde_json::from_value(json!([{
+                "credentialId": "SYNTHETIC-CREDENTIAL",
+                "keyType": "public-key",
+                "keyAlgorithm": "ECDSA",
+                "keyCurve": "P-256",
+                "keyValue": "SYNTHETIC-PASSKEY-PRIVATE",
+                "rpId": "example.com",
+                "userName": "fixture-user",
+                "userHandle": "SYNTHETIC-SITE-HANDLE",
+                "counter": "0",
+                "discoverable": "true",
+                "creationDate": "2026-11-19T00:00:00Z"
+            }]))
+            .unwrap(),
         );
         let mut response = response_for(&client, icon_item).await;
         let mut guarded = test_view();

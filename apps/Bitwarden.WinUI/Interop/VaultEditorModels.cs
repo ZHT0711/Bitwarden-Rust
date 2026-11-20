@@ -4,7 +4,8 @@ namespace Bitwarden_WinUI.Interop;
 internal sealed record VaultEditorData(string? Id, string Name, int ItemType, string? FolderId,
     bool Favorite, bool Reprompt, string? RevisionDate, string? Notes, Dictionary<string, string> Values,
     VaultUri[] Uris, VaultCustomField[] CustomFields, bool CanEdit, bool CanDelete, bool CanRestore,
-    bool IsDeleted, bool IsArchived, bool CanArchive = false, string? EditBlockedReason = null);
+    bool IsDeleted, bool IsArchived, bool CanArchive = false, string? EditBlockedReason = null,
+    VaultPasskey[]? Passkeys = null, bool RemoveSavedPasskey = false);
 internal sealed record VaultUri(string? Uri, int? Match);
 internal sealed record VaultCustomField(string? Name, string? Value, int Type, int? LinkedId);
 internal sealed record VaultMutationResult(VaultOverview Overview, string? Id);

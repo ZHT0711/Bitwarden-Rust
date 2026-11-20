@@ -12,10 +12,15 @@ public sealed record VaultItem(string Id, string Name, string Subtitle, int Item
     public string StatusLabel => Restricted ? "访问受限" : Deleted ? "已删除" : Archived ? "已归档" : Favorite ? "收藏" : TypeLabel;
 }
 internal sealed record VaultDetail(string Name, int ItemType, DisplayField[] Fields, DateTimeOffset RevisionDate,
-    bool Restricted, bool PasswordHidden, int Attachments, VaultTotp? Totp = null, ulong? TotpRequestId = null);
+    bool Restricted, bool PasswordHidden, int Attachments, VaultTotp? Totp = null, ulong? TotpRequestId = null,
+    VaultPasskey[]? Passkeys = null);
 internal sealed record DisplayField(string Label, string Value, bool Sensitive);
 internal sealed record VaultTotp(string Status, TotpCode? Value);
 internal sealed record TotpCode(string Code, uint Period, long ValidFrom, long ValidUntil);
+internal sealed record VaultPasskey(string RelyingParty, string? UserName, DateTimeOffset CreatedAt)
+{
+    internal string DisplayText => string.IsNullOrWhiteSpace(UserName) ? RelyingParty : $"{RelyingParty} · {UserName}";
+}
 
 internal sealed class VaultException(string code) : Exception(code)
 {

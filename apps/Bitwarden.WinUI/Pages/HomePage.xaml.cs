@@ -233,6 +233,24 @@ public sealed partial class HomePage : Page
                     : "请在编辑条目中检查验证器密钥或 otpauth 链接。",
             });
         }
+        if (detail.Passkeys is { Length: > 0 } passkeys)
+        {
+            var section = new StackPanel { Spacing = 6 };
+            section.Children.Add(new TextBlock
+            {
+                Text = "通行密钥",
+                Style = (Style)Application.Current.Resources["BodyStrongTextBlockStyle"],
+            });
+            foreach (var passkey in passkeys)
+            {
+                section.Children.Add(new TextBlock
+                {
+                    Text = $"{passkey.DisplayText}\n创建于 {passkey.CreatedAt.ToLocalTime():yyyy-MM-dd HH:mm}",
+                    TextWrapping = TextWrapping.Wrap,
+                });
+            }
+            DetailPanel.Children.Add(section);
+        }
         foreach (var field in detail.Fields)
         {
             var panel = new StackPanel { Spacing = 6 };

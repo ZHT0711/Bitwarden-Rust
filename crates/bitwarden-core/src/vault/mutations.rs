@@ -32,6 +32,8 @@ pub(crate) struct VaultEditorData {
     pub(super) is_archived: bool,
     pub(super) can_archive: bool,
     pub(super) edit_blocked_reason: Option<String>,
+    pub(super) passkeys: Option<Vec<VaultPasskey>>,
+    pub(super) remove_saved_passkey: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -116,6 +118,7 @@ impl VaultCache {
             .attachment_decryption_failures
             .as_ref()
             .is_some_and(|items| !items.is_empty());
+        let passkeys = allowed.then(|| passkey_summaries(&view));
         let values = if allowed {
             project_values(&view)?
         } else {
@@ -190,6 +193,8 @@ impl VaultCache {
             } else {
                 None
             },
+            passkeys,
+            remove_saved_passkey: false,
         })
     }
 
@@ -213,7 +218,9 @@ impl VaultCache {
                 return Err(VaultError::Validation);
             }
         }
-        if input.item_type != 1 && !input.uris.is_empty() {
+        if (input.item_type != 1 && (!input.uris.is_empty() || input.remove_saved_passkey))
+            || (input.remove_saved_passkey && input.id.is_none())
+        {
             return Err(VaultError::Validation);
         }
         Ok(())
@@ -306,16 +313,26 @@ impl VaultCache {
             return Err(VaultError::AttachmentUnavailable);
         }
         apply_input(&mut view, &input)?;
+        if input.remove_saved_passkey {
+            if !has_passkey(&view) {
+                return Err(VaultError::NotFound);
+            }
+            view.set_new_fido2_credentials(Vec::new())
+                .map_err(|_| VaultError::Validation)?;
+        }
         // Convert the complete native original; SDK edit maintains keys, attachments and history.
         let request = CipherEditRequest::try_from(view).map_err(|_| VaultError::Validation)?;
         self.activate(client);
         self.write_started = true;
-        client
+        let confirmed = client
             .vault()
             .ciphers()
             .edit(request)
             .await
             .map_err(|error| self.classify_edit_error(error))?;
+        if input.remove_saved_passkey && has_passkey(&confirmed) {
+            return Err(self.uncertain());
+        }
         self.finish_write(client, Some(id.to_owned())).await
     }
 
@@ -642,6 +659,13 @@ impl VaultCache {
         self.write_started = false;
         Ok(VaultMutationResult { overview, id })
     }
+}
+
+fn has_passkey(view: &CipherView) -> bool {
+    view.login
+        .as_ref()
+        .and_then(|login| login.fido2_credentials.as_ref())
+        .is_some_and(|credentials| !credentials.is_empty())
 }
 
 fn schema(kind: u8) -> &'static [&'static str] {
