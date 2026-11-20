@@ -1,5 +1,8 @@
 {
   "profiles": {
+    "Bitwarden Rust (Package)": {
+      "commandName": "MsixPackage"
+    },
     "Bitwarden.WinUI (Unpackaged)": {
       "commandName": "Project"
     }

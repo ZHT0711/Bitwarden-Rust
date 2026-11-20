@@ -1,5 +1,9 @@
 /target/
 /work/PackageProbe/
+/work/PackagedProbe/
+/work/tools/
+/apps/Bitwarden.WinUI/AppPackages/
+/apps/Bitwarden.WinUI/Properties/PublishProfiles/
 .vscode/
 .vs/
 **/bin/

@@ -16,9 +16,9 @@ public sealed partial class GeneratorPage : Page
     public GeneratorPage()
     {
         InitializeComponent();
+        CredentialType.SelectedIndex = 0;
         _regenerationTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(150) };
         _regenerationTimer.Tick += RegenerationTimer_Tick;
-        CredentialType.SelectedIndex = 0;
         GenerateCurrent();
     }
 
@@ -58,6 +58,7 @@ public sealed partial class GeneratorPage : Page
         }
         catch (Exception error) when (error is DllNotFoundException or EntryPointNotFoundException or BadImageFormatException or InvalidOperationException)
         {
+            GeneratedPassword.Text = string.Empty;
             GeneratorNotice.Title = "无法生成密码";
             GeneratorNotice.Severity = InfoBarSeverity.Error;
             GeneratorNotice.Message = error is InvalidOperationException

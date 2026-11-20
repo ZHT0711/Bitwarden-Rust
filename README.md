@@ -26,4 +26,10 @@ dotnet build apps\\Bitwarden.WinUI\\Bitwarden.WinUI.csproj
 dotnet run --project apps\\Bitwarden.WinUI\\Bitwarden.WinUI.csproj
 ~~~
 
-后续按里程碑接入认证与账户会话、官方密码学与数据协议、加密本地缓存、同步冲突处理、条目 CRUD、剪贴板自动清理、自动锁定、导入导出和 MSIX 打包。
+构建独立身份的未签名 MSIX 开发包（仅用于本机打包验证，不会覆盖官方 Bitwarden 安装）：
+
+~~~powershell
+dotnet build apps\Bitwarden.WinUI\Bitwarden.WinUI.csproj -p:GenerateAppxPackageOnBuild=true -p:AppxPackageSigningEnabled=false
+~~~
+
+后续按里程碑接入认证与账户会话、官方加密格式与数据协议、加密本地缓存、同步冲突处理、条目 CRUD、剪贴板自动清理、自动锁定及导入导出。
