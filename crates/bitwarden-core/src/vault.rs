@@ -228,8 +228,11 @@ impl VaultCache {
         }) {
             *unlock_data = None;
         }
-        // Let the official SDK handle security-state transitions and key upgrades.
-        client.crypto_sync_handler().on_sync(crypto).await;
+        // The SDK sync handler checks for a crypto-state downgrade through the host's
+        // state bridge. A native client can authenticate and sync without that bridge.
+        if client.km_state_bridge().is_bridge_registered() {
+            client.crypto_sync_handler().on_sync(crypto).await;
+        }
         let mut org_keys = Vec::new();
         for org in profile.organizations.iter().flatten() {
             if let (Some(id), Some(key)) = (org.id, org.key.as_ref()) {

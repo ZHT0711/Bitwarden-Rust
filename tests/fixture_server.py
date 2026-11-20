@@ -132,6 +132,11 @@ class FixtureState:
     def __init__(self, fixture: dict, private_key: str):
         self.lock = threading.RLock()
         self.initial = checked_fixture(fixture)
+        # Modern Bitwarden and Vaultwarden include wrapped account keys in the sync profile.
+        self.initial["profile"]["accountKeys"] = {
+            "publicKeyEncryptionKeyPair": {"wrappedPrivateKey": private_key},
+            "object": "privateKeys",
+        }
         self._last_revision = dt.datetime(1970, 1, 1, tzinfo=UTC)
         self.token = _encode({"alg": "fixture-only"}) + "." + _encode({
             "exp": int(time.time()) + 3600, "sub": PUBLIC_USER_ID,
@@ -577,7 +582,10 @@ def self_test() -> bool:
             self.assertEqual(status, 200)
             self.assertEqual(identity["access_token"], self.state.token)
             self.assertEqual(self.request("GET", "/api/sync", authenticated=False)[0], 401)
-            self.assertTrue(self.request("GET", "/api/sync")[1]["profile"]["premium"])
+            profile = self.request("GET", "/api/sync")[1]["profile"]
+            self.assertTrue(profile["premium"])
+            self.assertEqual(profile["accountKeys"]["publicKeyEncryptionKeyPair"]["wrappedPrivateKey"],
+                             "synthetic-public-private-key-fixture")
 
         def test_full_edit_and_revision_conflict(self):
             original = self.create(notes="old-encrypted-notes")

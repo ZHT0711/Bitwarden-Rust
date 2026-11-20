@@ -31,7 +31,7 @@ internal static class NativeLifecycle
             RustCore.Unlock(FixturePassword, CancellationToken.None);
             ExpectCode(() => RustCore.GetVaultOverview(), "notFound", "unlock before first sync leaves the unsynced vault empty");
             var initial = RustCore.SyncVault(CancellationToken.None);
-            check(initial.Items.Length == 2, "real DLL synchronizes encrypted fixture records");
+            check(initial.Items.Length == 2, "real DLL syncs a profile with wrapped account keys without a host state bridge");
             var draft = new VaultEditorData(null, "ABI synthetic login", 1, null, false, true, null, "synthetic notes",
                 new() { ["username"] = "abi-user", ["password"] = "synthetic-abi-secret", ["totp"] = "SYNTHETIC-TOTP" },
                 [new("https://example.invalid/abi", 3)], [new("fixture field", "synthetic hidden value", 1, null)],
