@@ -8,7 +8,7 @@ use bitwarden_fido::{
 };
 use bitwarden_vault::{
     CipherCreateRequest, CipherEditRequest, CipherListView, CipherView, EncryptionContext,
-    Fido2CredentialNewView, VaultClientExt,
+    Fido2CredentialNewView, Fido2CredentialView, VaultClientExt,
 };
 use bw_sdk_core::Client;
 use serde::Serialize;
@@ -65,12 +65,42 @@ impl PasskeyOperation {
         }
         Ok(())
     }
-    fn matches(&self, credential: &bitwarden_vault::Fido2CredentialView) -> bool {
-        credential.rp_id == self.rp_id
-            && bitwarden_fido::string_to_guid_bytes(&credential.credential_id)
-                .is_ok_and(|id| self.credential_ids.is_empty() || self.credential_ids.contains(&id))
+    fn matches(&self, credential: &Fido2CredentialView) -> bool {
+        matches_credential(credential, &self.rp_id, &self.credential_ids)
     }
 }
+
+pub(crate) fn is_discoverable(credential: &Fido2CredentialView) -> bool {
+    credential.discoverable == "true"
+}
+
+fn matches_credential(credential: &Fido2CredentialView, rp_id: &str, ids: &[Vec<u8>]) -> bool {
+    credential.rp_id == rp_id
+        && bitwarden_fido::string_to_guid_bytes(&credential.credential_id).is_ok_and(|id| {
+            if ids.is_empty() {
+                is_discoverable(credential)
+            } else {
+                ids.contains(&id)
+            }
+        })
+}
+
+fn confirms_credential(
+    confirmed: &Fido2CredentialView,
+    expected: &Fido2CredentialView,
+    id: &[u8],
+) -> bool {
+    bitwarden_fido::string_to_guid_bytes(&confirmed.credential_id).is_ok_and(|actual| actual == id)
+        && confirmed.key_value == expected.key_value
+        && confirmed.key_type == expected.key_type
+        && confirmed.key_algorithm == expected.key_algorithm
+        && confirmed.key_curve == expected.key_curve
+        && confirmed.rp_id == expected.rp_id
+        && confirmed.user_handle == expected.user_handle
+        && confirmed.counter == expected.counter
+        && confirmed.discoverable == expected.discoverable
+}
+
 impl VaultCache {
     pub(crate) async fn passkey_views(
         &self,
@@ -181,6 +211,9 @@ impl VaultCache {
             view
         } else {
             let choices = self.passkey_choices(client, op).await?;
+            if !op.creating && choices.is_empty() {
+                return Err(VaultError::NotFound);
+            }
             if !choices
                 .iter()
                 .any(|c| c.id == id && c.credential_index == credential_index)
@@ -327,25 +360,25 @@ impl VaultCache {
                 if !original.edit {
                     return Err(VaultError::PermissionDenied);
                 }
-                *old = changed.into();
+                // Preserve credential properties when the SDK stages a counter increment.
+                old.counter = changed.counter;
                 updated
                     .set_new_fido2_credentials(credentials)
                     .map_err(|_| VaultError::Internal)?;
             }
             self.activate(client);
-            let expected_key = updated
+            let expected_id = match &result {
+                PasskeyResult::Created { credential_id, .. }
+                | PasskeyResult::Assertion { credential_id, .. } => credential_id,
+            };
+            let expected = updated
                 .get_fido2_credentials()
                 .into_iter()
                 .find(|c| {
-                    let expected_id = match &result {
-                        PasskeyResult::Created { credential_id, .. }
-                        | PasskeyResult::Assertion { credential_id, .. } => credential_id,
-                    };
                     bitwarden_fido::string_to_guid_bytes(&c.credential_id)
                         .is_ok_and(|id| &id == expected_id)
                 })
-                .ok_or(VaultError::Internal)?
-                .key_value;
+                .ok_or(VaultError::Internal)?;
             self.write_started = true;
             let confirmed = if op.creating && original.id.is_none() {
                 let request = CipherCreateRequest {
@@ -374,15 +407,13 @@ impl VaultCache {
                     .await
                     .map_err(|e| self.classify_edit_error(e))?
             };
-            let expected = match &result {
-                PasskeyResult::Created { credential_id, .. }
-                | PasskeyResult::Assertion { credential_id, .. } => credential_id,
-            };
-            if !confirmed.get_fido2_credentials().iter().any(|c| {
-                bitwarden_fido::string_to_guid_bytes(&c.credential_id)
-                    .is_ok_and(|id| &id == expected)
-                    && c.key_value == expected_key
-            }) {
+            if confirmed.id.is_none()
+                || original.id.is_some_and(|id| confirmed.id != Some(id))
+                || !confirmed
+                    .get_fido2_credentials()
+                    .iter()
+                    .any(|c| confirms_credential(c, &expected, expected_id))
+            {
                 return Err(self.uncertain());
             }
             self.finish_write(client, confirmed.id.map(|v| v.to_string()))
@@ -451,11 +482,7 @@ impl Fido2CredentialStore for Callbacks {
                 .get_fido2_credentials()
                 .into_iter()
                 .filter(|c| {
-                    c.rp_id == rp_id
-                        && bitwarden_fido::string_to_guid_bytes(&c.credential_id).is_ok_and(|id| {
-                            ids.as_ref()
-                                .is_none_or(|ids| ids.is_empty() || ids.contains(&id))
-                        })
+                    matches_credential(c, &rp_id, ids.as_deref().unwrap_or_default())
                         && user_handle.as_ref().is_none_or(|handle| {
                             c.user_handle
                                 .as_ref()
@@ -484,5 +511,37 @@ impl Fido2CredentialStore for Callbacks {
             .lock()
             .map_err(|_| Fido2CallbackError::OperationCancelled)? = Some(context);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn credential(discoverable: &str) -> Fido2CredentialView {
+        serde_json::from_value(serde_json::json!({
+            "credentialId": "d548826e-79b4-db40-a3d8-11116f7e8349",
+            "keyType": "public-key",
+            "keyAlgorithm": "ECDSA",
+            "keyCurve": "P-256",
+            "keyValue": "synthetic-private-key",
+            "rpId": "example.com",
+            "counter": "0",
+            "discoverable": discoverable,
+            "creationDate": "2026-11-19T00:00:00Z"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn empty_allow_list_only_matches_discoverable_credentials() {
+        let discoverable = credential("true");
+        let non_discoverable = credential("false");
+        assert!(matches_credential(&discoverable, "example.com", &[]));
+        assert!(!matches_credential(&non_discoverable, "example.com", &[]));
+
+        let id = bitwarden_fido::string_to_guid_bytes(&non_discoverable.credential_id).unwrap();
+        assert!(matches_credential(&non_discoverable, "example.com", &[id]));
+        assert!(!matches_credential(&discoverable, "other.example.com", &[]));
     }
 }

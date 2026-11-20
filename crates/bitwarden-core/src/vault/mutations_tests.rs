@@ -181,10 +181,12 @@ async fn passkey_registration_persists_encrypted_key_then_signs_bound_assertions
         .await
         .unwrap()
         .is_empty());
-    assert!(cache
-        .perform_passkey(&client, &wrong_rp, &choice.id, &choice.revision, 0, "")
-        .await
-        .is_err());
+    assert!(matches!(
+        cache
+            .perform_passkey(&client, &wrong_rp, &choice.id, &choice.revision, 0, "")
+            .await,
+        Err(VaultError::NotFound)
+    ));
     let excluded = crate::vault::passkeys::PasskeyOperation {
         credential_ids: vec![credential_id],
         ..op

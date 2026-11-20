@@ -12,6 +12,15 @@ public sealed partial class MainWindow
     private DispatcherTimer? _passkeyTimer;
     private bool _passkeyChecking;
     private ContentDialog? _passkeyDialog;
+    private Action? _clearPasskeyApproval;
+
+    private void ClearPasskeySensitiveState()
+    {
+        try { RustCore.CancelPasskey(string.Empty); }
+        catch (Exception error) when (IsCoreUnavailable(error)) { }
+        if (_clearPasskeyApproval is { } clear) clear();
+        else _passkeyDialog?.Hide();
+    }
 
     private async void StartPasskeyProvider()
     {
@@ -31,15 +40,19 @@ public sealed partial class MainWindow
         try
         {
             var request = await Task.Run(RustCore.PendingPasskey);
-            if (_closed || string.IsNullOrEmpty(request.Id)) return;
+            if (_closed || _accountTransition || string.IsNullOrEmpty(request.Id)) return;
+            var requestId = request.Id;
             Activate();
             if (request.SessionState == VaultSessionState.SignedOut) await ShowSignInDialogAsync();
             else if (request.SessionState == VaultSessionState.Locked) await ShowUnlockDialogAsync();
             if (_closed) return;
-            if (RustCore.SessionState != VaultSessionState.Unlocked) { RustCore.CancelPasskey(request.Id); return; }
+            if (RustCore.SessionState != VaultSessionState.Unlocked) { RustCore.CancelPasskey(requestId); return; }
             request = await Task.Run(RustCore.PendingPasskey);
-            if (string.IsNullOrEmpty(request.Id)) return;
-            await ShowPasskeyDialogAsync(request);
+            if (!request.IsFor(requestId)) return;
+            var ready = request.NeedsSync ? await SynchronizePasskeyVaultAsync(request) : request;
+            if (!_closed && !_accountTransition && ready is not null && ready.IsReadyFor(requestId) &&
+                RustCore.SessionState == VaultSessionState.Unlocked && RustCore.IsPasskeyActive(requestId))
+                await ShowPasskeyDialogAsync(ready);
         }
         catch (VaultException) { }
         catch (Exception error) when (IsCoreUnavailable(error) || error is System.Runtime.InteropServices.COMException)
@@ -47,6 +60,78 @@ public sealed partial class MainWindow
             // A vault editor or sign-in dialog may already occupy this XamlRoot. Poll again later.
         }
         finally { _passkeyChecking = false; }
+    }
+
+    private async Task<PasskeyPending?> SynchronizePasskeyVaultAsync(PasskeyPending request)
+    {
+        using var cancellation = new CancellationTokenSource();
+        var cancellationToken = cancellation.Token;
+        var progress = new ProgressRing { IsActive = true, Width = 24, Height = 24,
+            HorizontalAlignment = HorizontalAlignment.Left };
+        var status = new TextBlock { Text = "正在同步保险库…", TextWrapping = TextWrapping.Wrap, MaxWidth = 480 };
+        var panel = new StackPanel { Spacing = 12, MaxWidth = 480 };
+        panel.Children.Add(new TextBlock { Text = request.RelyingParty ?? "", FontSize = 20, TextWrapping = TextWrapping.Wrap });
+        panel.Children.Add(progress);
+        panel.Children.Add(status);
+        var dialog = new ContentDialog {
+            XamlRoot = NavView.XamlRoot, Title = "准备通行密钥保险库", Content = panel,
+            PrimaryButtonText = "重试同步", CloseButtonText = "取消", IsPrimaryButtonEnabled = false,
+            DefaultButton = ContentDialogButton.Close,
+        };
+        AutomationProperties.SetAutomationId(dialog, "PasskeySyncDialog");
+        bool busy = false, opened = false, closed = false;
+        PasskeyPending? ready = null;
+        var timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(350) };
+        timer.Tick += (_, _) => { if (!RustCore.IsPasskeyActive(request.Id)) dialog.Hide(); };
+
+        async Task SynchronizeAsync()
+        {
+            if (busy || closed) return;
+            busy = true;
+            progress.IsActive = true;
+            dialog.IsPrimaryButtonEnabled = false;
+            status.Text = "正在同步保险库…";
+            try {
+                await Task.Run(() => RustCore.SyncVault(cancellationToken));
+                cancellationToken.ThrowIfCancellationRequested();
+                if (closed || _closed) return;
+                var refreshed = await Task.Run(RustCore.PendingPasskey);
+                if (closed || _closed) return;
+                if (!refreshed.IsFor(request.Id)) { dialog.Hide(); return; }
+                if (!refreshed.IsReadyFor(request.Id)) throw new VaultException("notSynced");
+                ready = refreshed;
+                dialog.Hide();
+            }
+            catch (OperationCanceledException) { if (!closed) dialog.Hide(); }
+            catch (VaultException error) { if (!closed) status.Text = error.UserMessage; }
+            catch (Exception error) when (IsCoreUnavailable(error))
+            { if (!closed) status.Text = "无法加载 Rust 核心。"; }
+            finally {
+                busy = false;
+                if (!closed) {
+                    progress.IsActive = false;
+                    dialog.IsPrimaryButtonEnabled = RustCore.IsPasskeyActive(request.Id) &&
+                        RustCore.SessionState == VaultSessionState.Unlocked;
+                }
+            }
+        }
+
+        dialog.Opened += async (_, _) => { opened = true; timer.Start(); await SynchronizeAsync(); };
+        dialog.PrimaryButtonClick += async (_, args) => { args.Cancel = true; await SynchronizeAsync(); };
+        dialog.Closing += (_, _) => {
+            closed = true;
+            cancellation.Cancel();
+            if (ready is null) RustCore.CancelPasskey(request.Id);
+        };
+        try { _passkeyDialog = dialog; await dialog.ShowAsync(); }
+        finally {
+            _passkeyDialog = null;
+            closed = true;
+            timer.Stop();
+            cancellation.Cancel();
+            if (opened && ready is null) RustCore.CancelPasskey(request.Id);
+        }
+        return ready;
     }
 
     private async Task ShowPasskeyDialogAsync(PasskeyPending request)
@@ -79,10 +164,10 @@ public sealed partial class MainWindow
             IsPrimaryButtonEnabled = choices.Items.Count > 0, DefaultButton = ContentDialogButton.Close,
         };
         AutomationProperties.SetAutomationId(dialog, "PasskeyApprovalDialog");
-        bool busy = false, completed = false, opened = false, failed = false, closeRequested = false;
+        bool busy = false, completed = false, opened = false, failed = false, closeRequested = false, aborted = false;
         void UpdateApprovalButton()
         {
-            if (!busy && !failed) dialog.IsPrimaryButtonEnabled = choices.SelectedIndex >= 0 &&
+            if (!aborted && !busy && !failed) dialog.IsPrimaryButtonEnabled = choices.SelectedIndex >= 0 &&
                 (choices.SelectedItem is not PasskeyChoice { Reprompt: true } || password.Password.Length > 0);
         }
         choices.SelectionChanged += (_, _) => UpdateApprovalButton();
@@ -93,11 +178,11 @@ public sealed partial class MainWindow
         dialog.Opened += (_, _) => { opened = true; timer.Start(); };
         dialog.Closing += (_, args) => {
             if (!completed) RustCore.CancelPasskey(request.Id);
-            if (busy) { closeRequested = true; args.Cancel = true; }
+            if (busy && !aborted) { closeRequested = true; args.Cancel = true; }
         };
         dialog.PrimaryButtonClick += async (_, args) => {
             args.Cancel = true;
-            if (busy || !RustCore.IsPasskeyActive(request.Id)) return;
+            if (aborted || busy || !RustCore.IsPasskeyActive(request.Id)) return;
             busy = true;
             dialog.IsPrimaryButtonEnabled = choices.IsEnabled = password.IsEnabled = false;
             var choice = choices.SelectedItem as PasskeyChoice;
@@ -109,21 +194,34 @@ public sealed partial class MainWindow
                 await Task.Run(() => RustCore.RespondPasskey(request.Id, choice, entered, window));
                 completed = true;
             }
-            catch (VaultException error) { failed = true; status.Text = error.Code == "permissionDenied"
+            catch (OperationCanceledException) { closeRequested = true; }
+            catch (VaultException error) { failed = true; if (!aborted) status.Text = error.Code == "permissionDenied"
                 ? "本次 Windows Hello 验证未完成，或条目权限不足。请关闭后重新发起请求。" : error.UserMessage; }
-            catch (Exception error) when (IsCoreUnavailable(error)) { failed = true; status.Text = "无法加载 Rust 核心。"; }
+            catch (Exception error) when (IsCoreUnavailable(error)) { failed = true; if (!aborted) status.Text = "无法加载 Rust 核心。"; }
             finally { entered = string.Empty; busy = false; }
-            if (_closed) return;
+            if (_closed || aborted) return;
             if (completed || closeRequested) dialog.Hide();
             else if (failed) dialog.CloseButtonText = "关闭";
         };
-        try { _passkeyDialog = dialog; await dialog.ShowAsync(); }
+        try {
+            _passkeyDialog = dialog;
+            _clearPasskeyApproval = () => {
+                aborted = true;
+                password.Password = string.Empty;
+                choices.Items.Clear();
+                panel.Children.Clear();
+                dialog.Hide();
+            };
+            await dialog.ShowAsync();
+        }
         finally {
+            _clearPasskeyApproval = null;
             _passkeyDialog = null;
             timer.Stop();
             password.Password = string.Empty;
             if (opened && !completed) RustCore.CancelPasskey(request.Id);
         }
-        if (completed && !_closed && NavFrame.Content is HomePage page) await page.RefreshAsync(false);
+        if (completed && !aborted && !_closed && !_accountTransition && NavFrame.Content is HomePage page)
+            await page.RefreshAsync(false);
     }
 }

@@ -8,7 +8,11 @@ internal sealed record PasskeyChoice(string Id, string Revision, int CredentialI
     public override string ToString() => string.IsNullOrWhiteSpace(UserName) ? Name : $"{Name} · {UserName}";
 }
 internal sealed record PasskeyPending(string Id, bool Creating, string? RelyingParty, string? UserName,
-    VaultSessionState SessionState, List<PasskeyChoice>? Choices);
+    VaultSessionState SessionState, List<PasskeyChoice>? Choices, bool NeedsSync = false)
+{
+    internal bool IsFor(string requestId) => requestId.Length != 0 && Id == requestId;
+    internal bool IsReadyFor(string requestId) => IsFor(requestId) && SessionState == VaultSessionState.Unlocked && !NeedsSync;
+}
 
 internal static partial class RustCore
 {
@@ -18,6 +22,8 @@ internal static partial class RustCore
     private static extern IntPtr PasskeyRegisterNative();
     [DllImport(LibraryName, EntryPoint = "bw_passkey_state", CallingConvention = CallingConvention.Cdecl)]
     private static extern IntPtr PasskeyStateNative();
+    [DllImport(LibraryName, EntryPoint = "bw_passkey_sync_metadata", CallingConvention = CallingConvention.Cdecl)]
+    private static extern IntPtr PasskeySyncMetadataNative();
     [DllImport(LibraryName, EntryPoint = "bw_passkey_pending", CallingConvention = CallingConvention.Cdecl)]
     private static extern IntPtr PasskeyPendingNative();
     [DllImport(LibraryName, EntryPoint = "bw_passkey_respond", CallingConvention = CallingConvention.Cdecl)]
@@ -30,6 +36,7 @@ internal static partial class RustCore
     internal static void StartPasskeys() => ReadJson<bool>(PasskeyStartNative());
     internal static void RegisterPasskeys() => ReadJson<bool>(PasskeyRegisterNative());
     internal static string PasskeyState() => ReadJson<string>(PasskeyStateNative());
+    internal static bool SyncPasskeyMetadata() => ReadJson<bool>(PasskeySyncMetadataNative());
     internal static PasskeyPending PendingPasskey() => ReadJson<PasskeyPending>(PasskeyPendingNative());
     internal static bool IsPasskeyActive(string id)
     {

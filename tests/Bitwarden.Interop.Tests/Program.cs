@@ -11,6 +11,10 @@ void Check(bool result, string name)
     Console.WriteLine($"PASS: {name}");
 }
 
+VaultTimeoutChecks.Run(Check);
+GeneratorSettingsChecks.Run(Check);
+PasskeyChecks.Run(Check);
+
 var items = Enumerable.Range(1, 8).Select(type => new VaultItem(type.ToString(), $"Type {type}", "user@example.invalid", type,
     type == 1, type == 2 ? "folder" : null, null, false, false, false, false)).ToArray();
 var mixed = items.Concat([items[0] with { Id = "deleted", Deleted = true }, items[1] with { Id = "archived", Archived = true }]).ToArray();

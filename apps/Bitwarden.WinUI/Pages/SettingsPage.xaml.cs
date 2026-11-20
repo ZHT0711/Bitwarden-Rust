@@ -9,6 +9,8 @@ namespace Bitwarden_WinUI.Pages;
 
 public sealed partial class SettingsPage : Page
 {
+    private bool _readingPasskeyState;
+    private bool _passkeyMetadataPublished;
     private async void RegisterPasskeys_Click(object sender, RoutedEventArgs e)
     {
         RegisterPasskeysButton.IsEnabled = false;
@@ -27,9 +29,13 @@ public sealed partial class SettingsPage : Page
 
     internal async void RefreshPasskeyStatus()
     {
+        if (_readingPasskeyState) return;
+        _readingPasskeyState = true;
         try {
             var state = await Task.Run(RustCore.PasskeyState);
             if (!IsLoaded) return;
+            if (state != "enabled") _passkeyMetadataPublished = false;
+            else if (!_passkeyMetadataPublished) _passkeyMetadataPublished = await Task.Run(RustCore.SyncPasskeyMetadata);
             PasskeyStatus.Text = state switch {
                 "enabled" => "Windows 已启用此通行密钥提供程序。网站请求会打开账户选择与 Windows Hello 验证。",
                 "disabled" => "已注册，Windows 尚未启用。请在系统通行密钥设置中打开 Bitwarden Rust (Preview)，并完成系统要求的确认。",
@@ -38,11 +44,13 @@ public sealed partial class SettingsPage : Page
         }
         catch (Exception error) when (error is VaultException or DllNotFoundException or EntryPointNotFoundException or BadImageFormatException)
         { if (IsLoaded) PasskeyStatus.Text = "无法读取系统通行密钥提供程序状态。"; }
+        finally { _readingPasskeyState = false; }
     }
 
     public SettingsPage()
     {
         InitializeComponent();
+        InitializeTimeoutControls();
         Loaded += (_, _) => RefreshPasskeyStatus();
         WebsiteIconsToggle.IsOn = WebsiteIcons.Enabled;
         WebsiteIconsToggle.Toggled += (_, _) => WebsiteIcons.SetEnabled(WebsiteIconsToggle.IsOn);

@@ -21,6 +21,7 @@ use windows::{core::GUID, Win32::Foundation::HWND};
 
 pub(crate) const CLSID: &str = "{68bf13a5-a81e-4514-a87e-e282b75baf26}";
 const AAGUID: &str = "bb905b68-1c5e-4939-b25a-7a24b83f40d6";
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 static SERVER: OnceLock<Mutex<Option<WebAuthnPlugin>>> = OnceLock::new();
 static PENDING: Mutex<Option<Arc<Pending>>> = Mutex::new(None);
 
@@ -42,30 +43,51 @@ struct PendingState {
 
 impl Pending {
     pub fn is_current(&self) -> bool {
-        self.created.elapsed() < Duration::from_secs(120)
-            && self
-                .state
-                .lock()
-                .is_ok_and(|s| !s.cancelled && s.result.is_none())
+        self.state.lock().is_ok_and(|s| self.is_active(&s))
+    }
+
+    fn is_active(&self, state: &PendingState) -> bool {
+        !state.cancelled && state.result.is_none() && self.created.elapsed() < REQUEST_TIMEOUT
     }
     pub fn begin(&self) -> Result<(), VaultError> {
         let mut state = self.state.lock().map_err(|_| VaultError::Internal)?;
-        if state.cancelled
-            || state.processing
-            || state.result.is_some()
-            || self.created.elapsed() >= Duration::from_secs(120)
-        {
+        if !self.is_active(&state) || state.processing {
             return Err(VaultError::NotFound);
         }
         state.processing = true;
         Ok(())
     }
-    pub fn complete(&self, result: Result<Vec<u8>, String>) {
+    #[must_use]
+    pub fn complete(&self, result: Result<Vec<u8>, String>) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        if !self.is_active(&state) {
+            return false;
+        }
+        state.result = Some(result);
+        self.ready.notify_all();
+        true
+    }
+
+    pub fn reject_before_approval(&self, error: VaultError) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        if !self.is_active(&state) || state.processing {
+            return false;
+        }
+        state.result = Some(Err(error.to_string()));
+        self.ready.notify_all();
+        true
+    }
+
+    fn cancel(&self) {
         if let Ok(mut state) = self.state.lock() {
-            if !state.cancelled {
-                state.result = Some(result);
+            if state.result.is_none() {
+                state.cancelled = true;
+                self.ready.notify_all();
             }
-            self.ready.notify_all();
         }
     }
     pub fn verify(&self, window: usize, user_name: &str) -> Result<(), VaultError> {
@@ -83,11 +105,7 @@ impl Pending {
                 },
                 &self.hash,
             )
-            .map_err(|_| VaultError::PermissionDenied)?;
-        if !self.is_current() {
-            return Err(VaultError::NotFound);
-        }
-        Ok(())
+            .map_err(|_| VaultError::PermissionDenied)
     }
 }
 
@@ -102,10 +120,7 @@ pub(crate) fn pending() -> Option<Arc<Pending>> {
 pub(crate) fn cancel(id: &str) {
     if let Ok(pending) = PENDING.lock() {
         if let Some(request) = pending.as_ref().filter(|p| id.is_empty() || p.id == id) {
-            if let Ok(mut state) = request.state.lock() {
-                state.cancelled = true;
-                request.ready.notify_all();
-            }
+            request.cancel();
         }
     }
 }
@@ -169,28 +184,34 @@ pub(crate) fn state() -> &'static str {
     }
 }
 
-pub(crate) async fn sync_metadata(vault: &crate::vault::VaultCache, client: &bw_sdk_core::Client) {
+pub(crate) async fn sync_metadata(
+    vault: &crate::vault::VaultCache,
+    client: &bw_sdk_core::Client,
+) -> bool {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     use win_webauthn::{
         plugin::{AuthenticatorState, PluginCredentialDetails},
         CredentialId, UserId,
     };
     if SERVER.get().is_none() {
-        return;
+        return false;
     }
     let Ok(clsid) = Clsid::try_from(CLSID) else {
-        return;
+        return false;
     };
     let plugin = WebAuthnPlugin::new(clsid);
     if plugin.get_authenticator_state().ok() != Some(AuthenticatorState::Enabled) {
-        return;
+        return false;
     }
     let Ok(views) = vault.passkey_views(client).await else {
-        return;
+        return false;
     };
     let mut metadata = Vec::new();
     for view in views {
         for credential in view.get_fido2_credentials() {
+            if !crate::vault::passkeys::is_discoverable(&credential) {
+                continue;
+            }
             let Ok(id) = bitwarden_fido::string_to_guid_bytes(&credential.credential_id) else {
                 continue;
             };
@@ -217,7 +238,7 @@ pub(crate) async fn sync_metadata(vault: &crate::vault::VaultCache, client: &bw_
         }
     }
     // Windows receives only public discovery metadata. The vault remains authoritative.
-    let _ = plugin.sync_credentials(metadata);
+    plugin.sync_credentials(metadata).is_ok()
 }
 
 pub(crate) fn clear_metadata() {
@@ -254,9 +275,11 @@ fn request(
     let state = request.state.lock().map_err(|_| "provider unavailable")?;
     let (mut state, _) = request
         .ready
-        .wait_timeout_while(state, Duration::from_secs(120), |s| {
-            !s.cancelled && s.result.is_none()
-        })
+        .wait_timeout_while(
+            state,
+            REQUEST_TIMEOUT.saturating_sub(request.created.elapsed()),
+            |s| !s.cancelled && s.result.is_none(),
+        )
         .map_err(|_| "provider unavailable")?;
     let result = state
         .result
@@ -475,17 +498,33 @@ mod tests {
         assert!(pending.is_current());
         pending.begin().unwrap();
         assert!(pending.begin().is_err());
-        pending.complete(Ok(vec![1]));
+        assert!(pending.complete(Ok(vec![1])));
+        assert!(!pending.complete(Err("notFound".to_owned())));
+        pending.cancel();
+        assert_eq!(pending.state.lock().unwrap().result, Some(Ok(vec![1])));
         assert!(!pending.is_current());
-        pending.state = Mutex::new(PendingState {
-            cancelled: true,
-            ..Default::default()
-        });
+        pending.state = Mutex::new(PendingState::default());
+        pending.cancel();
+        assert!(!pending.complete(Ok(vec![2])));
+        assert!(pending.state.lock().unwrap().result.is_none());
         assert!(!pending.is_current());
         assert!(pending.begin().is_err());
         pending.state = Mutex::new(PendingState::default());
-        pending.created = Instant::now() - Duration::from_secs(121);
+        pending.created = Instant::now() - REQUEST_TIMEOUT;
         assert!(!pending.is_current());
         assert!(pending.begin().is_err());
+        assert!(!pending.complete(Ok(vec![3])));
+        assert!(pending.state.lock().unwrap().result.is_none());
+
+        pending.state = Mutex::new(PendingState::default());
+        pending.created = Instant::now();
+        assert!(pending.reject_before_approval(VaultError::NotFound));
+        assert_eq!(
+            pending.state.lock().unwrap().result,
+            Some(Err("notFound".to_owned()))
+        );
+        pending.state = Mutex::new(PendingState::default());
+        pending.begin().unwrap();
+        assert!(!pending.reject_before_approval(VaultError::NotFound));
     }
 }

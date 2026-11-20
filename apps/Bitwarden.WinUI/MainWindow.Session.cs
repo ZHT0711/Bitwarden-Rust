@@ -21,6 +21,7 @@ public sealed partial class MainWindow
         LockButton.Visibility = signedIn ? Visibility.Visible : Visibility.Collapsed;
         LockButton.Content = unlocked ? "锁定" : "解锁";
         SignInButton.Content = signedIn ? "退出登录" : "登录";
+        UpdateVaultTimeoutMonitor(state);
     }
 
     private async void Lock_Click(object sender, RoutedEventArgs e)
@@ -33,20 +34,24 @@ public sealed partial class MainWindow
             }
             else if (RustCore.SessionState == VaultSessionState.Unlocked)
             {
-                await ChangeSessionAsync(() =>
-                {
-                    if (!RustCore.Lock()) RustCore.Logout();
-                });
+                await ChangeSessionAsync(LockVault);
             }
         }
         catch (Exception error) when (IsCoreUnavailable(error)) { }
+    }
+
+    private static void LockVault()
+    {
+        if (!RustCore.Lock()) RustCore.Logout();
     }
 
     private async Task ChangeSessionAsync(Action change)
     {
         if (_accountTransition || _signInDialogOpen) return;
         _accountTransition = true;
+        DiscardPendingWindowsTimeout();
         UpdateSessionControls(RustCore.SessionState);
+        ClearPasskeySensitiveState();
         NavView.IsEnabled = false;
         SearchBox.Text = string.Empty;
         if (NavFrame.Content is HomePage vault) vault.ClearSensitiveState();
@@ -63,7 +68,7 @@ public sealed partial class MainWindow
                 NavView.IsEnabled = true;
                 var state = RustCore.SessionState;
                 UpdateSessionControls(state);
-                if (NavFrame.Content is HomePage page)
+                if (!await ApplyPendingWindowsTimeoutAsync() && NavFrame.Content is HomePage page)
                 {
                     if (state == VaultSessionState.Locked) page.ShowLocked();
                     else if (state == VaultSessionState.SignedOut) page.ShowLoggedOut();
@@ -109,6 +114,7 @@ public sealed partial class MainWindow
             args.Cancel = true;
             if (_unlockRequest is not null || password.Password.Length == 0) return;
             var entered = password.Password;
+            DiscardPendingWindowsTimeout();
             using var request = _unlockRequest = new CancellationTokenSource();
             password.Password = string.Empty;
             password.IsEnabled = dialog.IsPrimaryButtonEnabled = false;
@@ -150,7 +156,7 @@ public sealed partial class MainWindow
             {
                 var state = RustCore.SessionState;
                 UpdateSessionControls(state);
-                if (state == VaultSessionState.Unlocked && NavFrame.Content is HomePage page)
+                if (!await ApplyPendingWindowsTimeoutAsync() && state == VaultSessionState.Unlocked && NavFrame.Content is HomePage page)
                     await page.RefreshAsync(false);
             }
         }

@@ -20,6 +20,8 @@ public sealed partial class MainWindow : Window
         SetTitleBar(AppTitleBar);
         AppWindow.TitleBar.PreferredHeightOption = TitleBarHeightOption.Tall;
         AppWindow.SetIcon("Assets/AppIcon.ico");
+        AccountSettingsScope.SignedOut += GeneratorPage.ResetSavedAlgorithm;
+        InitializeVaultTimeout();
         NavFrame.Navigated += NavFrame_Navigated;
         NavFrame.Navigate(typeof(HomePage), "vault");
         StartPasskeyProvider();
@@ -27,8 +29,11 @@ public sealed partial class MainWindow : Window
         Closed += (_, _) =>
         {
             _closed = true;
+            AccountSettingsScope.SignedOut -= GeneratorPage.ResetSavedAlgorithm;
             _passkeyTimer?.Stop();
-            _passkeyDialog?.Hide();
+            ClearPasskeySensitiveState();
+            _vaultTimeoutTimer?.Stop();
+            _windowsVaultEvents?.Dispose();
             _unlockRequest?.Cancel();
             if (NavFrame.Content is HomePage page) page.ClearSensitiveState();
             if (NavFrame.Content is GeneratorPage generator) generator.ClearSensitiveState();
@@ -105,6 +110,11 @@ public sealed partial class MainWindow : Window
             page.SignInRequested += HomePage_SignInRequested;
             page.SetSearch(SearchBox.Text);
         }
+        else if (e.Content is SettingsPage settings)
+        {
+            settings.VaultTimeoutChanged = value => SaveVaultTimeout(settings, value);
+            UpdateTimeoutControls(settings);
+        }
     }
 
     private async void SignIn_Click(object sender, RoutedEventArgs e)
@@ -155,7 +165,14 @@ public sealed partial class MainWindow : Window
             _signInDialogOpen = false;
             if (!_closed)
             {
-                try { UpdateSessionControls(RustCore.SessionState); }
+                try
+                {
+                    var state = RustCore.SessionState;
+                    UpdateSessionControls(state);
+                    if (!await ApplyPendingWindowsTimeoutAsync() &&
+                        state == VaultSessionState.Unlocked && NavFrame.Content is HomePage page)
+                        page.ShowAuthenticated();
+                }
                 catch (Exception error) when (IsCoreUnavailable(error)) { SignInButton.IsEnabled = true; }
             }
         }
@@ -399,6 +416,7 @@ public sealed partial class MainWindow : Window
                     return;
                 }
                 var provider = providerBox.SelectedItem is ComboBoxItem item && item.Tag is uint id ? id : 0;
+                DiscardPendingWindowsTimeout();
                 requestCancellation = new CancellationTokenSource();
                 var cancellationToken = requestCancellation.Token;
                 SetBusy(true);
@@ -412,8 +430,7 @@ public sealed partial class MainWindow : Window
                     pendingDeviceOtp = string.Empty;
                     if (_closed) return;
                     WebsiteIcons.SetServer(mode, url);
-                    UpdateSessionControls(VaultSessionState.Unlocked);
-                    if (NavFrame.Content is HomePage page) page.ShowAuthenticated();
+                    UseTimeoutSettingsFor(mode, url, email);
                     return;
                 }
                 if (result.Status is AuthStatus.NewDeviceVerificationRequired or AuthStatus.InvalidNewDeviceVerificationCode)

@@ -8,6 +8,9 @@
   <ItemGroup>
     <Compile Include="../../apps/Bitwarden.WinUI/Interop/RustCore.cs" Link="RustCore.cs" />
     <Compile Include="../../apps/Bitwarden.WinUI/Interop/RustCore.Passkeys.cs" Link="RustCore.Passkeys.cs" />
+    <Compile Include="../../apps/Bitwarden.WinUI/Interop/AccountSettingsScope.cs" Link="AccountSettingsScope.cs" />
+    <Compile Include="../../apps/Bitwarden.WinUI/Interop/VaultTimeoutSettings.cs" Link="VaultTimeoutSettings.cs" />
+    <Compile Include="../../apps/Bitwarden.WinUI/Interop/GeneratorSettings.cs" Link="GeneratorSettings.cs" />
     <Compile Include="../../apps/Bitwarden.WinUI/Interop/VaultModels.cs" Link="VaultModels.cs" />
     <Compile Include="../../apps/Bitwarden.WinUI/Interop/VaultEditorModels.cs" Link="VaultEditorModels.cs" />
     <Compile Include="../../apps/Bitwarden.WinUI/Interop/VaultQuery.cs" Link="VaultQuery.cs" />

@@ -2,6 +2,8 @@ using Bitwarden_WinUI.Interop;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Controls.Primitives;
+using System.Runtime.InteropServices;
+using Windows.Storage;
 
 namespace Bitwarden_WinUI.Pages;
 
@@ -12,23 +14,124 @@ public sealed partial class GeneratorPage : Page
     private double _lastMinimumNumbers = 1;
     private double _lastMinimumSpecial = 1;
     private bool _updatingMinimums;
+    private string? _settingsScope;
+    private bool _settingsLoaded;
+    private GeneratorSettings _settings = new();
+    private GeneratorSettings? _pendingSettings;
+
+    public static void ResetSavedAlgorithm(string scope)
+    {
+        try { GeneratorSettings.ResetSelectedType(ApplicationData.Current.LocalSettings.Values, scope); }
+        catch (Exception error) when (IsSettingsUnavailable(error)) { }
+    }
 
     public GeneratorPage()
     {
         InitializeComponent();
         _regenerationTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(150) };
         _regenerationTimer.Tick += RegenerationTimer_Tick;
-        _ready = true;
-        CredentialType.SelectedIndex = 0;
-        Loaded += (_, _) => GenerateCurrent();
-        Unloaded += (_, _) => ClearSensitiveState();
+        RefreshSettingsScope();
+        Loaded += (_, _) =>
+        {
+            AccountSettingsScope.SignedOut += Account_SignedOut;
+            RefreshSettingsScope();
+            GenerateCurrent();
+        };
+        Unloaded += (_, _) =>
+        {
+            AccountSettingsScope.SignedOut -= Account_SignedOut;
+            ClearSensitiveState();
+        };
     }
 
     public void ClearSensitiveState()
     {
+        PersistPendingSettings();
         _regenerationTimer.Stop();
         GeneratedPassword.Text = string.Empty;
     }
+
+    public void RefreshSettingsScope() => RefreshSettingsScopeIfChanged();
+
+    private bool RefreshSettingsScopeIfChanged()
+    {
+        var scope = AccountSettingsScope.Current;
+        if (_settingsLoaded && _settingsScope == scope) return false;
+        PersistPendingSettings();
+        _regenerationTimer.Stop();
+        GeneratedPassword.Text = string.Empty;
+        GeneratorNotice.IsOpen = false;
+        _settingsScope = scope;
+        try { _settings = GeneratorSettings.Load(ApplicationData.Current.LocalSettings.Values, scope); }
+        catch (Exception error) when (IsSettingsUnavailable(error)) { _settings = new(); }
+        _ready = false;
+        LengthSlider.Value = _settings.PasswordLength;
+        Uppercase.IsOn = _settings.Uppercase;
+        Lowercase.IsOn = _settings.Lowercase;
+        Numbers.IsOn = _settings.Numbers;
+        Special.IsOn = _settings.Special;
+        AvoidAmbiguous.IsOn = _settings.AvoidAmbiguous;
+        MinimumNumbers.Value = _settings.MinimumNumbers;
+        MinimumSpecial.Value = _settings.MinimumSpecial;
+        _lastMinimumNumbers = Math.Max(_settings.MinimumNumbers, 1);
+        _lastMinimumSpecial = Math.Max(_settings.MinimumSpecial, 1);
+        PassphraseWords.Value = _settings.PassphraseWords;
+        WordSeparator.Text = _settings.WordSeparator;
+        CapitalizeWords.IsOn = _settings.CapitalizeWords;
+        IncludeNumber.IsOn = _settings.IncludeNumber;
+        CredentialType.SelectedIndex = _settings.SelectedType;
+        UpdateCredentialTypePresentation();
+        _settingsLoaded = _ready = true;
+        return true;
+    }
+
+    private void Account_SignedOut(string scope)
+    {
+        void Refresh()
+        {
+            if (_settingsScope != scope) return;
+            // A pending edit may have been captured just before logout was requested.
+            if (_pendingSettings is not null) _pendingSettings = _pendingSettings with { SelectedType = 0 };
+            ClearSensitiveState();
+            RefreshSettingsScope();
+        }
+        if (DispatcherQueue.HasThreadAccess) Refresh();
+        else DispatcherQueue.TryEnqueue(Refresh);
+    }
+
+    private static bool IsSettingsUnavailable(Exception error) =>
+        error is COMException or InvalidOperationException or ArgumentException;
+
+    private void PersistPendingSettings()
+    {
+        if (_pendingSettings is not { } settings) return;
+        _pendingSettings = null;
+        if (_settingsScope is not null && _settingsScope != AccountSettingsScope.Current)
+            settings = settings with { SelectedType = 0 };
+        _settings = settings.Normalize();
+        try { _settings.Save(ApplicationData.Current.LocalSettings.Values, _settingsScope); }
+        catch (Exception error) when (IsSettingsUnavailable(error)) { }
+    }
+
+    private GeneratorSettings CaptureSettings() => new()
+    {
+        SelectedType = IsPassphraseSelected ? 1 : 0,
+        PasswordLength = (int)LengthSlider.Value,
+        Uppercase = Uppercase.IsOn,
+        Lowercase = Lowercase.IsOn,
+        Numbers = Numbers.IsOn,
+        Special = Special.IsOn,
+        AvoidAmbiguous = AvoidAmbiguous.IsOn,
+        MinimumNumbers = FiniteCount(MinimumNumbers.Value, _settings.MinimumNumbers),
+        MinimumSpecial = FiniteCount(MinimumSpecial.Value, _settings.MinimumSpecial),
+        PassphraseWords = FiniteCount(PassphraseWords.Value, _settings.PassphraseWords),
+        WordSeparator = WordSeparator.Text,
+        CapitalizeWords = CapitalizeWords.IsOn,
+        IncludeNumber = IncludeNumber.IsOn,
+    };
+
+    private static int FiniteCount(double value, int fallback) =>
+        double.IsFinite(value) ? (int)Math.Clamp(value, 0, 128) : fallback;
 
     private void LengthSlider_ValueChanged(object sender, RangeBaseValueChangedEventArgs e)
     {
@@ -39,11 +142,17 @@ public sealed partial class GeneratorPage : Page
         ScheduleRegeneration();
     }
 
-    private void Generate_Click(object sender, RoutedEventArgs e) => GenerateCurrent();
+    private void Generate_Click(object sender, RoutedEventArgs e)
+    {
+        RefreshSettingsScope();
+        GenerateCurrent();
+    }
 
     private void GenerateCurrent()
     {
+        if (RefreshSettingsScopeIfChanged()) return;
         _regenerationTimer.Stop();
+        PersistPendingSettings();
         try
         {
             GeneratedPassword.Text = IsPassphraseSelected
@@ -113,19 +222,25 @@ public sealed partial class GeneratorPage : Page
         GeneratorNotice.IsOpen = true;
     }
 
-    private static uint ToCount(double? value) => value is double number && number > 0 ? (uint)number : 0;
+    private static uint ToCount(double? value) => value is double number && double.IsFinite(number) && number > 0
+        ? (uint)Math.Min(number, 128) : 0;
 
     private bool IsPassphraseSelected => CredentialType.SelectedIndex == 1;
 
     private void CredentialType_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         if (!_ready) return;
+        UpdateCredentialTypePresentation();
+        ScheduleRegeneration();
+    }
+
+    private void UpdateCredentialTypePresentation()
+    {
         var showPassphrase = IsPassphraseSelected;
         PasswordOptions.Visibility = showPassphrase ? Visibility.Collapsed : Visibility.Visible;
         PassphraseOptions.Visibility = showPassphrase ? Visibility.Visible : Visibility.Collapsed;
         GeneratedLabel.Text = showPassphrase ? "生成的密码短语" : "生成的密码";
         GenerateButton.Content = showPassphrase ? "生成密码短语" : "生成密码";
-        ScheduleRegeneration();
     }
 
     private void PasswordOption_Toggled(object sender, RoutedEventArgs e)
@@ -189,6 +304,9 @@ public sealed partial class GeneratorPage : Page
         {
             return;
         }
+
+        if (RefreshSettingsScopeIfChanged()) return;
+        _pendingSettings = CaptureSettings();
 
         _regenerationTimer.Stop();
         _regenerationTimer.Start();

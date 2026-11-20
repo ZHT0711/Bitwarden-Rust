@@ -35,7 +35,12 @@
                     <Button x:Name="RegisterPasskeysButton" Content="注册 Windows 通行密钥提供程序" Click="RegisterPasskeys_Click" AutomationProperties.AutomationId="RegisterPasskeysButton" />
                     <Button Content="打开 Windows 通行密钥设置" Click="OpenPasskeySettings_Click" />
                     <TextBlock x:Name="PasskeyStatus" TextWrapping="Wrap" />
-                    <TextBlock Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="登录后可从窗口顶部手动锁定保险库，并使用主密码解锁。关闭应用会结束当前会话。" TextWrapping="Wrap" />
+                    <TextBlock Style="{StaticResource BodyStrongTextBlockStyle}" Text="保险库超时" Margin="0,12,0,0" />
+                    <ComboBox x:Name="TimeoutModeBox" Header="触发条件" HorizontalAlignment="Stretch" AutomationProperties.AutomationId="VaultTimeoutMode" />
+                    <NumberBox x:Name="TimeoutMinutesBox" Header="分钟" Minimum="1" SmallChange="1" LargeChange="15" SpinButtonPlacementMode="Compact" AutomationProperties.AutomationId="VaultTimeoutMinutes" />
+                    <ComboBox x:Name="TimeoutActionBox" Header="超时后" HorizontalAlignment="Stretch" AutomationProperties.AutomationId="VaultTimeoutAction" />
+                    <Button x:Name="SaveTimeoutButton" Content="保存超时设置" Click="SaveTimeout_Click" AutomationProperties.AutomationId="SaveVaultTimeout" />
+                    <TextBlock x:Name="TimeoutFeedback" TextWrapping="Wrap" />
                 </StackPanel>
             </Border>
         </StackPanel>
