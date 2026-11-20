@@ -91,6 +91,7 @@ async fn seeded_cache(client: &Client, views: Vec<CipherView>, premium: bool) ->
             folders: Some(vec![]),
             ..Default::default()
         },
+        &mut None,
     )
     .await
     .unwrap();

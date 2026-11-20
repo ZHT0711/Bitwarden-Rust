@@ -389,6 +389,12 @@ class FixtureHandler(BaseHTTPRequestHandler):
                 state.require_new_device_verification = True
             self.reply({"ok": True})
             return
+        if path == "/control/change-master-password-wrapper":
+            with state.lock:
+                # Change the wrapped key reported by sync while keeping the same fixture ciphers.
+                state.sync_template["profile"]["key"] = PUBLIC_WRAPPED_USER_KEY[:-2] + "A="
+            self.reply({"ok": True})
+            return
         if path == "/control/reset":
             state.reset()
             self.reply({"ok": True})

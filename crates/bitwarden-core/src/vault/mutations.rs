@@ -625,35 +625,10 @@ impl VaultCache {
         client: &Client,
         id: Option<String>,
     ) -> Result<VaultMutationResult, VaultError> {
-        let ciphers = self.ciphers.snapshot().map_err(|_| self.uncertain())?;
-        let result = client
-            .vault()
-            .ciphers()
-            .decrypt_list_with_failures(ciphers.values().cloned().collect::<Vec<_>>().into())
+        let (items, failures) = self
+            .project_items(client)
             .await
             .map_err(|_| self.uncertain())?;
-        let failures = result.failures.len();
-        let mut items = Vec::new();
-        for view in result.successes {
-            let Some(id) = view.id.map(|id| id.to_string()) else {
-                continue;
-            };
-            items.push(VaultItem {
-                id: id.clone(),
-                name: view.name,
-                subtitle: view.subtitle,
-                item_type: ciphers[&id].r#type as u8,
-                favorite: view.favorite,
-                folder_id: view.folder_id.map(|id| id.to_string()),
-                organization_id: view.organization_id.map(|id| id.to_string()),
-                deleted: view.deleted_date.is_some(),
-                archived: view.archived_date.is_some(),
-                reprompt: view.reprompt as u8 != 0,
-                restricted: view.partial,
-                revision_date: view.revision_date.to_rfc3339(),
-            });
-        }
-        items.sort_by_cached_key(|item| item.name.to_lowercase());
         if id
             .as_ref()
             .is_some_and(|id| !items.iter().any(|item| &item.id == id))

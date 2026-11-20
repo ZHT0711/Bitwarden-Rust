@@ -11,9 +11,14 @@ pub(crate) use mutations::{VaultEditorData, VaultMutationResult};
 use repository::CipherRepository;
 
 use bitwarden_api_api::models::SyncResponseModel;
+use bitwarden_crypto::UnsignedSharedKey;
 use bitwarden_crypto_sync_handler::{CryptoSyncData, CryptoSyncHandlerClientExt};
 use bitwarden_vault::{Cipher, CipherView, Folder, VaultClientExt};
-use bw_sdk_core::Client;
+use bw_sdk_core::{
+    auth::login::PasswordLoginUnlockData,
+    key_management::account_cryptographic_state::WrappedAccountCryptographicState, Client,
+    OrganizationId,
+};
 use chrono::Utc;
 use serde::Serialize;
 use serde_json::Value;
@@ -89,8 +94,12 @@ pub(crate) struct VaultOverview {
 #[derive(Default)]
 pub(crate) struct VaultCache {
     ciphers: Arc<CipherRepository>,
+    folders: Vec<Folder>,
+    org_keys: Vec<(OrganizationId, UnsignedSharedKey)>,
     encrypted_user_key: Option<String>,
     overview: Option<VaultOverview>,
+    last_sync: Option<String>,
+    parse_failures: usize,
     base_failures: usize,
     can_archive: bool,
     write_uncertain: bool,
@@ -144,7 +153,10 @@ impl VaultCache {
     }
 
     /// Build a replacement before touching the last successful cache. Failed syncs retain it.
-    pub(crate) async fn fetch(client: &Client) -> Result<Self, VaultError> {
+    pub(crate) async fn fetch(
+        client: &Client,
+        unlock_data: &mut Option<PasswordLoginUnlockData>,
+    ) -> Result<Self, VaultError> {
         let response = client
             .internal
             .get_api_configurations()
@@ -153,12 +165,13 @@ impl VaultCache {
             .get(Some(true))
             .await
             .map_err(|_| VaultError::Network)?;
-        Self::from_response(client, response).await
+        Self::from_response(client, response, unlock_data).await
     }
 
     async fn from_response(
         client: &Client,
         response: SyncResponseModel,
+        unlock_data: &mut Option<PasswordLoginUnlockData>,
     ) -> Result<Self, VaultError> {
         let api_ciphers = response
             .ciphers
@@ -183,20 +196,52 @@ impl VaultCache {
             .map_err(|_| VaultError::InvalidResponse)?;
         let crypto =
             CryptoSyncData::try_from(&response).map_err(|_| VaultError::InvalidResponse)?;
+        // A local unlock may only use the wrapped keys from this login. If sync reports new
+        // key material, require a fresh login so the old master password cannot unlock it.
+        if unlock_data.as_ref().is_some_and(|keys| {
+            let account_changed = match (&crypto.account_cryptographic_state, &keys.account) {
+                (Some(account), original) => account != original,
+                (None, WrappedAccountCryptographicState::V1 { private_key }) => profile
+                    .private_key
+                    .as_ref()
+                    .is_some_and(|key| key != &private_key.to_string()),
+                (None, _) => false,
+            };
+            let wrapper_changed = match crypto.user_decryption.as_ref() {
+                Some(decryption) => {
+                    decryption
+                        .master_password_unlock
+                        .as_ref()
+                        .is_none_or(|current| {
+                            current.kdf != keys.master_password.kdf
+                                || current.salt != keys.master_password.salt
+                                || current.master_key_wrapped_user_key
+                                    != keys.master_password.master_key_wrapped_user_key
+                                || decryption.v2_upgrade_token.is_some()
+                        })
+                }
+                None => profile.key.as_ref().is_some_and(|key| {
+                    key != &keys.master_password.master_key_wrapped_user_key.to_string()
+                }),
+            };
+            account_changed || wrapper_changed
+        }) {
+            *unlock_data = None;
+        }
         // Let the official SDK handle security-state transitions and key upgrades.
         client.crypto_sync_handler().on_sync(crypto).await;
         let mut org_keys = Vec::new();
         for org in profile.organizations.iter().flatten() {
             if let (Some(id), Some(key)) = (org.id, org.key.as_ref()) {
                 org_keys.push((
-                    bw_sdk_core::OrganizationId::new(id),
+                    OrganizationId::new(id),
                     key.parse().map_err(|_| VaultError::InvalidResponse)?,
                 ));
             }
         }
         client
             .internal
-            .initialize_org_crypto(org_keys)
+            .initialize_org_crypto(org_keys.clone())
             .map_err(|_| VaultError::DecryptionFailed)?;
 
         let mut failures = 0;
@@ -224,25 +269,81 @@ impl VaultCache {
         .map_err(|_| VaultError::InvalidResponse)?;
         flags.insert("strict-cipher-decryption".to_owned(), true);
         client.flags().load(flags).await;
+        let folders = api_folders
+            .iter()
+            .filter_map(|raw| Folder::try_from(raw.clone()).ok())
+            .collect::<Vec<_>>();
+        let mut cache = Self {
+            ciphers: Arc::new(CipherRepository::from(ciphers)),
+            org_keys,
+            parse_failures: failures + api_folders.len() - folders.len(),
+            folders,
+            encrypted_user_key: profile.key.clone(),
+            can_archive: profile.premium.unwrap_or(false)
+                || profile
+                    .organizations
+                    .iter()
+                    .flatten()
+                    .any(|org| org.users_get_premium.unwrap_or(false)),
+            last_sync: Some(Utc::now().to_rfc3339()),
+            ..Self::default()
+        };
+        cache.rebuild_overview(client).await?;
+        Ok(cache)
+    }
+
+    pub(crate) fn discard_overview(&mut self) {
+        if let Some(mut overview) = self.overview.take() {
+            use zeroize::Zeroize;
+            for item in &mut overview.items {
+                item.name.zeroize();
+                item.subtitle.zeroize();
+            }
+            for folder in &mut overview.folders {
+                folder.name.zeroize();
+            }
+        }
+    }
+
+    pub(crate) async fn restore_overview(&mut self, client: &Client) -> Result<(), VaultError> {
+        if self.last_sync.is_some() && !self.write_uncertain {
+            client
+                .internal
+                .initialize_org_crypto(self.org_keys.clone())
+                .map_err(|_| VaultError::DecryptionFailed)?;
+            self.rebuild_overview(client).await?;
+        }
+        Ok(())
+    }
+
+    async fn project_items(&self, client: &Client) -> Result<(Vec<VaultItem>, usize), VaultError> {
+        let ciphers = self
+            .ciphers
+            .snapshot()
+            .map_err(|_| VaultError::Internal)?
+            .into_values()
+            .collect::<Vec<_>>();
+        let types: HashMap<_, _> = ciphers
+            .iter()
+            .filter_map(|cipher| cipher.id.map(|id| (id, cipher.r#type as u8)))
+            .collect();
         let result = client
             .vault()
             .ciphers()
-            .decrypt_list_with_failures(ciphers.values().cloned().collect::<Vec<_>>().into())
+            .decrypt_list_with_failures(ciphers.into())
             .await
             .map_err(|_| VaultError::DecryptionFailed)?;
-        failures += result.failures.len();
-        let decryption_failures = result.failures.len();
+        let failures = result.failures.len();
         let mut items = Vec::new();
         for view in result.successes {
-            let Some(id) = view.id.map(|id| id.to_string()) else {
+            let Some(id) = view.id else {
                 continue;
             };
-            let cipher = &ciphers[&id];
             items.push(VaultItem {
-                id,
+                id: id.to_string(),
                 name: view.name,
                 subtitle: view.subtitle,
-                item_type: cipher.r#type as u8,
+                item_type: *types.get(&id).ok_or(VaultError::InvalidResponse)?,
                 favorite: view.favorite,
                 folder_id: view.folder_id.map(|id| id.to_string()),
                 organization_id: view.organization_id.map(|id| id.to_string()),
@@ -254,14 +355,18 @@ impl VaultCache {
             });
         }
         items.sort_by_cached_key(|item| item.name.to_lowercase());
+        Ok((items, failures))
+    }
+
+    async fn rebuild_overview(&mut self, client: &Client) -> Result<(), VaultError> {
+        let last_sync = self.last_sync.clone().ok_or(VaultError::NotSynced)?;
+        let (items, decryption_failures) = self.project_items(client).await?;
+        let mut failures = self.parse_failures;
         let mut folders = Vec::new();
         let mut ids = HashSet::new();
-        for raw in api_folders {
-            let view = Folder::try_from(raw.clone()).ok().and_then(|folder| {
-                #[allow(deprecated)]
-                client.vault().folders().decrypt(folder).ok()
-            });
-            if let Some(view) = view {
+        for folder in &self.folders {
+            #[allow(deprecated)]
+            if let Ok(view) = client.vault().folders().decrypt(folder.clone()) {
                 if let Some(id) = view.id {
                     if !ids.insert(id) {
                         return Err(VaultError::InvalidResponse);
@@ -278,25 +383,14 @@ impl VaultCache {
             }
         }
         folders.sort_by_cached_key(|folder| folder.name.to_lowercase());
-        Ok(Self {
-            ciphers: Arc::new(CipherRepository::from(ciphers)),
-            encrypted_user_key: profile.key.clone(),
-            base_failures: failures.saturating_sub(decryption_failures),
-            can_archive: profile.premium.unwrap_or(false)
-                || profile
-                    .organizations
-                    .iter()
-                    .flatten()
-                    .any(|org| org.users_get_premium.unwrap_or(false)),
-            write_uncertain: false,
-            write_started: false,
-            overview: Some(VaultOverview {
-                items,
-                folders,
-                failures,
-                last_sync: Utc::now().to_rfc3339(),
-            }),
-        })
+        self.base_failures = failures;
+        self.overview = Some(VaultOverview {
+            items,
+            folders,
+            failures: failures + decryption_failures,
+            last_sync,
+        });
+        Ok(())
     }
 
     pub(crate) async fn detail(
@@ -559,7 +653,7 @@ mod tests {
         });
         let client =
             Client::init_test_account_with_api_client(test_bitwarden_com_account(), mock).await;
-        let cache = VaultCache::fetch(&client).await.unwrap();
+        let cache = VaultCache::fetch(&client, &mut None).await.unwrap();
         let overview = cache.overview().unwrap();
         assert_eq!(overview.items.len(), 1);
         assert_eq!(overview.items[0].name, "Synthetic login");
@@ -591,7 +685,9 @@ mod tests {
         broken.id = Some(uuid::Uuid::new_v4());
         broken.name = Some("not-an-encrypted-string".to_owned());
         response.ciphers.as_mut().unwrap().push(broken);
-        let cache = VaultCache::from_response(&client, response).await.unwrap();
+        let cache = VaultCache::from_response(&client, response, &mut None)
+            .await
+            .unwrap();
         assert_eq!(cache.overview().unwrap().items.len(), 1);
         assert_eq!(cache.overview().unwrap().failures, 1);
     }
@@ -603,20 +699,20 @@ mod tests {
         let mut incomplete = response.clone();
         incomplete.ciphers = None;
         assert!(matches!(
-            VaultCache::from_response(&client, incomplete).await,
+            VaultCache::from_response(&client, incomplete, &mut None).await,
             Err(VaultError::InvalidResponse)
         ));
         let mut wrong_account = response.clone();
         wrong_account.profile.as_mut().unwrap().id = Some(uuid::Uuid::new_v4());
         assert!(matches!(
-            VaultCache::from_response(&client, wrong_account).await,
+            VaultCache::from_response(&client, wrong_account, &mut None).await,
             Err(VaultError::InvalidResponse)
         ));
         let mut duplicate = response;
         let cipher = duplicate.ciphers.as_ref().unwrap()[0].clone();
         duplicate.ciphers.as_mut().unwrap().push(cipher);
         assert!(matches!(
-            VaultCache::from_response(&client, duplicate).await,
+            VaultCache::from_response(&client, duplicate, &mut None).await,
             Err(VaultError::InvalidResponse)
         ));
     }
@@ -626,9 +722,10 @@ mod tests {
         let client = Client::init_test_account(test_bitwarden_com_account()).await;
         let mut view = test_view();
         view.reprompt = bitwarden_vault::CipherRepromptType::Password;
-        let cache = VaultCache::from_response(&client, response_for(&client, view).await)
-            .await
-            .unwrap();
+        let cache =
+            VaultCache::from_response(&client, response_for(&client, view).await, &mut None)
+                .await
+                .unwrap();
         let id = &cache.overview().unwrap().items[0].id;
         assert!(matches!(
             cache.detail(&client, id, "").await,
@@ -702,9 +799,10 @@ mod tests {
             value["login"] = Value::Null;
             value[property] = data;
             let view: CipherView = serde_json::from_value(value).unwrap();
-            let cache = VaultCache::from_response(&client, response_for(&client, view).await)
-                .await
-                .unwrap();
+            let cache =
+                VaultCache::from_response(&client, response_for(&client, view).await, &mut None)
+                    .await
+                    .unwrap();
             let item = &cache.overview().unwrap().items[0];
             assert_eq!(item.item_type, kind);
             let detail = cache.detail(&client, &item.id, "").await.unwrap();
@@ -717,6 +815,8 @@ mod tests {
 
     #[tokio::test]
     async fn organization_cipher_is_decrypted_with_the_synced_wrapped_organization_key() {
+        use bw_sdk_core::key_management::SymmetricKeySlotId;
+
         let client = Client::init_test_account(test_bitwarden_com_account()).await;
         let mut view = test_view();
         view.organization_id = Some("1bc9ac1e-f5aa-45f2-94bf-b181009709b8".parse().unwrap());
@@ -725,13 +825,26 @@ mod tests {
             "id":"1bc9ac1e-f5aa-45f2-94bf-b181009709b8",
             "key":"4.rY01mZFXHOsBAg5Fq4gyXuklWfm6mQASm42DJpx05a+e2mmp+P5W6r54WU2hlREX0uoTxyP91bKKwickSPdCQQ58J45LXHdr9t2uzOYyjVzpzebFcdMw1eElR9W2DW8wEk9+mvtWvKwu7yTebzND+46y1nRMoFydi5zPVLSlJEf81qZZ4Uh1UUMLwXz+NRWfixnGXgq2wRq1bH0n3mqDhayiG4LJKgGdDjWXC8W8MMXDYx24SIJrJu9KiNEMprJE+XVF9nQVNijNAjlWBqkDpsfaWTUfeVLRLctfAqW1blsmIv4RQ91PupYJZDNc8nO9ZTF3TEVM+2KHoxzDJrLs2Q=="
         })).unwrap()]);
-        let cache = VaultCache::from_response(&client, response).await.unwrap();
+        let mut cache = VaultCache::from_response(&client, response, &mut None)
+            .await
+            .unwrap();
         assert_eq!(cache.overview().unwrap().failures, 0);
         assert!(cache.overview().unwrap().items[0].organization_id.is_some());
         assert!(cache
             .detail(&client, &cache.overview().unwrap().items[0].id, "")
             .await
             .is_ok());
+        cache.discard_overview();
+        client
+            .internal
+            .get_key_store()
+            .context_mut()
+            .retain_symmetric_keys(|slot| !matches!(slot, SymmetricKeySlotId::Organization(_)));
+        assert!(cache.overview().is_err());
+        cache.restore_overview(&client).await.unwrap();
+        let overview = cache.overview().unwrap();
+        assert_eq!(overview.failures, 0);
+        assert_eq!(overview.items[0].name, "Synthetic login");
     }
 
     #[tokio::test]
@@ -759,7 +872,9 @@ mod tests {
         response.profile.as_mut().unwrap().key = None;
         assert!(response.ciphers.as_ref().unwrap()[0].data.is_some());
         assert!(response.ciphers.as_ref().unwrap()[0].name.is_none());
-        let cache = VaultCache::from_response(&client, response).await.unwrap();
+        let cache = VaultCache::from_response(&client, response, &mut None)
+            .await
+            .unwrap();
         assert_eq!(cache.overview().unwrap().items[0].name, "Synthetic login");
     }
 }

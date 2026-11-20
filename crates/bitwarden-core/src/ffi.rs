@@ -2,7 +2,7 @@ use std::{
     ffi::{c_char, CStr, CString},
     panic::{catch_unwind, AssertUnwindSafe},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicU8, Ordering},
         Arc, Mutex, OnceLock,
     },
 };
@@ -13,7 +13,10 @@ use bitwarden_generators::{
     GeneratorClient, GeneratorClientsExt, PassphraseGeneratorRequest, PasswordGeneratorRequest,
 };
 use bw_sdk_core::{
-    auth::login::{LoginError, PasswordLoginRequest, TwoFactorProvider, TwoFactorRequest},
+    auth::login::{
+        LoginError, PasswordLoginRequest, PasswordLoginUnlockData, TwoFactorProvider,
+        TwoFactorRequest,
+    },
     client::{ClientSettings, DeviceType},
     key_management::MasterPasswordAuthenticationData,
     Client, ClientBuilder,
@@ -36,7 +39,10 @@ const TWO_FACTOR_AUTHENTICATOR: u32 = 1 << 0;
 const TWO_FACTOR_EMAIL: u32 = 1 << 1;
 const TWO_FACTOR_YUBIKEY: u32 = 1 << 3;
 
-static AUTHENTICATED_STATE: AtomicBool = AtomicBool::new(false);
+const SESSION_SIGNED_OUT: u8 = 0;
+const SESSION_UNLOCKED: u8 = 1;
+const SESSION_LOCKED: u8 = 2;
+static SESSION_STATE: AtomicU8 = AtomicU8::new(SESSION_SIGNED_OUT);
 static AUTH_CLIENT: OnceLock<Mutex<Option<AuthSession>>> = OnceLock::new();
 static ASYNC_RUNTIME: OnceLock<Option<tokio::runtime::Runtime>> = OnceLock::new();
 static GENERATOR: OnceLock<GeneratorClient> = OnceLock::new();
@@ -52,7 +58,18 @@ struct AuthSession {
     device_identifier: String,
     client: Client,
     device_login_middleware: Arc<DeviceLoginMiddleware>,
+    unlock_data: Option<PasswordLoginUnlockData>,
     vault: VaultCache,
+}
+
+impl AuthSession {
+    fn clear_vault_keys(&mut self) -> bool {
+        self.vault.discard_overview();
+        catch_unwind(AssertUnwindSafe(|| {
+            self.client.internal.get_key_store().clear()
+        }))
+        .is_ok()
+    }
 }
 
 struct DeviceLoginMiddleware {
@@ -257,9 +274,9 @@ fn auth_client_for_server<'a>(
             device_identifier,
             client: build_auth_client(server, middleware.clone()),
             device_login_middleware: middleware,
+            unlock_data: None,
             vault: VaultCache::default(),
         });
-        AUTHENTICATED_STATE.store(false, Ordering::Release);
     }
 
     &session
@@ -311,12 +328,8 @@ fn login_status(
     >,
 ) -> u32 {
     match result {
-        Ok(response) if response.authenticated => {
-            AUTHENTICATED_STATE.store(true, Ordering::Release);
-            AUTHENTICATED
-        }
+        Ok(response) if response.authenticated => AUTHENTICATED,
         Ok(response) => {
-            AUTHENTICATED_STATE.store(false, Ordering::Release);
             let Some(providers) = response.two_factor else {
                 return AUTH_FAILED;
             };
@@ -326,19 +339,14 @@ fn login_status(
         Err(LoginError::IdentityFail(error))
             if error.to_string().trim() == "new device verification required" =>
         {
-            AUTHENTICATED_STATE.store(false, Ordering::Release);
             DEVICE_VERIFICATION_REQUIRED
         }
         Err(LoginError::IdentityFail(error))
             if error.to_string().trim() == "invalid new device otp" =>
         {
-            AUTHENTICATED_STATE.store(false, Ordering::Release);
             DEVICE_VERIFICATION_INVALID
         }
-        Err(_) => {
-            AUTHENTICATED_STATE.store(false, Ordering::Release);
-            AUTH_FAILED
-        }
+        Err(_) => AUTH_FAILED,
     }
 }
 
@@ -519,46 +527,61 @@ pub unsafe extern "C" fn bw_auth_login(
             two_factor,
         });
 
+        let Some(runtime) = runtime() else {
+            return AUTH_FAILED;
+        };
+        let mut session = auth_client()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if bw_auth_session_state() != SESSION_SIGNED_OUT {
+            return AUTH_FAILED;
+        }
+        if !auth_request::is_current(request_id) {
+            return AUTH_CANCELLED;
+        }
         let result = catch_unwind(AssertUnwindSafe(|| {
-            let runtime = runtime().ok_or(())?;
-            let mut session = auth_client()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
             auth_client_for_server(&mut session, &server, &device_identifier);
             let active_session = session
-                .as_ref()
+                .as_mut()
                 .expect("authentication session was initialized");
             active_session.device_login_middleware.arm(&device_otp);
             let response = runtime.block_on(auth_request::run(
                 request_id,
-                active_session.client.auth().login_password(&request.0),
+                active_session
+                    .client
+                    .auth()
+                    .login_password_with_unlock_data(&request.0),
             ));
-            let status = match response {
-                Ok(response) => login_status(response),
+            active_session.device_login_middleware.arm("");
+            match response {
+                Ok(Ok((response, unlock_data))) if auth_request::is_current(request_id) => {
+                    if response.authenticated {
+                        if unlock_data.is_none() {
+                            return AUTH_FAILED;
+                        }
+                        active_session.unlock_data = unlock_data;
+                        SESSION_STATE.store(SESSION_UNLOCKED, Ordering::Release);
+                    }
+                    login_status(Ok(response))
+                }
+                Ok(Ok(_)) => AUTH_CANCELLED,
+                Ok(Err(error)) => login_status(Err(error)),
                 Err(RequestError::TimedOut) => AUTH_TIMED_OUT,
                 Err(RequestError::Cancelled) => AUTH_CANCELLED,
-            };
-            if !matches!(
-                status & 0xff,
-                AUTHENTICATED
-                    | TWO_FACTOR_REQUIRED
-                    | DEVICE_VERIFICATION_REQUIRED
-                    | DEVICE_VERIFICATION_INVALID
-            ) {
-                // Includes partially authenticated state if a request failed after setting tokens.
-                *session = None;
-                AUTHENTICATED_STATE.store(false, Ordering::Release);
             }
-            Ok::<_, ()>(status)
-        }));
-
-        match result {
-            Ok(Ok(status)) => status,
-            Ok(Err(())) | Err(_) => {
-                AUTHENTICATED_STATE.store(false, Ordering::Release);
-                AUTH_FAILED
-            }
+        }))
+        .unwrap_or(AUTH_FAILED);
+        if !matches!(
+            result & 0xff,
+            AUTHENTICATED
+                | TWO_FACTOR_REQUIRED
+                | DEVICE_VERIFICATION_REQUIRED
+                | DEVICE_VERIFICATION_INVALID
+        ) {
+            // Discard partially authenticated state if login failed after setting tokens.
+            *session = None;
         }
+        result
     }))
     .unwrap_or(AUTH_FAILED)
 }
@@ -600,6 +623,9 @@ pub unsafe extern "C" fn bw_auth_send_two_factor_email(
             let mut session = auth_client()
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if bw_auth_session_state() != SESSION_SIGNED_OUT {
+                return Ok(AUTH_FAILED as u8);
+            }
             let device_identifier = session
                 .as_ref()
                 .map(|current| current.device_identifier.clone())
@@ -617,7 +643,6 @@ pub unsafe extern "C" fn bw_auth_send_two_factor_email(
             };
             if status == AUTH_TIMED_OUT as u8 || status == AUTH_CANCELLED as u8 {
                 *session = None;
-                AUTHENTICATED_STATE.store(false, Ordering::Release);
             }
             Ok::<_, ()>(status)
         }));
@@ -666,6 +691,9 @@ pub unsafe extern "C" fn bw_auth_resend_new_device_verification(
             let mut session = auth_client()
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if bw_auth_session_state() != SESSION_SIGNED_OUT {
+                return Ok(AUTH_FAILED as u8);
+            }
             auth_client_for_server(&mut session, &server, &device_identifier);
             let active_session = session
                 .as_ref()
@@ -723,7 +751,12 @@ pub unsafe extern "C" fn bw_auth_resend_new_device_verification(
 
 #[no_mangle]
 pub extern "C" fn bw_auth_is_authenticated() -> u8 {
-    u8::from(AUTHENTICATED_STATE.load(Ordering::Acquire))
+    u8::from(bw_auth_session_state() == SESSION_UNLOCKED)
+}
+
+#[no_mangle]
+pub extern "C" fn bw_auth_session_state() -> u8 {
+    SESSION_STATE.load(Ordering::Acquire)
 }
 
 #[no_mangle]
@@ -733,8 +766,94 @@ pub extern "C" fn bw_auth_logout() {
     let mut session = auth_client()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *session = None;
-    AUTHENTICATED_STATE.store(false, Ordering::Release);
+    if let Some(mut active) = session.take() {
+        active.clear_vault_keys();
+    }
+    SESSION_STATE.store(SESSION_SIGNED_OUT, Ordering::Release);
+}
+
+#[no_mangle]
+pub extern "C" fn bw_auth_lock() -> u8 {
+    catch_unwind(AssertUnwindSafe(|| {
+        auth_request::begin();
+        let mut guard = auth_client()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if bw_auth_session_state() == SESSION_LOCKED {
+            return 1;
+        }
+        let Some(session) = guard
+            .as_mut()
+            .filter(|_| bw_auth_session_state() == SESSION_UNLOCKED)
+        else {
+            return 0;
+        };
+        if !session.clear_vault_keys() {
+            *guard = None;
+            SESSION_STATE.store(SESSION_SIGNED_OUT, Ordering::Release);
+            return 0;
+        }
+        SESSION_STATE.store(SESSION_LOCKED, Ordering::Release);
+        1
+    }))
+    .unwrap_or(0)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn bw_auth_unlock(password: *const c_char, request_id: u64) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(password) = (unsafe { read_utf8(password) }) else {
+            return vault_error("wrongPassword");
+        };
+        let password = Zeroizing::new(password);
+        let Some(runtime) = runtime() else {
+            return vault_error("internal");
+        };
+        let mut guard = auth_client()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(session) = guard
+            .as_mut()
+            .filter(|_| bw_auth_session_state() == SESSION_LOCKED)
+        else {
+            return vault_error("unlockUnavailable");
+        };
+        let Some(keys) = session.unlock_data.as_ref() else {
+            return vault_error("unlockUnavailable");
+        };
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            runtime.block_on(auth_request::run(request_id, async {
+                keys.unlock(&session.client, &password)
+                    .map_err(|_| VaultError::WrongPassword)?;
+                session.vault.restore_overview(&session.client).await
+            }))
+        }));
+        let code = match result {
+            Ok(Ok(Ok(()))) if auth_request::is_current(request_id) => {
+                SESSION_STATE.store(SESSION_UNLOCKED, Ordering::Release);
+                return vault_success(&true);
+            }
+            Ok(Ok(Ok(()))) | Ok(Err(RequestError::Cancelled)) => "cancelled".to_owned(),
+            Ok(Err(RequestError::TimedOut)) => "timedOut".to_owned(),
+            Ok(Ok(Err(error))) => error.to_string(),
+            Err(_) => "internal".to_owned(),
+        };
+        if !session.clear_vault_keys() {
+            *guard = None;
+            SESSION_STATE.store(SESSION_SIGNED_OUT, Ordering::Release);
+            return vault_error("internal");
+        }
+        vault_error(&code)
+    }))
+    .unwrap_or_else(|_| vault_error("internal"))
+}
+
+fn vault_access_error() -> *mut c_char {
+    if bw_auth_session_state() == SESSION_LOCKED {
+        vault_error("locked")
+    } else {
+        vault_error("notAuthenticated")
+    }
 }
 
 fn vault_error(code: &str) -> *mut c_char {
@@ -753,9 +872,9 @@ pub extern "C" fn bw_vault_overview() -> *mut c_char {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(session) = guard
             .as_ref()
-            .filter(|_| AUTHENTICATED_STATE.load(Ordering::Acquire))
+            .filter(|_| bw_auth_session_state() == SESSION_UNLOCKED)
         else {
-            return vault_error("notAuthenticated");
+            return vault_access_error();
         };
         if session.vault.needs_reconciliation() {
             return vault_error("notSynced");
@@ -779,13 +898,13 @@ pub extern "C" fn bw_vault_sync(request_id: u64) -> *mut c_char {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(session) = guard
             .as_mut()
-            .filter(|_| AUTHENTICATED_STATE.load(Ordering::Acquire))
+            .filter(|_| bw_auth_session_state() == SESSION_UNLOCKED)
         else {
-            return vault_error("notAuthenticated");
+            return vault_access_error();
         };
         match runtime.block_on(auth_request::run(
             request_id,
-            VaultCache::fetch(&session.client),
+            VaultCache::fetch(&session.client, &mut session.unlock_data),
         )) {
             Ok(Ok(cache)) if auth_request::is_current(request_id) => {
                 cache.activate(&session.client);
@@ -827,9 +946,9 @@ pub unsafe extern "C" fn bw_vault_detail(
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(session) = guard
             .as_ref()
-            .filter(|_| AUTHENTICATED_STATE.load(Ordering::Acquire))
+            .filter(|_| bw_auth_session_state() == SESSION_UNLOCKED)
         else {
-            return vault_error(&VaultError::NotAuthenticated.to_string());
+            return vault_access_error();
         };
         match runtime.block_on(auth_request::run(
             request_id,
@@ -866,9 +985,9 @@ pub unsafe extern "C" fn bw_vault_editor(
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(session) = guard
             .as_ref()
-            .filter(|_| AUTHENTICATED_STATE.load(Ordering::Acquire))
+            .filter(|_| bw_auth_session_state() == SESSION_UNLOCKED)
         else {
-            return vault_error("notAuthenticated");
+            return vault_access_error();
         };
         match runtime.block_on(auth_request::run(
             request_id,
@@ -904,9 +1023,9 @@ fn perform_vault_write(command: VaultWriteCommand, request_id: u64) -> *mut c_ch
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(session) = guard
             .as_mut()
-            .filter(|_| AUTHENTICATED_STATE.load(Ordering::Acquire))
+            .filter(|_| bw_auth_session_state() == SESSION_UNLOCKED)
         else {
-            return vault_error("notAuthenticated");
+            return vault_access_error();
         };
         session.vault.reset_write_attempt();
         // Catch inside the session guard: a panic after sending a write must force reconciliation.
@@ -1155,7 +1274,10 @@ mod tests {
 
     #[test]
     fn auth_logout_clears_in_memory_session_state() {
-        super::AUTHENTICATED_STATE.store(true, std::sync::atomic::Ordering::Release);
+        super::SESSION_STATE.store(
+            super::SESSION_UNLOCKED,
+            std::sync::atomic::Ordering::Release,
+        );
         super::bw_auth_logout();
         assert_eq!(super::bw_auth_is_authenticated(), 0);
     }

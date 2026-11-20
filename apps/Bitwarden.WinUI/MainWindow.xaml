@@ -41,6 +41,7 @@
                         x:Name="SearchBox"
                         PlaceholderText="搜索保险库"
                         QueryIcon="Find"
+                        IsEnabled="False"
                         MaxWidth="420"
                         MinWidth="180"
                         TextChanged="SearchBox_TextChanged"
@@ -48,6 +49,7 @@
                         QuerySubmitted="SearchBox_QuerySubmitted" />
                     <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8">
                         <Button x:Name="SyncButton" Content="同步" IsEnabled="False" Click="Sync_Click" />
+                        <Button x:Name="LockButton" Content="锁定" Visibility="Collapsed" Click="Lock_Click" />
                         <Button x:Name="SignInButton" Content="登录" Click="SignIn_Click" />
                     </StackPanel>
                 </Grid>

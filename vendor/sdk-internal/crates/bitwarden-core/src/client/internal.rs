@@ -401,13 +401,13 @@ impl InternalClient {
     #[bitwarden_logging::instrument(err)]
     pub(crate) fn initialize_user_crypto_master_password_unlock(
         &self,
-        password: String,
+        password: impl AsRef<str>,
         master_password_unlock: MasterPasswordUnlockData,
         account_crypto_state: WrappedAccountCryptographicState,
         upgrade_token: &Option<V2UpgradeToken>,
     ) -> Result<(), EncryptionSettingsError> {
         let master_key = MasterKey::derive(
-            &password,
+            password.as_ref(),
             &master_password_unlock.salt,
             &master_password_unlock.kdf,
         )?;

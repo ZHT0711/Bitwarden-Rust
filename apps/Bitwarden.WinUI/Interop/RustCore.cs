@@ -66,8 +66,17 @@ internal static class RustCore
     [DllImport(LibraryName, EntryPoint = "bw_auth_is_authenticated", CallingConvention = CallingConvention.Cdecl)]
     private static extern byte IsAuthenticatedNative();
 
+    [DllImport(LibraryName, EntryPoint = "bw_auth_session_state", CallingConvention = CallingConvention.Cdecl)]
+    private static extern byte SessionStateNative();
+
     [DllImport(LibraryName, EntryPoint = "bw_auth_logout", CallingConvention = CallingConvention.Cdecl)]
     private static extern void LogoutNative();
+
+    [DllImport(LibraryName, EntryPoint = "bw_auth_lock", CallingConvention = CallingConvention.Cdecl)]
+    private static extern byte LockNative();
+
+    [DllImport(LibraryName, EntryPoint = "bw_auth_unlock", CallingConvention = CallingConvention.Cdecl)]
+    private static extern IntPtr UnlockNative(IntPtr password, ulong requestId);
 
     [DllImport(LibraryName, EntryPoint = "bw_vault_overview", CallingConvention = CallingConvention.Cdecl)]
     private static extern IntPtr VaultOverviewNative();
@@ -163,6 +172,7 @@ internal static class RustCore
 
     internal static string Version => Marshal.PtrToStringUTF8(GetVersionNative()) ?? "unknown";
     internal static bool IsAuthenticated => IsAuthenticatedNative() != 0;
+    internal static VaultSessionState SessionState => (VaultSessionState)SessionStateNative();
     internal static bool IsValidServer(uint serverMode, string serverUrl) => ValidateServerNative(serverMode, serverUrl) != 0;
 
     internal static AuthResult Login(
@@ -197,6 +207,13 @@ internal static class RustCore
     }
 
     internal static void Logout() => LogoutNative();
+    internal static bool Lock() => LockNative() != 0;
+
+    internal static void Unlock(string password, CancellationToken token)
+    {
+        using var buffer = new Utf8Buffer(password);
+        RunVaultRequest<bool>(requestId => UnlockNative(buffer.Pointer, requestId), token);
+    }
 
     internal static AuthStatus SendTwoFactorEmail(
         string email,
@@ -374,3 +391,10 @@ internal enum AuthStatus : uint
 }
 
 internal readonly record struct AuthResult(AuthStatus Status, uint AvailableTwoFactorMethods);
+
+internal enum VaultSessionState : byte
+{
+    SignedOut = 0,
+    Unlocked = 1,
+    Locked = 2,
+}

@@ -20,7 +20,9 @@ internal sealed class VaultException(string code) : Exception(code)
     public string UserMessage => Code switch
     {
         "notAuthenticated" => "当前没有活跃的账户会话，请先登录。",
-        "network" => "无法同步。请检查网络连接和登录状态后重试；上次成功加载的条目仍然保留。",
+        "locked" => "保险库已锁定，请先解锁。",
+        "unlockUnavailable" => "本次会话需要重新登录。请取消解锁，选择「退出登录」，然后重新连接账户。",
+        "network" => "无法同步。请检查网络连接和登录状态后重试。",
         "invalidResponse" => "服务器返回的保险库数据不完整或格式不受支持。",
         "notFound" => "未找到条目或尚未完成首次同步，请重新同步。",
         "decryptionFailed" => "无法解密保险库数据，请重新登录后重试。",

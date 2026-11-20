@@ -349,6 +349,7 @@ dependencies = [
  "bitwarden-api-api",
  "bitwarden-auth",
  "bitwarden-core 4.0.0",
+ "bitwarden-crypto",
  "bitwarden-crypto-sync-handler",
  "bitwarden-generators",
  "bitwarden-state",

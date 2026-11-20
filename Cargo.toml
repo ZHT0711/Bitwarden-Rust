@@ -20,6 +20,7 @@ bitwarden-auth = { git = "https://github.com/bitwarden/sdk-internal", rev = "56c
 bitwarden-api-api = { git = "https://github.com/bitwarden/sdk-internal", rev = "56c7617b23501af70221094cdee59e10b2a9d8d2" }
 bitwarden-vault = { git = "https://github.com/bitwarden/sdk-internal", rev = "56c7617b23501af70221094cdee59e10b2a9d8d2" }
 bitwarden-state = { git = "https://github.com/bitwarden/sdk-internal", rev = "56c7617b23501af70221094cdee59e10b2a9d8d2" }
+bitwarden-crypto = { git = "https://github.com/bitwarden/sdk-internal", rev = "56c7617b23501af70221094cdee59e10b2a9d8d2" }
 bitwarden-crypto-sync-handler = { git = "https://github.com/bitwarden/sdk-internal", rev = "56c7617b23501af70221094cdee59e10b2a9d8d2" }
 bw-sdk-core = { package = "bitwarden-core", git = "https://github.com/bitwarden/sdk-internal", rev = "56c7617b23501af70221094cdee59e10b2a9d8d2" }
 chrono = { version = "0.4", features = ["serde"] }

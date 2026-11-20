@@ -18,7 +18,7 @@ use crate::{
 pub(crate) async fn login_password(
     client: &Client,
     input: &PasswordLoginRequest,
-) -> Result<PasswordLoginResponse, LoginError> {
+) -> Result<(PasswordLoginResponse, Option<PasswordLoginUnlockData>), LoginError> {
     use bitwarden_crypto::EncString;
 
     use crate::{client::UserLoginMethod, require};
@@ -35,6 +35,7 @@ pub(crate) async fn login_password(
         .to_string();
 
     let response = request_identity_tokens(client, input, &password_hash).await?;
+    let mut unlock_data = None;
 
     if let IdentityTokenResponse::Authenticated(r) = &response {
         use crate::key_management::account_cryptographic_state::WrappedAccountCryptographicState;
@@ -62,9 +63,9 @@ pub(crate) async fn login_password(
             client
                 .internal
                 .initialize_user_crypto_master_password_unlock(
-                    input.password.clone(),
+                    &input.password,
                     master_password_unlock.clone(),
-                    user_key_state,
+                    user_key_state.clone(),
                     &None,
                 )?;
 
@@ -72,14 +73,44 @@ pub(crate) async fn login_password(
                 .internal
                 .set_login_method(LoginMethod::User(UserLoginMethod::Username {
                     client_id: "web".to_owned(),
-                    email: master_password_unlock.salt,
-                    kdf: master_password_unlock.kdf,
+                    email: master_password_unlock.salt.clone(),
+                    kdf: master_password_unlock.kdf.clone(),
                 }))
                 .await;
+            unlock_data = Some(PasswordLoginUnlockData {
+                master_password: master_password_unlock,
+                account: user_key_state,
+            });
         }
     }
 
-    Ok(PasswordLoginResponse::process_response(response))
+    Ok((PasswordLoginResponse::process_response(response), unlock_data))
+}
+
+/// Server-wrapped account keys from a successful password login, for in-process unlock.
+#[cfg(feature = "internal")]
+pub struct PasswordLoginUnlockData {
+    /// KDF parameters and master-password-wrapped user key used during login.
+    pub master_password: crate::key_management::MasterPasswordUnlockData,
+    /// The encrypted account keys used during login.
+    pub account: crate::key_management::account_cryptographic_state::WrappedAccountCryptographicState,
+}
+
+#[cfg(feature = "internal")]
+impl PasswordLoginUnlockData {
+    /// Reinitialize crypto on the same client after its key store has been cleared.
+    pub fn unlock(
+        &self,
+        client: &Client,
+        password: &str,
+    ) -> Result<(), crate::client::encryption_settings::EncryptionSettingsError> {
+        client.internal.initialize_user_crypto_master_password_unlock(
+            password,
+            self.master_password.clone(),
+            self.account.clone(),
+            &None,
+        )
+    }
 }
 
 #[cfg(feature = "internal")]

@@ -53,7 +53,17 @@ public sealed partial class HomePage : Page
         ClearSensitiveState();
         SetNotice("账户已退出", "当前没有活跃的账户会话。", InfoBarSeverity.Informational);
         ConnectButton.Visibility = Visibility.Visible;
+        ConnectButton.Content = "连接账户";
         EmptyMessage.Text = "登录以查看你的保险库";
+    }
+
+    internal void ShowLocked()
+    {
+        ClearSensitiveState();
+        SetNotice("保险库已锁定", "输入主密码以继续使用当前账户。", InfoBarSeverity.Informational);
+        ConnectButton.Visibility = Visibility.Visible;
+        ConnectButton.Content = "解锁保险库";
+        EmptyMessage.Text = "保险库已锁定";
     }
 
     public void ClearSensitiveState()
@@ -66,6 +76,11 @@ public sealed partial class HomePage : Page
         _requiresSync = false;
         _syncing = false;
         VaultList.ItemsSource = null;
+        foreach (var field in DetailPanel.Children.OfType<StackPanel>())
+        {
+            foreach (var box in field.Children.OfType<PasswordBox>()) box.Password = string.Empty;
+            foreach (var box in field.Children.OfType<TextBox>()) box.Text = string.Empty;
+        }
         DetailPanel.Children.Clear();
         DetailPanel.Children.Add(new TextBlock { Text = "选择一个条目查看详情" });
         PopulateFolders();
@@ -86,7 +101,9 @@ public sealed partial class HomePage : Page
         VaultList.SelectedItem = null;
         try
         {
-            if (!RustCore.IsAuthenticated) { ShowLoggedOut(); return; }
+            var state = RustCore.SessionState;
+            if (state == VaultSessionState.Locked) { ShowLocked(); return; }
+            if (state != VaultSessionState.Unlocked) { ShowLoggedOut(); return; }
             ConnectButton.Visibility = Visibility.Collapsed;
             SetNotice("正在加载保险库", forceSync ? "正在同步并在本机解密…" : "正在读取本次会话的保险库…", InfoBarSeverity.Informational);
             VaultOverview result;
@@ -164,13 +181,9 @@ public sealed partial class HomePage : Page
             var password = string.Empty;
             if (item.Reprompt)
             {
-                var passwordBox = new PasswordBox { Header = "主密码" };
-                var dialog = new ContentDialog { Title = "验证主密码", Content = passwordBox, PrimaryButtonText = "验证",
-                    CloseButtonText = "取消", DefaultButton = ContentDialogButton.Primary, XamlRoot = XamlRoot };
-                var answer = await dialog.ShowAsync();
-                password = passwordBox.Password;
-                passwordBox.Password = string.Empty;
-                if (answer != ContentDialogResult.Primary || !IsCurrent(version, token)) return;
+                var entered = await PromptMasterPasswordAsync();
+                if (entered is null || !IsCurrent(version, token)) return;
+                password = entered;
             }
             var detail = await Task.Run(() => RustCore.GetVaultDetail(item.Id, password, token), token);
             password = string.Empty;

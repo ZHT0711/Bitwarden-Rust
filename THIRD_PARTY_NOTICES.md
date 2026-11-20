@@ -2,7 +2,7 @@
 
 ## Bitwarden Rust SDK
 
-This application links the Bitwarden `sdk-internal` Rust crates and their transitive SDK dependencies, pinned to commit `56c7617b23501af70221094cdee59e10b2a9d8d2`. The `bitwarden-core` crate is vendored under `vendor/sdk-internal` with one local change that adds a middleware hook to its unauthenticated Identity client for new-device verification. The SDK source offers GPL-3.0 or the Bitwarden SDK License; this project uses GPL-3.0-only. Tests use the SDK's public synthetic account fixtures and associated encrypted fixture keys; these are not production account data. See [`LICENSE`](LICENSE) and the pinned upstream [license file](https://github.com/bitwarden/sdk-internal/blob/56c7617b23501af70221094cdee59e10b2a9d8d2/LICENSE_GPL.txt).
+This application links the Bitwarden `sdk-internal` Rust crates and their transitive SDK dependencies, pinned to commit `56c7617b23501af70221094cdee59e10b2a9d8d2`. The vendored `bitwarden-core` adds an Identity middleware hook for new-device verification and exposes the wrapped keys returned by password login for in-process unlock. This project uses the SDK under GPL-3.0-only. Tests use the SDK's public synthetic accounts and encrypted fixture keys. See [`LICENSE`](LICENSE) and the pinned upstream [license file](https://github.com/bitwarden/sdk-internal/blob/56c7617b23501af70221094cdee59e10b2a9d8d2/LICENSE_GPL.txt).
 
 ## EFF long passphrase word list
 

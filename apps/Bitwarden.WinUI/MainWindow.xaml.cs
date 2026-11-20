@@ -23,6 +23,8 @@ public sealed partial class MainWindow : Window
         NavFrame.Navigate(typeof(HomePage), "vault");
         Closed += (_, _) =>
         {
+            _closed = true;
+            _unlockRequest?.Cancel();
             if (NavFrame.Content is HomePage page) page.ClearSensitiveState();
             if (NavFrame.Content is GeneratorPage generator) generator.ClearSensitiveState();
             ClipboardCleaner.ClearOwned();
@@ -103,18 +105,9 @@ public sealed partial class MainWindow : Window
     {
         try
         {
-            if (RustCore.IsAuthenticated)
+            if (RustCore.SessionState != VaultSessionState.SignedOut)
             {
-                SignInButton.IsEnabled = SyncButton.IsEnabled = false;
-                if (NavFrame.Content is HomePage homePage)
-                {
-                    homePage.ShowLoggedOut();
-                }
-                if (NavFrame.Content is GeneratorPage generator) generator.ClearSensitiveState();
-                SearchBox.Text = string.Empty;
-                ClipboardCleaner.ClearOwned();
-                try { await Task.Run(RustCore.Logout); }
-                finally { SignInButton.IsEnabled = true; SignInButton.Content = "登录"; }
+                await ChangeSessionAsync(RustCore.Logout);
                 return;
             }
         }
@@ -126,13 +119,21 @@ public sealed partial class MainWindow : Window
         await ShowSignInDialogAsync();
     }
 
-    private void HomePage_SignInRequested(object? sender, EventArgs e) => _ = ShowSignInDialogAsync();
+    private async void HomePage_SignInRequested(object? sender, EventArgs e)
+    {
+        try
+        {
+            if (RustCore.SessionState == VaultSessionState.Locked) await ShowUnlockDialogAsync();
+            else await ShowSignInDialogAsync();
+        }
+        catch (Exception error) when (IsCoreUnavailable(error)) { }
+    }
 
     private bool _signInDialogOpen;
 
     private async Task ShowSignInDialogAsync()
     {
-        if (_signInDialogOpen)
+        if (_signInDialogOpen || _accountTransition)
         {
             return;
         }
@@ -145,8 +146,12 @@ public sealed partial class MainWindow : Window
         }
         finally
         {
-            SignInButton.IsEnabled = true;
             _signInDialogOpen = false;
+            if (!_closed)
+            {
+                try { UpdateSessionControls(RustCore.SessionState); }
+                catch (Exception error) when (IsCoreUnavailable(error)) { SignInButton.IsEnabled = true; }
+            }
         }
     }
 
@@ -399,8 +404,8 @@ public sealed partial class MainWindow : Window
                     authenticated = true;
                     deviceVerificationRequired = false;
                     pendingDeviceOtp = string.Empty;
-                    SignInButton.Content = "退出登录";
-                    SyncButton.IsEnabled = true;
+                    if (_closed) return;
+                    UpdateSessionControls(VaultSessionState.Unlocked);
                     if (NavFrame.Content is HomePage page) page.ShowAuthenticated();
                     return;
                 }

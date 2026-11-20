@@ -16,6 +16,7 @@ bitwarden-auth.workspace = true
 bitwarden-api-api.workspace = true
 bitwarden-vault.workspace = true
 bitwarden-state.workspace = true
+bitwarden-crypto.workspace = true
 bitwarden-crypto-sync-handler.workspace = true
 bitwarden-generators.workspace = true
 bw-sdk-core = { workspace = true, features = ["internal"] }

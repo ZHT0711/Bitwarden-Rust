@@ -19,8 +19,8 @@ use crate::{
         key_connector::{KeyConnectorResponse, make_key_connector_keys},
         login::{
             ApiKeyLoginRequest, ApiKeyLoginResponse, NewAuthRequestResponse, PasswordLoginRequest,
-            PasswordLoginResponse, PreloginError, TwoFactorEmailError, TwoFactorEmailRequest,
-            login_api_key, login_password, send_two_factor_email,
+            PasswordLoginResponse, PasswordLoginUnlockData, PreloginError, TwoFactorEmailError,
+            TwoFactorEmailRequest, login_api_key, login_password, send_two_factor_email,
         },
         password::{
             MasterPasswordPolicyOptions, password_strength, satisfies_policy, validate_password,
@@ -110,6 +110,16 @@ impl AuthClient {
         &self,
         input: &PasswordLoginRequest,
     ) -> Result<PasswordLoginResponse, LoginError> {
+        login_password(&self.client, input)
+            .await
+            .map(|(response, _)| response)
+    }
+
+    /// Log in and return the server-wrapped keys needed to unlock the same client locally.
+    pub async fn login_password_with_unlock_data(
+        &self,
+        input: &PasswordLoginRequest,
+    ) -> Result<(PasswordLoginResponse, Option<PasswordLoginUnlockData>), LoginError> {
         login_password(&self.client, input).await
     }
 

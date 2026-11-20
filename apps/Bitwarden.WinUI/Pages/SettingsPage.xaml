@@ -30,7 +30,7 @@
             <Border Padding="20" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1" CornerRadius="8">
                 <StackPanel Spacing="8">
                     <TextBlock Style="{StaticResource BodyStrongTextBlockStyle}" Text="安全" />
-                    <TextBlock Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="账户会话、自动锁定与本地加密存储尚未启用。请勿在此预览版输入真实账户凭据。" TextWrapping="Wrap" />
+                    <TextBlock Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="登录后可从窗口顶部手动锁定保险库，并使用主密码解锁。关闭应用会结束当前会话。" TextWrapping="Wrap" />
                 </StackPanel>
             </Border>
         </StackPanel>

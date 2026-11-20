@@ -27,6 +27,9 @@ internal static class NativeLifecycle
             check(invalidCode.Status == AuthStatus.InvalidNewDeviceVerificationCode, $"invalid new-device code remains distinct from invalid credentials ({invalidCode.Status})");
             var login = await Task.Run(() => RustCore.Login("test@bitwarden.com", FixturePassword, 0, string.Empty, "246810", 2, address, deviceIdentifier));
             check(login.Status == AuthStatus.Authenticated, "real DLL logs into loopback public SDK fixture");
+            check(RustCore.Lock() && RustCore.SessionState == VaultSessionState.Locked, "account can lock before its first sync");
+            RustCore.Unlock(FixturePassword, CancellationToken.None);
+            ExpectCode(() => RustCore.GetVaultOverview(), "notFound", "unlock before first sync leaves the unsynced vault empty");
             var initial = RustCore.SyncVault(CancellationToken.None);
             check(initial.Items.Length == 2, "real DLL synchronizes encrypted fixture records");
             var draft = new VaultEditorData(null, "ABI synthetic login", 1, null, false, true, null, "synthetic notes",
@@ -48,6 +51,23 @@ internal static class NativeLifecycle
             ExpectCode(() => RustCore.UpdateVaultItem(changed, FixturePassword, CancellationToken.None), "conflict", "stale editor revision cannot overwrite newer local data");
             var latest = RustCore.GetVaultEditor(id, FixturePassword, CancellationToken.None);
             check(latest.Values["password"] == "synthetic-abi-updated" && latest.CustomFields.Single().Value == "synthetic hidden value", "edit retains hidden custom fields and changed password");
+
+            await Control("fail-next-sync");
+            check(RustCore.Lock() && RustCore.SessionState == VaultSessionState.Locked && !RustCore.IsAuthenticated,
+                "lock closes native vault access while keeping the account session");
+            ExpectCode(() => RustCore.GetVaultOverview(), "locked", "locked overview is inaccessible");
+            ExpectCode(() => RustCore.GetVaultDetail(id, FixturePassword, CancellationToken.None), "locked", "item reprompt cannot bypass vault lock");
+            ExpectCode(() => RustCore.GetVaultEditor(id, FixturePassword, CancellationToken.None), "locked", "locked account cannot open an editor");
+            ExpectCode(() => RustCore.SyncVault(CancellationToken.None), "locked", "locked account cannot synchronize");
+            ExpectCode(() => RustCore.CreateVaultItem(draft, CancellationToken.None), "locked", "locked account cannot write");
+            ExpectCode(() => RustCore.Unlock("wrong synthetic password", CancellationToken.None), "wrongPassword", "incorrect password does not unlock");
+            check(RustCore.SessionState == VaultSessionState.Locked, "wrong password leaves native state locked");
+            RustCore.Unlock(FixturePassword, CancellationToken.None);
+            var reopened = RustCore.GetVaultOverview();
+            check(RustCore.SessionState == VaultSessionState.Unlocked && reopened.LastSync == initial.LastSync &&
+                reopened.Items.Single(item => item.Id == id).Name == changed.Name, "unlock restores the cached vault and confirmed edits without resyncing");
+            ExpectCode(() => RustCore.SyncVault(CancellationToken.None), "network", "offline unlock did not consume the pending sync request");
+            ExpectCode(() => RustCore.GetVaultEditor(id, string.Empty, CancellationToken.None), "passwordRequired", "unlock preserves item-level reprompt");
 
             var favored = Action("favorite", string.Empty);
             check(favored.Overview.Items.Single(item => item.Id == id).Favorite, "favorite on reprompt item requires no password");
@@ -72,6 +92,9 @@ internal static class NativeLifecycle
             ExpectCode(() => RustCore.CreateVaultItem(ambiguous, CancellationToken.None), "writeUncertain", "lost response after server commit is not reported as a safe retry");
             ExpectCode(() => RustCore.CreateVaultItem(ambiguous, CancellationToken.None), "notSynced", "ambiguous create cannot be retried before sync");
             ExpectCode(() => RustCore.GetVaultOverview(), "notSynced", "ambiguous write forces reconciliation even after navigating to a new vault page");
+            check(RustCore.Lock(), "vault can lock with an ambiguous write");
+            RustCore.Unlock(FixturePassword, CancellationToken.None);
+            ExpectCode(() => RustCore.GetVaultOverview(), "notSynced", "lock and unlock preserve write reconciliation");
             check(await Count() == before + 1, "ambiguous create committed exactly once despite retry attempt");
             var reconciled = RustCore.SyncVault(CancellationToken.None);
             check(reconciled.Items.Count(item => item.Name == ambiguous.Name) == 1, "sync discovers single committed ambiguous create");
@@ -80,6 +103,13 @@ internal static class NativeLifecycle
             check(!Action("restore", FixturePassword).Overview.Items.Single(item => item.Id == id).Deleted, "restore returns trashed item through ABI");
             Action("trash", FixturePassword);
             check(Action("delete", FixturePassword).Overview.Items.All(item => item.Id != id), "permanent delete removes server-confirmed item");
+            await Control("change-master-password-wrapper");
+            RustCore.SyncVault(CancellationToken.None);
+            check(RustCore.Lock(), "account can lock again after a complete write lifecycle");
+            ExpectCode(() => RustCore.Unlock(FixturePassword, CancellationToken.None), "unlockUnavailable", "changed server wrapper invalidates the cached unlock material");
+            RustCore.Logout();
+            check(RustCore.SessionState == VaultSessionState.SignedOut, "logout disposes a locked session");
+            ExpectCode(() => RustCore.Unlock(FixturePassword, CancellationToken.None), "unlockUnavailable", "logout discards the local unlock material");
 
             VaultMutationResult Action(string action, string password)
             {
