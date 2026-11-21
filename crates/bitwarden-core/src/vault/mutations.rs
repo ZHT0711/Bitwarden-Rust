@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 
+use bitwarden_api_api::models::FolderBulkDeleteRequestModel;
 use bitwarden_state::repository::Repository;
 use bitwarden_vault::{
     CipherCreateRequest, CipherEditRequest, CipherPartialEditRequest, CipherRepromptType,
-    CipherViewType, FieldView, LoginUriView,
+    CipherViewType, FieldView, FolderAddEditRequest, FolderId, FolderView, LoginUriView,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -59,6 +60,182 @@ pub(crate) struct VaultMutationResult {
 }
 
 impl VaultCache {
+    fn validate_folder_name(name: &str) -> Result<(), VaultError> {
+        if name.trim().is_empty() {
+            return Err(VaultError::Validation);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn create_folder(
+        &mut self,
+        client: &Client,
+        name: &str,
+    ) -> Result<VaultMutationResult, VaultError> {
+        self.write_started = false;
+        self.ensure_synced()?;
+        Self::validate_folder_name(name)?;
+        self.activate(client);
+        self.write_started = true;
+        let folder = client
+            .vault()
+            .folders()
+            .create(FolderAddEditRequest {
+                name: name.trim().to_owned(),
+            })
+            .await
+            .map_err(|error| match error {
+                bitwarden_vault::CreateFolderError::Api(error) => self.classify_api_error(error),
+                _ => self.uncertain(),
+            })?;
+        self.apply_folder_write(folder, name.trim(), None)
+    }
+
+    pub(crate) async fn rename_folder(
+        &mut self,
+        client: &Client,
+        id: &str,
+        name: &str,
+    ) -> Result<VaultMutationResult, VaultError> {
+        self.write_started = false;
+        self.ensure_synced()?;
+        Self::validate_folder_name(name)?;
+        let folder_id = id.parse::<FolderId>().map_err(|_| VaultError::NotFound)?;
+        self.activate(client);
+        self.write_started = true;
+        let folder = client
+            .vault()
+            .folders()
+            .edit(
+                folder_id,
+                FolderAddEditRequest {
+                    name: name.trim().to_owned(),
+                },
+            )
+            .await
+            .map_err(|error| match error {
+                bitwarden_vault::EditFolderError::Api(error) => self.classify_api_error(error),
+                bitwarden_vault::EditFolderError::ItemNotFound(_) => {
+                    self.write_started = false;
+                    VaultError::NotFound
+                }
+                _ => self.uncertain(),
+            })?;
+        self.apply_folder_write(folder, name.trim(), Some(folder_id))
+    }
+
+    fn apply_folder_write(
+        &mut self,
+        folder: FolderView,
+        expected_name: &str,
+        previous_id: Option<FolderId>,
+    ) -> Result<VaultMutationResult, VaultError> {
+        let id = folder.id.ok_or_else(|| self.uncertain())?;
+        if folder.name != expected_name || previous_id.is_some_and(|previous| previous != id) {
+            return Err(self.uncertain());
+        }
+        let id = id.to_string();
+        let overview = self.overview.as_mut().ok_or(VaultError::NotSynced)?;
+        let previous = overview.folders.iter().position(|folder| folder.id == id);
+        match (previous_id, previous) {
+            (Some(_), Some(index)) => overview.folders[index].name = folder.name,
+            (None, None) => overview.folders.push(VaultFolder {
+                id: id.clone(),
+                name: folder.name,
+            }),
+            _ => return Err(self.uncertain()),
+        }
+        overview
+            .folders
+            .sort_by_cached_key(|folder| folder.name.to_lowercase());
+        self.write_started = false;
+        Ok(VaultMutationResult {
+            overview: overview.clone(),
+            id: Some(id),
+        })
+    }
+
+    pub(crate) async fn delete_folders(
+        &mut self,
+        client: &Client,
+        ids: Vec<FolderId>,
+    ) -> Result<VaultMutationResult, VaultError> {
+        self.write_started = false;
+        self.ensure_synced()?;
+        let deleted: HashSet<FolderId> = ids.iter().copied().collect();
+        if ids.is_empty() || ids.len() > 500 || deleted.len() != ids.len() {
+            return Err(VaultError::Validation);
+        }
+        for id in &ids {
+            if self
+                .folders
+                .get(*id)
+                .await
+                .map_err(|_| VaultError::Internal)?
+                .is_none()
+            {
+                return Err(VaultError::NotFound);
+            }
+        }
+
+        let config = client.internal.get_api_configurations();
+        let api = config.api_client.folders_api();
+        self.write_started = true;
+        let mut use_single_delete = ids.len() == 1;
+        if !use_single_delete {
+            let request =
+                FolderBulkDeleteRequestModel::new(ids.iter().copied().map(Into::into).collect());
+            match api.delete_many(Some(request)).await {
+                Ok(()) => {}
+                // Older self-hosted servers (including Vaultwarden 1.37.5) lack this route.
+                Err(bw_sdk_core::ApiError::Response(error))
+                    if matches!(error.status.as_u16(), 404 | 405) =>
+                {
+                    use_single_delete = true;
+                }
+                Err(error) => return Err(self.classify_api_error(error)),
+            }
+        }
+        if use_single_delete {
+            for (index, id) in ids.iter().enumerate() {
+                if let Err(error) = api.delete(&id.to_string()).await {
+                    return Err(if index == 0 {
+                        self.classify_api_error(error)
+                    } else {
+                        self.uncertain()
+                    });
+                }
+            }
+        }
+
+        self.folders
+            .remove_bulk(ids)
+            .await
+            .map_err(|_| self.uncertain())?;
+        self.ciphers
+            .clear_folders(&deleted)
+            .map_err(|_| self.uncertain())?;
+        let deleted: HashSet<String> = deleted.iter().map(ToString::to_string).collect();
+        let overview = self.overview.as_mut().ok_or(VaultError::NotSynced)?;
+        overview
+            .folders
+            .retain(|folder| !deleted.contains(&folder.id));
+        for item in &mut overview.items {
+            if item
+                .folder_id
+                .as_ref()
+                .is_some_and(|id| deleted.contains(id))
+            {
+                item.folder_id = None;
+            }
+        }
+        self.write_started = false;
+        Ok(VaultMutationResult {
+            overview: overview.clone(),
+            id: None,
+        })
+    }
+
     pub(super) fn ensure_synced(&self) -> Result<(), VaultError> {
         if self.overview.is_none() || self.write_uncertain {
             Err(VaultError::NotSynced)

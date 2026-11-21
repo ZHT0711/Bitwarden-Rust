@@ -55,6 +55,7 @@ public sealed partial class MainWindow
         NavView.IsEnabled = false;
         SearchBox.Text = string.Empty;
         if (NavFrame.Content is HomePage vault) vault.ClearSensitiveState();
+        if (NavFrame.Content is FolderManagementPage folders) folders.ClearSensitiveState();
         if (NavFrame.Content is GeneratorPage generator) generator.ClearSensitiveState();
         WebsiteIcons.ClearCache();
         ClipboardCleaner.ClearOwned();
@@ -68,11 +69,16 @@ public sealed partial class MainWindow
                 NavView.IsEnabled = true;
                 var state = RustCore.SessionState;
                 UpdateSessionControls(state);
-                if (!await ApplyPendingWindowsTimeoutAsync() && NavFrame.Content is HomePage page)
+                var timeoutHandled = await ApplyPendingWindowsTimeoutAsync();
+                if (!timeoutHandled && NavFrame.Content is HomePage page)
                 {
                     if (state == VaultSessionState.Locked) page.ShowLocked();
                     else if (state == VaultSessionState.SignedOut) page.ShowLoggedOut();
                     else await page.RefreshAsync(false);
+                }
+                else if (!timeoutHandled && NavFrame.Content is FolderManagementPage folderPage)
+                {
+                    await folderPage.RefreshAsync(false);
                 }
             }
         }
@@ -156,8 +162,12 @@ public sealed partial class MainWindow
             {
                 var state = RustCore.SessionState;
                 UpdateSessionControls(state);
-                if (!await ApplyPendingWindowsTimeoutAsync() && state == VaultSessionState.Unlocked && NavFrame.Content is HomePage page)
-                    await page.RefreshAsync(false);
+                var timeoutHandled = await ApplyPendingWindowsTimeoutAsync();
+                if (!timeoutHandled && state == VaultSessionState.Unlocked)
+                {
+                    if (NavFrame.Content is HomePage page) await page.RefreshAsync(false);
+                    else if (NavFrame.Content is FolderManagementPage folderPage) await folderPage.RefreshAsync(false);
+                }
             }
         }
     }

@@ -88,6 +88,17 @@ def checked_fixture(value: object) -> dict:
         if key in ids:
             raise ValueError("The synthetic fixture has duplicate cipher ids.")
         ids.add(key)
+    folder_ids = set()
+    for folder in value["folders"]:
+        if not isinstance(folder, dict):
+            raise ValueError("Invalid synthetic folder record.")
+        try:
+            key = str(uuid.UUID(folder.get("id", "")))
+        except (ValueError, TypeError, AttributeError) as error:
+            raise ValueError("A synthetic folder has no valid id.") from error
+        if key in folder_ids:
+            raise ValueError("The synthetic fixture has duplicate folder ids.")
+        folder_ids.add(key)
     result = copy.deepcopy(value)
     result["profile"]["email"] = PUBLIC_EMAIL
     # Premium is synthetic and local only, so the archive lifecycle can be exercised.
@@ -186,8 +197,18 @@ class FixtureState:
                 self._metadata(cipher)
                 self.ciphers[cipher["id"]] = cipher
                 self._last_revision = max(self._last_revision, parse_date(cipher["revisionDate"]))
+            self.folders = {}
+            for folder in copy.deepcopy(self.sync_template["folders"]):
+                folder["id"] = str(uuid.UUID(folder["id"]))
+                folder.setdefault("object", "folder")
+                folder.setdefault("revisionDate", "2026-11-20T00:00:00.000Z")
+                self.folders[folder["id"]] = folder
+                self._last_revision = max(self._last_revision, parse_date(folder["revisionDate"]))
             self.conflict_next_write = False
             self.drop_next_create_response = False
+            self.reject_folder_batch = False
+            self.fail_second_folder_delete = False
+            self.fail_next_single_folder_delete = False
             self.fail_next_sync = False
             self.require_new_device_verification = False
             self.require_authenticator = False
@@ -217,7 +238,19 @@ class FixtureState:
     def sync(self) -> dict:
         result = copy.deepcopy(self.sync_template)
         result["ciphers"] = copy.deepcopy(list(self.ciphers.values()))
+        result["folders"] = copy.deepcopy(list(self.folders.values()))
         return result
+
+    def full_folder_write(self, payload: dict, folder_id: str | None = None) -> dict:
+        name = payload.get("name")
+        if not isinstance(name, str) or not name:
+            raise ValueError("A folder name is required.")
+        return {
+            "id": folder_id or str(uuid.uuid4()),
+            "name": name,
+            "revisionDate": self.revision(),
+            "object": "folder",
+        }
 
     def full_write(self, payload: dict, previous: dict | None = None) -> dict:
         kind = payload.get("type")
@@ -420,6 +453,8 @@ class FixtureHandler(BaseHTTPRequestHandler):
         controls = {
             "/control/conflict-next-write": "conflict_next_write",
             "/control/drop-next-write-response": "drop_next_create_response",
+            "/control/reject-folder-batch": "reject_folder_batch",
+            "/control/fail-second-folder-delete": "fail_second_folder_delete",
             "/control/fail-next-sync": "fail_next_sync",
             "/control/require-authenticator": "require_authenticator",
         }
@@ -460,6 +495,16 @@ class FixtureHandler(BaseHTTPRequestHandler):
         value = self.json_body(body)
         if value is None:
             return
+        if path == "/api/folders":
+            with state.lock:
+                try:
+                    folder = state.full_folder_write(value)
+                except (ValueError, TypeError):
+                    self.fail("Invalid synthetic folder request.")
+                    return
+                state.folders[folder["id"]] = folder
+            self.reply(folder)
+            return
         if path != "/api/ciphers":
             self.fail("Fixture route not found.", 404)
             return
@@ -489,6 +534,22 @@ class FixtureHandler(BaseHTTPRequestHandler):
             return
         value = self.json_body(body)
         if value is None:
+            return
+        folder_match = re.fullmatch(r"/api/folders/([0-9a-fA-F-]{36})", urlsplit(self.path).path)
+        if folder_match:
+            folder_id = folder_match.group(1).lower()
+            state = self.server.state
+            with state.lock:
+                if folder_id not in state.folders:
+                    self.fail("Synthetic folder not found.", 404)
+                    return
+                try:
+                    updated = state.full_folder_write(value, folder_id)
+                except (ValueError, TypeError):
+                    self.fail("Invalid synthetic folder request.")
+                    return
+                state.folders[folder_id] = updated
+            self.reply(updated)
             return
         match = re.fullmatch(r"/api/ciphers/([0-9a-fA-F-]{36})(?:/(partial|delete|restore|archive|unarchive))?", urlsplit(self.path).path)
         if not match:
@@ -551,8 +612,45 @@ class FixtureHandler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         if not self.authorized():
             return
-        match = re.fullmatch(r"/api/ciphers/([0-9a-fA-F-]{36})", urlsplit(self.path).path)
         state = self.server.state
+        path = urlsplit(self.path).path
+        folder_match = re.fullmatch(r"/api/folders/([0-9a-fA-F-]{36})", path)
+        if path == "/api/folders" or folder_match:
+            if folder_match:
+                ids = [folder_match.group(1).lower()]
+            else:
+                body = self.body()
+                value = self.json_body(body) if body is not None else None
+                if value is None:
+                    return
+                ids = value.get("ids")
+                if not isinstance(ids, list) or not 1 <= len(ids) <= 500 or not all(isinstance(key, str) for key in ids):
+                    self.fail("Invalid synthetic folder batch.")
+                    return
+            with state.lock:
+                if not folder_match and state.reject_folder_batch:
+                    state.reject_folder_batch = False
+                    self.fail("Fixture bulk route unavailable.", 405)
+                    return
+                if any(key not in state.folders for key in ids):
+                    self.fail("Synthetic folder not found.", 404)
+                    return
+                if folder_match and state.fail_next_single_folder_delete:
+                    state.fail_next_single_folder_delete = False
+                    self.fail("Synthetic folder delete failed.", 503)
+                    return
+                if folder_match and state.fail_second_folder_delete:
+                    state.fail_second_folder_delete = False
+                    state.fail_next_single_folder_delete = True
+                deleted = set(ids)
+                for folder_id in deleted:
+                    del state.folders[folder_id]
+                for cipher in state.ciphers.values():
+                    if cipher.get("folderId") in deleted:
+                        cipher["folderId"] = None
+            self.reply(None, 204)
+            return
+        match = re.fullmatch(r"/api/ciphers/([0-9a-fA-F-]{36})", path)
         with state.lock:
             if not match or match.group(1).lower() not in state.ciphers:
                 self.fail("Synthetic cipher not found.", 404)
@@ -661,6 +759,33 @@ def self_test() -> bool:
             self.assertIsNone(self.request("PUT", path + "/restore")[1]["deletedDate"])
             self.assertEqual(self.request("DELETE", path)[0], 204)
             self.assertEqual(self.request("GET", "/control/snapshot")[1]["cipherCount"], 0)
+
+        def test_folder_create_edit_delete_preserves_and_uncategorizes_ciphers(self):
+            created_name = "encrypted-folder-name"
+            status, folder = self.request("POST", "/api/folders", {"name": created_name})
+            self.assertEqual(status, 200)
+            self.assertEqual(folder["name"], created_name)
+            folder_id = folder["id"]
+            item = self.create(folderId=folder_id)
+
+            status, updated = self.request("PUT", "/api/folders/" + folder_id, {"name": "renamed-encrypted-folder"})
+            self.assertEqual(status, 200)
+            self.assertEqual(updated["name"], "renamed-encrypted-folder")
+            self.assertEqual(self.request("GET", "/api/sync")[1]["folders"], [updated])
+
+            status, _ = self.request("DELETE", "/api/folders/" + folder_id)
+            self.assertEqual(status, 204)
+            sync = self.request("GET", "/api/sync")[1]
+            self.assertEqual(sync["folders"], [])
+            retained = next(cipher for cipher in sync["ciphers"] if cipher["id"] == item["id"])
+            self.assertIsNone(retained["folderId"])
+
+        def test_unknown_folder_mutations_fail_without_changing_sync(self):
+            missing = str(uuid.uuid4())
+            self.assertEqual(self.request("PUT", "/api/folders/" + missing, {"name": "encrypted-name"})[0], 404)
+            self.assertEqual(self.request("DELETE", "/api/folders/" + missing)[0], 404)
+            self.assertEqual(self.request("POST", "/api/folders", {"name": ""})[0], 400)
+            self.assertEqual(self.request("GET", "/api/sync")[1]["folders"], [])
 
         def test_controls_and_committed_but_dropped_create_response(self):
             item = self.create()

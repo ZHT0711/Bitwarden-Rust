@@ -5,10 +5,12 @@ use std::{
     sync::Arc,
 };
 
+mod folder_repository;
 mod mutations;
 pub(crate) mod passkeys;
 mod repository;
 mod totp;
+use folder_repository::FolderRepository;
 pub(crate) use mutations::{VaultEditorData, VaultMutationResult};
 use repository::CipherRepository;
 pub(crate) use totp::{TotpCode, VaultTotp};
@@ -102,7 +104,7 @@ pub(crate) struct VaultOverview {
 #[derive(Default)]
 pub(crate) struct VaultCache {
     ciphers: Arc<CipherRepository>,
-    folders: Vec<Folder>,
+    folders: Arc<FolderRepository>,
     org_keys: Vec<(OrganizationId, UnsignedSharedKey)>,
     encrypted_user_key: Option<String>,
     overview: Option<VaultOverview>,
@@ -168,6 +170,10 @@ impl VaultCache {
             .platform()
             .state()
             .register_client_managed(self.ciphers.clone());
+        client
+            .platform()
+            .state()
+            .register_client_managed(self.folders.clone());
     }
 
     pub(crate) fn mark_write_uncertain(&mut self) {
@@ -307,10 +313,19 @@ impl VaultCache {
         .map_err(|_| VaultError::InvalidResponse)?;
         flags.insert("strict-cipher-decryption".to_owned(), true);
         client.flags().load(flags).await;
-        let folders = api_folders
+        let parsed_folders = api_folders
             .iter()
-            .filter_map(|raw| Folder::try_from(raw.clone()).ok())
+            .filter_map(|raw| {
+                Folder::try_from(raw.clone())
+                    .ok()
+                    .filter(|folder| folder.id.is_some())
+            })
             .collect::<Vec<_>>();
+        let parsed_folder_count = parsed_folders.len();
+        let folders = Arc::new(
+            FolderRepository::from_folders(parsed_folders)
+                .map_err(|_| VaultError::InvalidResponse)?,
+        );
         let organization_premium = profile
             .organizations
             .iter()
@@ -319,7 +334,7 @@ impl VaultCache {
         let mut cache = Self {
             ciphers: Arc::new(CipherRepository::from(ciphers)),
             org_keys,
-            parse_failures: failures + api_folders.len() - folders.len(),
+            parse_failures: failures + api_folders.len() - parsed_folder_count,
             folders,
             encrypted_user_key: profile.key.clone(),
             can_archive: profile.premium.unwrap_or(false) || organization_premium,
@@ -423,7 +438,12 @@ impl VaultCache {
         let mut failures = self.parse_failures;
         let mut folders = Vec::new();
         let mut ids = HashSet::new();
-        for folder in &self.folders {
+        for folder in self
+            .folders
+            .snapshot()
+            .map_err(|_| VaultError::Internal)?
+            .iter()
+        {
             #[allow(deprecated)]
             if let Ok(view) = client.vault().folders().decrypt(folder.clone()) {
                 if let Some(id) = view.id {

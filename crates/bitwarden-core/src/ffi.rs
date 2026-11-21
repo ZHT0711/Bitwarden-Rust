@@ -12,6 +12,7 @@ use bitwarden_auth::token_management::PasswordManagerTokenHandler;
 use bitwarden_generators::{
     GeneratorClient, GeneratorClientsExt, PassphraseGeneratorRequest, PasswordGeneratorRequest,
 };
+use bitwarden_vault::FolderId;
 use bw_sdk_core::{
     auth::login::{
         LoginError, PasswordLoginRequest, PasswordLoginUnlockData, TwoFactorProvider,
@@ -1094,6 +1095,12 @@ pub unsafe extern "C" fn bw_vault_editor(
 enum VaultWriteCommand {
     Create(VaultEditorData),
     Update(VaultEditorData, Zeroizing<String>),
+    CreateFolder(String),
+    RenameFolder {
+        id: String,
+        name: String,
+    },
+    DeleteFolders(Vec<FolderId>),
     Action {
         id: String,
         action: String,
@@ -1117,6 +1124,13 @@ fn perform_vault_write(command: VaultWriteCommand, request_id: u64) -> *mut c_ch
             return vault_access_error();
         };
         session.vault.reset_write_attempt();
+        #[cfg(windows)]
+        let affects_passkeys = matches!(
+            &command,
+            VaultWriteCommand::Create(..)
+                | VaultWriteCommand::Update(..)
+                | VaultWriteCommand::Action { .. }
+        );
         // Catch inside the session guard: a panic after sending a write must force reconciliation.
         let result = catch_unwind(AssertUnwindSafe(|| {
             runtime.block_on(auth_request::run(request_id, async {
@@ -1126,6 +1140,18 @@ fn perform_vault_write(command: VaultWriteCommand, request_id: u64) -> *mut c_ch
                     }
                     VaultWriteCommand::Update(data, password) => {
                         session.vault.update(&session.client, data, &password).await
+                    }
+                    VaultWriteCommand::CreateFolder(name) => {
+                        session.vault.create_folder(&session.client, &name).await
+                    }
+                    VaultWriteCommand::RenameFolder { id, name } => {
+                        session
+                            .vault
+                            .rename_folder(&session.client, &id, &name)
+                            .await
+                    }
+                    VaultWriteCommand::DeleteFolders(ids) => {
+                        session.vault.delete_folders(&session.client, ids).await
                     }
                     VaultWriteCommand::Action {
                         id,
@@ -1145,10 +1171,12 @@ fn perform_vault_write(command: VaultWriteCommand, request_id: u64) -> *mut c_ch
             // An acknowledged success is authoritative even if cancellation races its return.
             Ok(Ok(Ok(result))) => {
                 #[cfg(windows)]
-                runtime.block_on(crate::passkey_provider::sync_metadata(
-                    &session.vault,
-                    &session.client,
-                ));
+                if affects_passkeys {
+                    runtime.block_on(crate::passkey_provider::sync_metadata(
+                        &session.vault,
+                        &session.client,
+                    ));
+                }
                 vault_write_success(&result)
             }
             Ok(Ok(Err(error))) => vault_error(&error.to_string()),
@@ -1204,6 +1232,46 @@ pub unsafe extern "C" fn bw_vault_update(
             VaultWriteCommand::Update(data, Zeroizing::new(password)),
             request_id,
         )
+    }))
+    .unwrap_or_else(|_| vault_error("internal"))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn bw_folder_create(name: *const c_char, request_id: u64) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(name) = (unsafe { read_utf8(name) }) else {
+            return vault_error("validation");
+        };
+        perform_vault_write(VaultWriteCommand::CreateFolder(name), request_id)
+    }))
+    .unwrap_or_else(|_| vault_error("internal"))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn bw_folder_rename(
+    id: *const c_char,
+    name: *const c_char,
+    request_id: u64,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let (Some(id), Some(name)) = (unsafe { read_utf8(id) }, unsafe { read_utf8(name) }) else {
+            return vault_error("validation");
+        };
+        perform_vault_write(VaultWriteCommand::RenameFolder { id, name }, request_id)
+    }))
+    .unwrap_or_else(|_| vault_error("internal"))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn bw_folders_delete(ids: *const c_char, request_id: u64) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(json) = (unsafe { read_utf8(ids) }) else {
+            return vault_error("validation");
+        };
+        let Ok(ids) = serde_json::from_str(&json) else {
+            return vault_error("validation");
+        };
+        perform_vault_write(VaultWriteCommand::DeleteFolders(ids), request_id)
     }))
     .unwrap_or_else(|_| vault_error("internal"))
 }

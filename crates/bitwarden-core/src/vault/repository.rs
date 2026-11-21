@@ -1,9 +1,12 @@
 //! Shared ciphertext storage for the cache and the official SDK's mutation clients.
 //! Validation completes before any mutation, including full replacement during sync.
-use std::{collections::HashMap, sync::RwLock};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::RwLock,
+};
 
 use bitwarden_state::repository::{Repository, RepositoryError};
-use bitwarden_vault::{Cipher, CipherId};
+use bitwarden_vault::{Cipher, CipherId, FolderId};
 
 #[derive(Default)]
 pub(super) struct CipherRepository {
@@ -31,6 +34,20 @@ impl CipherRepository {
 
     pub(super) fn snapshot(&self) -> Result<HashMap<String, Cipher>, RepositoryError> {
         Ok(self.ciphers.read().map_err(|_| unavailable())?.clone())
+    }
+
+    pub(super) fn clear_folders(&self, deleted: &HashSet<FolderId>) -> Result<(), RepositoryError> {
+        for cipher in self
+            .ciphers
+            .write()
+            .map_err(|_| unavailable())?
+            .values_mut()
+        {
+            if cipher.folder_id.is_some_and(|id| deleted.contains(&id)) {
+                cipher.folder_id = None;
+            }
+        }
+        Ok(())
     }
 }
 

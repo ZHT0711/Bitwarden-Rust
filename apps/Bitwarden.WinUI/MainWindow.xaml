@@ -59,6 +59,9 @@
                 <NavigationViewItem Content="我的保险库" IsSelected="True" Tag="vault">
                     <NavigationViewItem.Icon><SymbolIcon Symbol="Home" /></NavigationViewItem.Icon>
                 </NavigationViewItem>
+                <NavigationViewItem Content="我的文件夹" Tag="folder-manager">
+                    <NavigationViewItem.Icon><SymbolIcon Symbol="Folder" /></NavigationViewItem.Icon>
+                </NavigationViewItem>
                 <NavigationViewItem Content="收藏夹" Tag="favorites">
                     <NavigationViewItem.Icon><SymbolIcon Symbol="Favorite" /></NavigationViewItem.Icon>
                 </NavigationViewItem>

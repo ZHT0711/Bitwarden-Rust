@@ -36,6 +36,7 @@ public sealed partial class MainWindow : Window
             _windowsVaultEvents?.Dispose();
             _unlockRequest?.Cancel();
             if (NavFrame.Content is HomePage page) page.ClearSensitiveState();
+            if (NavFrame.Content is FolderManagementPage folders) folders.ClearSensitiveState();
             if (NavFrame.Content is GeneratorPage generator) generator.ClearSensitiveState();
             WebsiteIcons.ClearCache();
             ClipboardCleaner.ClearOwned();
@@ -65,6 +66,10 @@ public sealed partial class MainWindow : Window
         {
             NavFrame.Navigate(typeof(GeneratorPage));
         }
+        else if (tag == "folder-manager")
+        {
+            NavFrame.Navigate(typeof(FolderManagementPage));
+        }
         else if (tag == "about")
         {
             NavFrame.Navigate(typeof(AboutPage));
@@ -81,6 +86,10 @@ public sealed partial class MainWindow : Window
         {
             page.SetSearch(args.QueryText);
         }
+        else if (NavFrame.Content is FolderManagementPage folderPage)
+        {
+            folderPage.SetSearch(args.QueryText);
+        }
         else
         {
             NavFrame.Navigate(typeof(HomePage), "vault");
@@ -94,16 +103,23 @@ public sealed partial class MainWindow : Window
     private void SearchBox_TextChanged(AutoSuggestBox sender, AutoSuggestBoxTextChangedEventArgs args)
     {
         if (NavFrame.Content is HomePage page) page.SetSearch(sender.Text);
+        else if (NavFrame.Content is FolderManagementPage folderPage) folderPage.SetSearch(sender.Text);
     }
 
     private async void Sync_Click(object sender, RoutedEventArgs e)
     {
-        if (NavFrame.Content is not HomePage) NavFrame.Navigate(typeof(HomePage), "vault");
         if (NavFrame.Content is HomePage page) await page.RefreshAsync(true);
+        else if (NavFrame.Content is FolderManagementPage folderPage) await folderPage.RefreshAsync(true);
+        else
+        {
+            NavFrame.Navigate(typeof(HomePage), "vault");
+            if (NavFrame.Content is HomePage homePage) await homePage.RefreshAsync(true);
+        }
     }
 
     private void NavFrame_Navigated(object sender, NavigationEventArgs e)
     {
+        SearchBox.PlaceholderText = e.Content is FolderManagementPage ? "搜索文件夹" : "搜索保险库";
         if (e.Content is HomePage page)
         {
             page.SignInRequested -= HomePage_SignInRequested;
@@ -114,6 +130,12 @@ public sealed partial class MainWindow : Window
         {
             settings.VaultTimeoutChanged = value => SaveVaultTimeout(settings, value);
             UpdateTimeoutControls(settings);
+        }
+        else if (e.Content is FolderManagementPage folders)
+        {
+            folders.SignInRequested -= HomePage_SignInRequested;
+            folders.SignInRequested += HomePage_SignInRequested;
+            folders.SetSearch(SearchBox.Text);
         }
     }
 
@@ -169,9 +191,13 @@ public sealed partial class MainWindow : Window
                 {
                     var state = RustCore.SessionState;
                     UpdateSessionControls(state);
-                    if (!await ApplyPendingWindowsTimeoutAsync() &&
+                    var timeoutHandled = await ApplyPendingWindowsTimeoutAsync();
+                    if (!timeoutHandled &&
                         state == VaultSessionState.Unlocked && NavFrame.Content is HomePage page)
                         page.ShowAuthenticated();
+                    else if (!timeoutHandled &&
+                        state == VaultSessionState.Unlocked && NavFrame.Content is FolderManagementPage folders)
+                        await folders.RefreshAsync(false);
                 }
                 catch (Exception error) when (IsCoreUnavailable(error)) { SignInButton.IsEnabled = true; }
             }

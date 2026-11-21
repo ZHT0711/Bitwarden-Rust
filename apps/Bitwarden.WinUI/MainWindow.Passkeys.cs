@@ -221,7 +221,10 @@ public sealed partial class MainWindow
             password.Password = string.Empty;
             if (opened && !completed) RustCore.CancelPasskey(request.Id);
         }
-        if (completed && !aborted && !_closed && !_accountTransition && NavFrame.Content is HomePage page)
-            await page.RefreshAsync(false);
+        if (completed && !aborted && !_closed && !_accountTransition)
+        {
+            if (NavFrame.Content is HomePage page) await page.RefreshAsync(false);
+            else if (NavFrame.Content is FolderManagementPage folders) await folders.RefreshAsync(false);
+        }
     }
 }

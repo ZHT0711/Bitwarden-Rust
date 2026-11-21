@@ -73,6 +73,58 @@ internal static class NativeLifecycle
             var latest = RustCore.GetVaultEditor(id, FixturePassword, CancellationToken.None);
             check(latest.Values["password"] == "synthetic-abi-updated" && latest.CustomFields.Single().Value == "synthetic hidden value", "edit retains hidden custom fields and changed password");
 
+            var createdFolder = RustCore.CreateFolder("Synthetic folder", CancellationToken.None);
+            var folderId = createdFolder.Id ?? throw new Exception("Folder create returned no id.");
+            check(createdFolder.Overview.Folders.Any(folder => folder.Id == folderId && folder.Name == "Synthetic folder"),
+                "folder creation returns server-confirmed decrypted metadata");
+            var renamedFolder = RustCore.RenameFolder(folderId, "Renamed synthetic folder", CancellationToken.None);
+            check(renamedFolder.Overview.Folders.Any(folder => folder.Id == folderId && folder.Name == "Renamed synthetic folder"),
+                "folder rename updates SDK repository and overview");
+            var assigned = RustCore.GetVaultEditor(id, FixturePassword, CancellationToken.None) with { FolderId = folderId };
+            var assignment = RustCore.UpdateVaultItem(assigned, FixturePassword, CancellationToken.None);
+            check(assignment.Overview.Items.Single(item => item.Id == id).FolderId == folderId,
+                "an item can be assigned to a newly created folder");
+            var deletedFolder = RustCore.DeleteFolders([folderId], CancellationToken.None);
+            check(!deletedFolder.Overview.Folders.Any(folder => folder.Id == folderId) &&
+                deletedFolder.Overview.Items.Single(item => item.Id == id) is { FolderId: null, Name: "ABI edited login" },
+                "folder deletion keeps its item and clears its folder assignment");
+            var reconciledFolderDelete = RustCore.SyncVault(CancellationToken.None);
+            check(!reconciledFolderDelete.Folders.Any(folder => folder.Id == folderId) &&
+                reconciledFolderDelete.Items.Single(item => item.Id == id).FolderId is null,
+                "a full server sync confirms the deleted folder and retained unassigned item");
+
+            string CreateFolderId(string name) =>
+                RustCore.CreateFolder(name, CancellationToken.None).Id ?? throw new Exception("Folder create returned no id.");
+            var a = CreateFolderId("Synthetic batch A");
+            var b = CreateFolderId("Synthetic batch B");
+            var retainedFolder = CreateFolderId("Synthetic batch retained");
+            var batchItem = RustCore.GetVaultEditor(id, FixturePassword, CancellationToken.None) with { FolderId = a };
+            RustCore.UpdateVaultItem(batchItem, FixturePassword, CancellationToken.None);
+            ExpectCode(() => RustCore.DeleteFolders([a, a], CancellationToken.None), "validation", "duplicate folder IDs are rejected before deleting");
+            var batchDelete = RustCore.DeleteFolders([a, b], CancellationToken.None);
+            check(batchDelete.Overview.Folders.All(folder => folder.Id != a && folder.Id != b) &&
+                batchDelete.Overview.Folders.Any(folder => folder.Id == retainedFolder) &&
+                batchDelete.Overview.Items.Single(item => item.Id == id).FolderId is null &&
+                RustCore.GetVaultEditor(id, FixturePassword, CancellationToken.None).FolderId is null,
+                "bulk delete clears the assigned folder in both item metadata and the encrypted cache");
+
+            var first = CreateFolderId("Synthetic fallback first");
+            var second = CreateFolderId("Synthetic fallback second");
+            await Control("reject-folder-batch");
+            await Control("fail-second-folder-delete");
+            ExpectCode(() => RustCore.DeleteFolders([first, second], CancellationToken.None), "writeUncertain",
+                "partial deletion on a server without bulk support requires reconciliation");
+            ExpectCode(() => RustCore.GetVaultOverview(), "notSynced", "partial folder delete blocks stale overview reads");
+            var reconciledFolders = RustCore.SyncVault(CancellationToken.None);
+            check(reconciledFolders.Folders.All(folder => folder.Id != first) &&
+                reconciledFolders.Folders.Any(folder => folder.Id == second),
+                "sync reconciles the individually confirmed deletion after a partial failure");
+            await Control("reject-folder-batch");
+            var fallback = RustCore.DeleteFolders([second, retainedFolder], CancellationToken.None);
+            check(fallback.Overview.Folders.All(folder => folder.Id != second && folder.Id != retainedFolder),
+                "individual fallback deletes all selected folders when the bulk route is unavailable");
+            var lastConfirmedSync = RustCore.SyncVault(CancellationToken.None).LastSync;
+
             var totpBeforeLock = RustCore.GetVaultDetail(id, FixturePassword, CancellationToken.None).TotpRequestId!.Value;
             await Control("fail-next-sync");
             check(RustCore.Lock() && RustCore.SessionState == VaultSessionState.Locked && !RustCore.IsAuthenticated,
@@ -83,12 +135,14 @@ internal static class NativeLifecycle
             ExpectCode(() => RustCore.GetVaultEditor(id, FixturePassword, CancellationToken.None), "locked", "locked account cannot open an editor");
             ExpectCode(() => RustCore.SyncVault(CancellationToken.None), "locked", "locked account cannot synchronize");
             ExpectCode(() => RustCore.CreateVaultItem(draft, CancellationToken.None), "locked", "locked account cannot write");
+            ExpectCode(() => RustCore.CreateFolder("Locked synthetic folder", CancellationToken.None), "locked",
+                "locked account cannot create folders");
             ExpectCode(() => RustCore.Unlock("wrong synthetic password", CancellationToken.None), "wrongPassword", "incorrect password does not unlock");
             check(RustCore.SessionState == VaultSessionState.Locked, "wrong password leaves native state locked");
             RustCore.Unlock(FixturePassword, CancellationToken.None);
             ExpectCode(() => RustCore.RefreshTotp(totpBeforeLock), "totpViewExpired", "unlock does not reauthorize a dismissed detail");
             var reopened = RustCore.GetVaultOverview();
-            check(RustCore.SessionState == VaultSessionState.Unlocked && reopened.LastSync == initial.LastSync &&
+            check(RustCore.SessionState == VaultSessionState.Unlocked && reopened.LastSync == lastConfirmedSync &&
                 reopened.Items.Single(item => item.Id == id).Name == changed.Name, "unlock restores the cached vault and confirmed edits without resyncing");
             ExpectCode(() => RustCore.SyncVault(CancellationToken.None), "network", "offline unlock did not consume the pending sync request");
             ExpectCode(() => RustCore.GetVaultEditor(id, string.Empty, CancellationToken.None), "passwordRequired", "unlock preserves item-level reprompt");
