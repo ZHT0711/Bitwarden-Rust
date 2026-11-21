@@ -115,7 +115,7 @@ internal static partial class RustCore
 
     internal static TotpCode RefreshTotp(ulong requestId) => ReadJson<TotpCode>(VaultTotpRefreshNative(requestId));
 
-    internal static void CloseTotp(ulong requestId) => CancelAuthRequestNative(requestId);
+    internal static void CloseVaultDetail(ulong requestId) => CancelAuthRequestNative(requestId);
 
     internal static VaultEditorData GetVaultEditor(string id, string password, CancellationToken token)
     {

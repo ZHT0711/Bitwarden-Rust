@@ -191,6 +191,7 @@ class FixtureState:
     def reset(self):
         with self.lock:
             self.sync_template = copy.deepcopy(self.initial)
+            self.attachment_blobs = self.sync_template.pop("attachmentBlobs", {})
             self.ciphers = {}
             for cipher in self.sync_template.pop("ciphers"):
                 cipher["id"] = str(uuid.UUID(cipher["id"]))
@@ -210,6 +211,9 @@ class FixtureState:
             self.fail_second_folder_delete = False
             self.fail_next_single_folder_delete = False
             self.fail_next_move_after_first = False
+            self.tamper_next_attachment = False
+            self.pause_next_attachment = False
+            self.attachment_downloads = 0
             self.fail_next_sync = False
             self.require_new_device_verification = False
             self.require_authenticator = False
@@ -368,7 +372,30 @@ class FixtureHandler(BaseHTTPRequestHandler):
             return
         if path == "/control/snapshot":
             with state.lock:
-                self.reply({"cipherCount": len(state.ciphers), "ids": sorted(state.ciphers)})
+                self.reply({"cipherCount": len(state.ciphers), "ids": sorted(state.ciphers),
+                            "attachmentDownloads": state.attachment_downloads})
+            return
+        blob_match = re.fullmatch(r"/fixture-attachments/([a-zA-Z0-9_-]+)", path)
+        if blob_match:
+            with state.lock:
+                data = state.attachment_blobs.get(blob_match.group(1))
+                if data is None or self.headers.get("Authorization") or self.headers.get("Device-Identifier"):
+                    self.fail("Invalid synthetic blob request.", 404)
+                    return
+                contents = base64.b64decode(data, validate=True)
+                state.attachment_downloads += 1
+                if state.tamper_next_attachment:
+                    state.tamper_next_attachment = False
+                    contents = contents[:-1] + bytes([contents[-1] ^ 1])
+                pause = state.pause_next_attachment
+                state.pause_next_attachment = False
+            if pause:
+                time.sleep(3)  # Allow the native cancellation test to interrupt a live request.
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(contents)))
+            self.end_headers()
+            self.wfile.write(contents)
             return
         if not self.authorized():
             return
@@ -384,6 +411,16 @@ class FixtureHandler(BaseHTTPRequestHandler):
             if match and match.group(1).lower() in state.ciphers:
                 self.reply(copy.deepcopy(state.ciphers[match.group(1).lower()]))
                 return
+            match = re.fullmatch(r"/api/ciphers/([0-9a-fA-F-]{36})/attachment/([a-zA-Z0-9_-]+)", path)
+            if match:
+                cipher_id, attachment_id = match.groups()
+                cipher = state.ciphers.get(cipher_id.lower(), {})
+                if (attachment_id in state.attachment_blobs
+                        and any(entry.get("id") == attachment_id for entry in cipher.get("attachments") or [])):
+                    host, port = self.server.server_address[:2]
+                    host = f"[{host}]" if ":" in host else host
+                    self.reply({"id": attachment_id, "url": f"http://{host}:{port}/fixture-attachments/{attachment_id}"})
+                    return
         self.fail("Fixture route or cipher not found.", 404)
 
     def do_POST(self):
@@ -457,6 +494,8 @@ class FixtureHandler(BaseHTTPRequestHandler):
             "/control/reject-folder-batch": "reject_folder_batch",
             "/control/fail-second-folder-delete": "fail_second_folder_delete",
             "/control/fail-next-move-after-first": "fail_next_move_after_first",
+            "/control/tamper-next-attachment": "tamper_next_attachment",
+            "/control/pause-next-attachment": "pause_next_attachment",
             "/control/fail-next-sync": "fail_next_sync",
             "/control/require-authenticator": "require_authenticator",
         }

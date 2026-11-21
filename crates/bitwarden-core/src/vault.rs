@@ -5,6 +5,7 @@ use std::{
     sync::Arc,
 };
 
+pub(crate) mod attachments;
 mod folder_repository;
 mod mutations;
 pub(crate) mod passkeys;
@@ -60,6 +61,14 @@ pub(crate) enum VaultError {
     PremiumRequired,
     #[error("attachmentUnavailable")]
     AttachmentUnavailable,
+    #[error("attachmentDownloadFailed")]
+    AttachmentDownloadFailed,
+    #[error("attachmentTooLarge")]
+    AttachmentTooLarge,
+    #[error("fileAccess")]
+    FileAccess,
+    #[error("cancelled")]
+    Cancelled,
     #[error("internal")]
     Internal,
     #[error("credentialExcluded")]
@@ -130,10 +139,13 @@ pub(crate) struct VaultDetail {
     name: String,
     item_type: u8,
     fields: Vec<DisplayField>,
-    revision_date: String,
+    pub(crate) revision_date: String,
     restricted: bool,
     password_hidden: bool,
     attachments: usize,
+    pub(crate) attachment_files: Vec<attachments::AttachmentSummary>,
+    attachment_failures: usize,
+    pub(crate) attachment_request_id: Option<u64>,
     pub(crate) totp: Option<VaultTotp>,
     pub(crate) totp_request_id: Option<u64>,
     passkeys: Vec<VaultPasskey>,
@@ -710,6 +722,7 @@ fn display_detail(view: CipherView) -> VaultDetail {
     if !view.view_password || view.partial {
         fields.retain(|field| !field.sensitive);
     }
+    let (attachment_files, attachment_failures) = attachments::summaries(&view);
     VaultDetail {
         name: view.name,
         item_type: view.r#type as u8,
@@ -717,7 +730,10 @@ fn display_detail(view: CipherView) -> VaultDetail {
         revision_date: view.revision_date.to_rfc3339(),
         restricted: view.partial,
         password_hidden: !view.view_password,
-        attachments: view.attachments.as_ref().map_or(0, Vec::len),
+        attachments: attachment_files.len() + attachment_failures,
+        attachment_files,
+        attachment_failures,
+        attachment_request_id: None,
         totp: None,
         totp_request_id: None,
         passkeys,
@@ -1041,12 +1057,37 @@ mod tests {
         let mut guarded = test_view();
         guarded.name = "Synthetic protected item".to_owned();
         guarded.reprompt = bitwarden_vault::CipherRepromptType::Password;
-        response
+        let mut guarded_response = response_for(&client, guarded)
+            .await
             .ciphers
-            .as_mut()
             .unwrap()
-            .extend(response_for(&client, guarded).await.ciphers.unwrap());
-        std::fs::write(output, serde_json::to_vec_pretty(&response).unwrap()).unwrap();
+            .remove(0);
+        let attachment_id = "synthetic-attachment";
+        let encrypted = client
+            .vault()
+            .attachments()
+            .encrypt_buffer(
+                Cipher::try_from(guarded_response.clone()).unwrap(),
+                bitwarden_vault::AttachmentView {
+                    id: Some(attachment_id.to_owned()),
+                    url: None,
+                    size: None,
+                    size_name: None,
+                    file_name: Some("synthetic-attachment.txt".to_owned()),
+                    key: None,
+                },
+                b"Bitwarden synthetic attachment fixture\n",
+            )
+            .unwrap();
+        guarded_response.attachments = Some(vec![serde_json::from_value(
+            serde_json::to_value(&encrypted.attachment).unwrap(),
+        )
+        .unwrap()]);
+        response.ciphers.as_mut().unwrap().push(guarded_response);
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let mut fixture = serde_json::to_value(response).unwrap();
+        fixture["attachmentBlobs"] = json!({attachment_id: STANDARD.encode(encrypted.contents)});
+        std::fs::write(output, serde_json::to_vec_pretty(&fixture).unwrap()).unwrap();
     }
 
     #[tokio::test]

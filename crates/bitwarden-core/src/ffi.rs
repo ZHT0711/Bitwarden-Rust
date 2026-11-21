@@ -1,6 +1,7 @@
 use std::{
     ffi::{c_char, CStr, CString},
     panic::{catch_unwind, AssertUnwindSafe},
+    path::Path,
     sync::{
         atomic::{AtomicU8, Ordering},
         Arc, Mutex, OnceLock, TryLockError,
@@ -66,12 +67,20 @@ struct AuthSession {
     device_login_middleware: Arc<DeviceLoginMiddleware>,
     unlock_data: Option<PasswordLoginUnlockData>,
     vault: VaultCache,
-    totp_detail: Option<(u64, String)>,
+    open_detail: Option<OpenDetail>,
+}
+
+struct OpenDetail {
+    request_id: u64,
+    item_id: String,
+    revision: String,
+    has_totp: bool,
+    has_attachments: bool,
 }
 
 impl AuthSession {
     fn clear_vault_keys(&mut self) -> bool {
-        self.totp_detail = None;
+        self.open_detail = None;
         self.vault.discard_overview();
         catch_unwind(AssertUnwindSafe(|| {
             self.client.internal.get_key_store().clear()
@@ -301,7 +310,7 @@ fn auth_client_for_server<'a>(
             device_login_middleware: middleware,
             unlock_data: None,
             vault: VaultCache::default(),
-            totp_detail: None,
+            open_detail: None,
         });
     }
 
@@ -992,14 +1001,18 @@ pub unsafe extern "C" fn bw_vault_detail(
             session.vault.detail(&session.client, &id, &password),
         )) {
             Ok(Ok(mut detail)) if auth_request::is_current(request_id) => {
-                // The request generation acts as the lifetime of the currently open item.
-                // Store only its id. Each refresh decrypts the encrypted record again.
-                session.totp_detail = if matches!(detail.totp, Some(VaultTotp::Ready { .. })) {
-                    detail.totp_request_id = Some(request_id);
-                    Some((request_id, id))
-                } else {
-                    None
-                };
+                // Reuse this authorization only for the currently open item. The cache remains encrypted.
+                let has_totp = matches!(detail.totp, Some(VaultTotp::Ready { .. }));
+                let has_attachments = !detail.attachment_files.is_empty();
+                detail.totp_request_id = has_totp.then_some(request_id);
+                detail.attachment_request_id = has_attachments.then_some(request_id);
+                session.open_detail = (has_totp || has_attachments).then(|| OpenDetail {
+                    request_id,
+                    item_id: id,
+                    revision: detail.revision_date.clone(),
+                    has_totp,
+                    has_attachments,
+                });
                 vault_success(&detail)
             }
             Ok(Ok(_)) | Err(RequestError::Cancelled) => vault_error("cancelled"),
@@ -1030,10 +1043,10 @@ pub extern "C" fn bw_vault_totp_refresh(request_id: u64) -> *mut c_char {
         else {
             return vault_access_error();
         };
-        let Some((_, id)) = session
-            .totp_detail
+        let Some(detail) = session
+            .open_detail
             .as_ref()
-            .filter(|(active, _)| *active == request_id)
+            .filter(|detail| detail.request_id == request_id && detail.has_totp)
         else {
             return vault_error("totpViewExpired");
         };
@@ -1042,12 +1055,82 @@ pub extern "C" fn bw_vault_totp_refresh(request_id: u64) -> *mut c_char {
         };
         match runtime.block_on(auth_request::run(
             request_id,
-            session.vault.refresh_totp(&session.client, id),
+            session.vault.refresh_totp(&session.client, &detail.item_id),
         )) {
             Ok(Ok(code)) if auth_request::is_current(request_id) => vault_success(&code),
             Ok(Ok(_)) | Err(RequestError::Cancelled) => vault_error("totpViewExpired"),
             Err(RequestError::TimedOut) => vault_error("timedOut"),
             Ok(Err(error)) => vault_error(&error.to_string()),
+        }
+    }))
+    .unwrap_or_else(|_| vault_error("internal"))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn bw_vault_download_attachment(
+    attachment_id: *const c_char,
+    destination: *const c_char,
+    request_id: u64,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let (Some(attachment_id), Some(destination)) =
+            (unsafe { read_utf8(attachment_id) }, unsafe {
+                read_utf8(destination)
+            })
+        else {
+            return vault_error("validation");
+        };
+        let Some(runtime) = runtime() else {
+            return vault_error("internal");
+        };
+        let guard = auth_client()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(session) = guard
+            .as_ref()
+            .filter(|_| bw_auth_session_state() == SESSION_UNLOCKED)
+        else {
+            return vault_access_error();
+        };
+        if !auth_request::is_current(request_id) {
+            return vault_error("attachmentViewExpired");
+        }
+        let Some(detail) = session
+            .open_detail
+            .as_ref()
+            .filter(|detail| detail.request_id == request_id && detail.has_attachments)
+        else {
+            return vault_error("attachmentViewExpired");
+        };
+        let destination = Path::new(&destination);
+        if !destination.is_absolute() || destination.file_name().is_none() {
+            return vault_error("fileAccess");
+        }
+        let Ok(replace_existing) = destination.try_exists() else {
+            return vault_error("fileAccess");
+        };
+        match runtime.block_on(auth_request::run_transfer(
+            request_id,
+            session.vault.decrypt_attachment(
+                &session.client,
+                &session.server.api_url,
+                &detail.item_id,
+                &detail.revision,
+                &attachment_id,
+            ),
+        )) {
+            Ok(Ok(contents)) => match crate::vault::attachments::save_download(
+                &contents,
+                destination,
+                replace_existing,
+                request_id,
+            ) {
+                Ok(()) => vault_success(&true),
+                Err(error) => vault_error(&error.to_string()),
+            },
+            Ok(Err(error)) => vault_error(&error.to_string()),
+            Err(RequestError::Cancelled) => vault_error("cancelled"),
+            Err(RequestError::TimedOut) => vault_error("timedOut"),
         }
     }))
     .unwrap_or_else(|_| vault_error("internal"))

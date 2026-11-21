@@ -24,7 +24,7 @@
 | 条目写入 | 新增、编辑、批量移动到文件夹、收藏修改、归档、软删除、还原、永久删除；修订冲突与不确定结果同步恢复 | 真实账户覆盖与生产服务兼容性 |
 | 我的文件夹 | 搜索、打开文件夹查看条目、条目计数、新建、重命名、单个与批量删除。删除保留条目并清除归属，旧服务器可逐个删除 | 嵌套导航与云端账户验收 |
 | 本地状态与锁定 | 进程内会话，手动和自动锁定共用密钥与界面清理。支持按账户配置应用闲置、系统空闲、锁屏、休眠与重启触发，超时可锁定或退出登录。主密码可在同一进程中离线解锁已同步数据 | 跨重启的加密缓存与会话恢复、系统锁屏／休眠的实机验收、PIN、Windows Hello 解锁、托盘、快捷键、开机启动与真实账户验证 |
-| 附件 / TOTP / 通行密钥 | 报告附件数量。登录条目支持手动录入验证器密钥、离线生成验证码、倒计时与复制。通行密钥显示元数据、编辑保留、明确移除。实验性 Windows 提供程序已接入 COM 注册、系统状态读取、请求确认、Windows Hello、官方 SDK 创建及断言与加密保存 | Windows Hello 与真实网站端到端验收、通行密钥替换体验、附件上传下载、TOTP 二维码录入、SSH 代理 |
+| 附件 / TOTP / 通行密钥 | 附件列表与本地解密下载。登录条目支持手动录入验证器密钥、离线生成验证码、倒计时与复制。通行密钥显示元数据、编辑保留、明确移除。实验性 Windows 提供程序已接入 COM 注册、系统状态读取、请求确认、Windows Hello、官方 SDK 创建及断言与加密保存 | Windows Hello 与真实网站端到端验收、通行密钥替换体验、附件上传和删除、云端与大型附件验收、TOTP 二维码录入、SSH 代理 |
 | Send / 导入导出 | 未实现 | 完整 Send、文本 / 文件、导入格式、加密 / 明文导出与确认 |
 | 其他桌面功能 | 关于页、基础设置占位 | 设置、语言、通知、更新、账户 / 组织策略、帮助等逐项对照 |
 | 构建发布 | 本地 x64 WinUI / Rust、未签名 MSIX；增加 Windows CI | CI 通过、干净构建、签名分发、ARM64 / x86、更新与回滚 |
@@ -57,6 +57,11 @@
 - 对照官方桌面版 [文件夹操作](https://github.com/bitwarden/clients/blob/desktop-v2026.11.0/libs/vault/src/services/my-folder-actions.service.ts) 和 [归属清理](https://github.com/bitwarden/clients/blob/desktop-v2026.11.0/libs/common/src/vault/services/folder/folder.service.ts)。新建与改名通过 SDK 加密名字，收到服务器响应后只更新文件夹元数据。删除只清除对应的归属，避免重新解密所有条目。
 - DLL 测试覆盖新建、改名、分配条目、单个与批量删除、旧服务逐个删除和部分成功后的同步恢复。另用临时本机 Vaultwarden 1.37.5 合成账户确认兼容路径，重新同步后文件夹已删除、条目仍在。WinUI 预览验证了创建、搜索、改名和删除。
 - 对照 [官方批量移动对话框](https://github.com/bitwarden/clients/blob/desktop-v2026.11.0/libs/vault/src/components/bulk-action-dialogs/bulk-move-dialog/bulk-move-dialog.component.ts) 使用 SDK 移动条目，只更新个人文件夹归属。互操作测试确认受主密码复验的条目仍保留原有密码、自定义字段和复验要求，部分移动失败后可以通过同步核对。WinUI 预览在本机 Vaultwarden 批量移动两个合成条目，重新同步后从文件夹名称直接打开并看到对应条目。
+
+## 2026-11-21 附件下载验证
+
+- 对照官方桌面版 [下载组件](https://github.com/bitwarden/clients/blob/desktop-v2026.11.0/libs/vault/src/components/download-attachment/download-attachment.component.ts)，通过 SDK 请求下载链接并解密内容。只有已打开的条目可授权下载。数据传输使用独立 HTTP 客户端，WinUI 接收文件名、大小和保存结果。
+- 真实 DLL 与合成服务器覆盖主密码复验、下载字节匹配、内容篡改、传输取消、授权过期和锁定。WinUI 通过 Windows 保存对话框从本机 Vaultwarden 1.37.5 保存了合成附件，使用包含中文的目标路径并逐字节核对内容。
 
 ## 后续顺序
 

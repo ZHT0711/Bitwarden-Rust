@@ -13,7 +13,9 @@ public sealed record VaultItem(string Id, string Name, string Subtitle, int Item
 }
 internal sealed record VaultDetail(string Name, int ItemType, DisplayField[] Fields, DateTimeOffset RevisionDate,
     bool Restricted, bool PasswordHidden, int Attachments, VaultTotp? Totp = null, ulong? TotpRequestId = null,
-    VaultPasskey[]? Passkeys = null);
+    VaultPasskey[]? Passkeys = null, VaultAttachment[]? AttachmentFiles = null,
+    int AttachmentFailures = 0, ulong? AttachmentRequestId = null);
+internal sealed record VaultAttachment(string Id, string Name, ulong? Size);
 internal sealed record DisplayField(string Label, string Value, bool Sensitive);
 internal sealed record VaultTotp(string Status, TotpCode? Value);
 internal sealed record TotpCode(string Code, uint Period, long ValidFrom, long ValidUntil);
@@ -41,6 +43,10 @@ internal sealed class VaultException(string code) : Exception(code)
         "permissionDenied" => "当前账户没有执行此操作所需的权限。",
         "premiumRequired" => "归档需要个人或组织提供的高级会员资格；取消归档仍然可用。",
         "attachmentUnavailable" => "此条目有未能解密的附件。为避免编辑时丢失附件引用，请先同步并处理附件问题。",
+        "attachmentViewExpired" => "请重新打开当前条目以下载附件。",
+        "attachmentDownloadFailed" => "无法下载附件。请同步保险库后重试。",
+        "attachmentTooLarge" => "附件超出桌面端支持的大小，或可用内存不足。",
+        "fileAccess" => "无法保存到所选位置。请检查写入权限和可用空间。",
         "conflict" => "此条目已经发生变化。草稿已保留，请先同步并核对最新版本，避免覆盖其他修改。",
         "writeUncertain" => "服务器可能已经保存了此操作，但未能确认结果。草稿已保留，请先同步核对，勿直接重复创建或提交。",
         "notSynced" => "请先成功同步保险库，再继续读取或写入条目。",

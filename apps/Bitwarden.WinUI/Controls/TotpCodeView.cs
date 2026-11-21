@@ -125,6 +125,6 @@ internal sealed class TotpCodeView : IDisposable
         _code = null;
         _value.Text = string.Empty;
         _copy.IsEnabled = false;
-        RustCore.CloseTotp(_requestId);
+        RustCore.CloseVaultDetail(_requestId);
     }
 }

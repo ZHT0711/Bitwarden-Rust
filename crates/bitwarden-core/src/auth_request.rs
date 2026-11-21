@@ -79,6 +79,16 @@ pub(crate) async fn run<F: Future>(id: u64, request: F) -> Result<F::Output, Req
         .await
 }
 
+pub(crate) async fn run_transfer<F: Future>(
+    id: u64,
+    request: F,
+) -> Result<F::Output, RequestError> {
+    CURRENT_REQUEST
+        .get_or_init(RequestGate::new)
+        .run(id, request, Duration::from_secs(60 * 60))
+        .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

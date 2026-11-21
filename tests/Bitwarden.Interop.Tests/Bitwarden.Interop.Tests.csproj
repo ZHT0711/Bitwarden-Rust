@@ -9,6 +9,7 @@
     <Compile Include="../../apps/Bitwarden.WinUI/Interop/RustCore.cs" Link="RustCore.cs" />
     <Compile Include="../../apps/Bitwarden.WinUI/Interop/RustCore.Passkeys.cs" Link="RustCore.Passkeys.cs" />
     <Compile Include="../../apps/Bitwarden.WinUI/Interop/RustCore.Folders.cs" Link="RustCore.Folders.cs" />
+    <Compile Include="../../apps/Bitwarden.WinUI/Interop/RustCore.Attachments.cs" Link="RustCore.Attachments.cs" />
     <Compile Include="../../apps/Bitwarden.WinUI/Interop/AccountSettingsScope.cs" Link="AccountSettingsScope.cs" />
     <Compile Include="../../apps/Bitwarden.WinUI/Interop/VaultTimeoutSettings.cs" Link="VaultTimeoutSettings.cs" />
     <Compile Include="../../apps/Bitwarden.WinUI/Interop/GeneratorSettings.cs" Link="GeneratorSettings.cs" />

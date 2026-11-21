@@ -41,6 +41,62 @@ internal static class NativeLifecycle
             ExpectCode(() => RustCore.GetVaultOverview(), "notFound", "unlock before first sync leaves the unsynced vault empty");
             var initial = RustCore.SyncVault(CancellationToken.None);
             check(initial.Items.Length == 2, "real DLL syncs a profile with wrapped account keys without a host state bridge");
+            var protectedItem = initial.Items.Single(item => item.Name == "Synthetic protected item");
+            ExpectCode(() => RustCore.GetVaultDetail(protectedItem.Id, "", CancellationToken.None), "passwordRequired",
+                "an attachment detail lease requires the item's master-password reprompt");
+            var protectedDetail = RustCore.GetVaultDetail(protectedItem.Id, FixturePassword, CancellationToken.None);
+            var attachment = protectedDetail.AttachmentFiles!.Single();
+            var attachmentRequest = protectedDetail.AttachmentRequestId!.Value;
+            var summary = JsonSerializer.Serialize(attachment, new JsonSerializerOptions(JsonSerializerDefaults.Web));
+            check(attachment.Name == "synthetic-attachment.txt" && attachment.Size > 0 &&
+                !summary.Contains("\"key\"", StringComparison.Ordinal) && !summary.Contains("\"url\"", StringComparison.Ordinal),
+                "attachment details expose the decrypted name and size without keys or download URLs");
+            var directory = Directory.CreateTempSubdirectory("bitwarden-attachment-test-");
+            var destination = Path.Combine(directory.FullName, "合成附件.txt");
+            const string fixtureContents = "Bitwarden synthetic attachment fixture\n";
+            try
+            {
+                File.WriteAllText(destination, "existing file");
+                RustCore.DownloadVaultAttachment(attachment.Id, destination, attachmentRequest, CancellationToken.None);
+                check(File.ReadAllText(destination) == fixtureContents, "the native attachment download saves exact authenticated plaintext");
+
+                await Control("tamper-next-attachment");
+                ExpectCode(() => RustCore.DownloadVaultAttachment(attachment.Id, destination, attachmentRequest, CancellationToken.None),
+                    "decryptionFailed", "tampered attachment bytes are rejected");
+                check(File.ReadAllText(destination) == fixtureContents && directory.GetFiles().Length == 1,
+                    "failed decryption retains the original destination and leaves no temporary file");
+
+                var downloadsBefore = (await http.GetFromJsonAsync<JsonElement>("/control/snapshot")).GetProperty("attachmentDownloads").GetInt32();
+                await Control("pause-next-attachment");
+                using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                var pending = Task.Run(() => RustCore.DownloadVaultAttachment(attachment.Id, destination, attachmentRequest, cancellation.Token));
+                var live = false;
+                var deadline = DateTime.UtcNow.AddSeconds(2);
+                do
+                {
+                    var count = (await http.GetFromJsonAsync<JsonElement>("/control/snapshot")).GetProperty("attachmentDownloads").GetInt32();
+                    if (count > downloadsBefore) { live = true; break; }
+                    await Task.Delay(20);
+                } while (DateTime.UtcNow < deadline && !pending.IsCompleted);
+                cancellation.Cancel();
+                try { await pending; throw new Exception("Cancelled download completed unexpectedly."); }
+                catch (OperationCanceledException)
+                {
+                    check(live && File.ReadAllText(destination) == fixtureContents && directory.GetFiles().Length == 1,
+                        "cancelling a live transfer retains the original destination and leaves no temporary file");
+                }
+                ExpectCode(() => RustCore.DownloadVaultAttachment(attachment.Id, destination, attachmentRequest, CancellationToken.None),
+                    "attachmentViewExpired", "an expired detail lease cannot authorize another attachment transfer");
+                check(RustCore.Lock(), "vault locks after cancelling attachment activity");
+                ExpectCode(() => RustCore.DownloadVaultAttachment(attachment.Id, destination, attachmentRequest, CancellationToken.None),
+                    "locked", "locked vault refuses attachment downloads");
+                RustCore.Unlock(FixturePassword, CancellationToken.None);
+            }
+            finally
+            {
+                File.Delete(destination);
+                directory.Delete();
+            }
             const string seed = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
             var draft = new VaultEditorData(null, "ABI synthetic login", 1, null, false, true, null, "synthetic notes",
                 new() { ["username"] = "abi-user", ["password"] = "synthetic-abi-secret", ["totp"] = $"otpauth://totp/Synthetic?secret={seed}&digits=8&period=17" },
@@ -58,7 +114,7 @@ internal static class NativeLifecycle
                 && totp.Code.Length == 8 && totp.ValidUntil - totp.ValidFrom == 17, "details contain the generated code and custom period");
             check(!JsonSerializer.Serialize(detail).Contains(seed, StringComparison.Ordinal), "detail ABI keeps the TOTP seed in Rust");
             check(RustCore.RefreshTotp(requestForTotp).Code.Length == 8, "a verified item refreshes its code without another password");
-            RustCore.CloseTotp(requestForTotp);
+            RustCore.CloseVaultDetail(requestForTotp);
             ExpectCode(() => RustCore.RefreshTotp(requestForTotp), "totpViewExpired", "closing details revokes code generation");
             ExpectCode(() => RustCore.GetVaultEditor(id, string.Empty, CancellationToken.None), "passwordRequired", "editor reprompt enforced through ABI");
             var editor = RustCore.GetVaultEditor(id, FixturePassword, CancellationToken.None);

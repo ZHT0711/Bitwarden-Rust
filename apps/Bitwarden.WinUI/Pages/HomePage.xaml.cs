@@ -204,7 +204,8 @@ public sealed partial class HomePage : Page
             var detail = await Task.Run(() => RustCore.GetVaultDetail(item.Id, password, token), token);
             password = string.Empty;
             if (IsCurrent(version, token)) ShowDetail(detail);
-            else if (detail.TotpRequestId is { } staleRequest) RustCore.CloseTotp(staleRequest);
+            else if ((detail.TotpRequestId ?? detail.AttachmentRequestId) is { } staleRequest)
+                RustCore.CloseVaultDetail(staleRequest);
         }
         catch (OperationCanceledException) { }
         catch (VaultException error)
@@ -281,13 +282,15 @@ public sealed partial class HomePage : Page
             panel.Children.Add(copy);
             DetailPanel.Children.Add(panel);
         }
-        if (detail.Attachments > 0) DetailPanel.Children.Add(new TextBlock { Text = $"{detail.Attachments} 个附件（下载功能待接入）", TextWrapping = TextWrapping.Wrap });
+        ShowAttachmentDetails(detail);
         DetailPanel.Children.Add(new TextBlock { Text = $"修改时间 {detail.RevisionDate.ToLocalTime():yyyy-MM-dd HH:mm:ss}", TextWrapping = TextWrapping.Wrap });
     }
 
     private bool IsCurrent(int version, CancellationToken token) => _loaded && version == _version && !token.IsCancellationRequested;
     private void CancelOperation()
     {
+        if (_attachmentRequestId is { } detailRequestId) RustCore.CloseVaultDetail(detailRequestId);
+        _attachmentRequestId = null;
         _totpView?.Dispose();
         _totpView = null;
         _operation?.Cancel();
