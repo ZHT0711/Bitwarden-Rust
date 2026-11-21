@@ -370,6 +370,88 @@ internal static class NativeLifecycle
         }
         finally { RustCore.Logout(); await Control("reset"); }
         check(!RustCore.IsAuthenticated, "lifecycle cleanup leaves no authenticated native session");
+        if (health.TryGetProperty("peerPort", out var peerPort))
+            await CheckAccountSwitching(new UriBuilder(uri) { Port = peerPort.GetInt32() }.Uri);
+
+        async Task CheckAccountSwitching(Uri peer)
+        {
+            using var otherServer = new HttpClient { BaseAddress = peer, Timeout = TimeSpan.FromSeconds(10) };
+            var otherHealth = await otherServer.GetFromJsonAsync<JsonElement>("/health");
+            if (!otherHealth.GetProperty("fixture").GetBoolean()) throw new Exception("Second server must be a loopback fixture.");
+            var otherAddress = peer.GetLeftPart(UriPartial.Authority);
+            var device = Guid.NewGuid().ToString("D");
+            AuthStatus LoginAt(string server, string email = "test@bitwarden.com") =>
+                RustCore.Login(email, FixturePassword, 0, "", "", 2, server, device).Status;
+            bool HasItem(string name) => RustCore.GetVaultOverview().Items.Any(item => item.Name == name);
+            void CreateNote(string note) => RustCore.CreateVaultItem(new VaultEditorData(
+                null, note, 2, null, false, false, null, "Synthetic fixture note", [], [], [], true, false, false, false, false),
+                CancellationToken.None);
+
+            try
+            {
+                check(LoginAt(address) == AuthStatus.Authenticated, "primary account logs in");
+                var first = RustCore.GetAccounts().Single();
+                RustCore.SyncVault(CancellationToken.None);
+                CreateNote("Primary account item");
+                check(LoginAt(address, " TEST@BITWARDEN.COM ") == AuthStatus.AccountAlreadySignedIn,
+                    "a duplicate account is rejected on the same server");
+                check(LoginAt(otherAddress, "unregistered@example.invalid") == AuthStatus.Failed &&
+                    RustCore.GetAccounts().Single().Id == first.Id && HasItem("Primary account item"),
+                    "a failed second login preserves the active account and cache");
+
+                check(LoginAt(otherAddress) == AuthStatus.Authenticated, "the same email on another server logs in independently");
+                var second = RustCore.GetAccounts().Single(account => account.Active);
+                check(first.Id != second.Id && second.ServerUrl == otherAddress &&
+                    RustCore.GetAccounts().Single(account => account.Id == first.Id).State == VaultSessionState.Unlocked,
+                    "switching identities retains the previous account's server and lock state");
+                RustCore.SyncVault(CancellationToken.None);
+                CreateNote("Secondary account item");
+                check(HasItem("Secondary account item") && !HasItem("Primary account item"),
+                    "secondary account uses its own authorized server and item cache");
+                RustCore.SwitchAccount(first.Id);
+                check(HasItem("Primary account item") && !HasItem("Secondary account item"),
+                    "switching back restores the first cached vault without server I/O");
+                var item = RustCore.GetVaultOverview().Items.Single(candidate => candidate.Name == "Synthetic login");
+                var detail = RustCore.GetVaultDetail(item.Id, "", CancellationToken.None);
+
+                var syncs = await FixtureCount("syncRequests");
+                await Control("pause-next-sync");
+                var slowSync = Task.Run(() => RustCore.SyncVault(CancellationToken.None));
+                var live = await WaitForTransfer("syncRequests", syncs, slowSync);
+                RustCore.SwitchAccount(second.Id);
+                try { await slowSync; throw new Exception("Expected the old account's synchronization to be cancelled."); }
+                catch (OperationCanceledException)
+                {
+                    check(live && HasItem("Secondary account item"), "switching cancels a live sync on the old server");
+                }
+                if (detail.TotpRequestId is { } request)
+                    ExpectCode(() => RustCore.RefreshTotp(request), "totpViewExpired", "switching revokes old item access");
+
+                var timedOut = RustCore.ApplyAccountTimeouts([new(first.Id, false)], interrupt: false);
+                check(timedOut.Single(account => account.Id == first.Id).State == VaultSessionState.Locked &&
+                    timedOut.Single(account => account.Active).Id == second.Id && RustCore.IsAuthenticated,
+                    "an inactive account can time out independently of the active vault");
+                RustCore.SwitchAccount(first.Id);
+                check(RustCore.SessionState == VaultSessionState.Locked, "switching to a locked account preserves its lock");
+                ExpectCode(() => RustCore.GetVaultOverview(), "locked", "a locked account cannot reveal cached metadata");
+                await Control("fail-next-sync");
+                RustCore.Unlock(FixturePassword, CancellationToken.None);
+                check(HasItem("Primary account item"), "the locked account restores its own cached data while its server is unavailable");
+                ExpectCode(() => RustCore.SyncVault(CancellationToken.None), "network", "offline unlock does not depend on a sync");
+                RustCore.Logout();
+                check(RustCore.GetAccounts().Single().Id == second.Id && HasItem("Secondary account item"),
+                    "logging out the active account selects the remaining account");
+            }
+            finally
+            {
+                RustCore.LogoutAll();
+                await Control("reset");
+                using var reset = await otherServer.PostAsync("/control/reset", null);
+                reset.EnsureSuccessStatusCode();
+            }
+            check(RustCore.GetAccounts().Length == 0 && RustCore.SessionState == VaultSessionState.SignedOut,
+                "closing the session removes all account clients");
+        }
 
         async Task Control(string command)
         {

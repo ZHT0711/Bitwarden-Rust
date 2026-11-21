@@ -31,6 +31,7 @@ internal sealed class VaultException(string code) : Exception(code)
     public string UserMessage => Code switch
     {
         "notAuthenticated" => "当前没有活跃的账户会话，请先登录。",
+        "accountNotFound" => "该账户已退出登录，请重新添加。",
         "locked" => "保险库已锁定，请先解锁。",
         "unlockUnavailable" => "本次会话需要重新登录。请取消解锁，选择「退出登录」，然后重新连接账户。",
         "network" => "无法同步。请检查网络连接和登录状态后重试。",

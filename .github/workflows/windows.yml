@@ -75,7 +75,7 @@ jobs:
             $python = (Get-Command python -ErrorAction Stop).Source
             $server = Start-Process -FilePath $python -ArgumentList @(
               '-u', 'tests/fixture_server.py', '--fixture', 'work/ci-fixture.json',
-              '--port-file', 'work/ci-port.txt'
+              '--port-file', 'work/ci-port.txt', '--peer'
             ) -WorkingDirectory $env:GITHUB_WORKSPACE -WindowStyle Hidden -PassThru `
               -RedirectStandardOutput $stdout -RedirectStandardError $stderr
             $deadline = [DateTime]::UtcNow.AddSeconds(30)
@@ -89,7 +89,8 @@ jobs:
                   $baseUrl = "http://127.0.0.1:$port"
                   try {
                     $health = Invoke-RestMethod -Uri "$baseUrl/health" -TimeoutSec 2
-                    if ($health.fixture -is [bool] -and $health.fixture) { $ready = $true; break }
+                    if ($health.fixture -is [bool] -and $health.fixture -and
+                        $health.peerPort -ge 1 -and $health.peerPort -le 65535) { $ready = $true; break }
                   } catch {
                     # Allow startup only while this same process is still live and within its deadline.
                   }

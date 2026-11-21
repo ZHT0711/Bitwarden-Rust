@@ -57,6 +57,7 @@ pub extern "C" fn bw_passkey_pending() -> *mut c_char {
                 return vault_error("busy");
             };
             let Some(session) = guard
+                .active
                 .as_ref()
                 .filter(|_| bw_auth_session_state() == SESSION_UNLOCKED)
             else {
@@ -110,6 +111,7 @@ pub extern "C" fn bw_passkey_sync_metadata() -> *mut c_char {
             return vault_success(&false);
         };
         let Some(session) = guard
+            .active
             .as_ref()
             .filter(|_| bw_auth_session_state() == SESSION_UNLOCKED)
         else {
@@ -175,7 +177,7 @@ pub unsafe extern "C" fn bw_passkey_respond(
         let result = (|| -> Result<Vec<u8>, VaultError> {
             request.verify(window, request.operation.user_name.as_deref().unwrap_or(""))?;
             let mut guard = auth_client().lock().map_err(|_| VaultError::Internal)?;
-            let session = guard.as_mut().filter(|_| bw_auth_session_state() == SESSION_UNLOCKED).ok_or(VaultError::NotAuthenticated)?;
+            let session = guard.active.as_mut().filter(|_| bw_auth_session_state() == SESSION_UNLOCKED).ok_or(VaultError::NotAuthenticated)?;
             if !request.is_current() { return Err(VaultError::NotFound); }
             if is_vault_registration(&session.server, &request.operation) { return Err(VaultError::NotFound); }
             let runtime = runtime().ok_or(VaultError::Internal)?;

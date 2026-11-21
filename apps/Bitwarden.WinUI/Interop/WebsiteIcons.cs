@@ -38,6 +38,12 @@ internal static class WebsiteIcons
             : new Uri("https://icons.bitwarden.net/");
     }
 
+    internal static void ClearServer()
+    {
+        ClearCache();
+        _endpoint = null;
+    }
+
     internal static void ClearCache()
     {
         _requests.Cancel();

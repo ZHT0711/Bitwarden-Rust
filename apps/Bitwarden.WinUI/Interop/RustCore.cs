@@ -205,9 +205,8 @@ internal static partial class RustCore
 
         var result = LoginNative(emailBuffer.Pointer, passwordBuffer.Pointer, provider, tokenBuffer.Pointer,
             serverMode, serverBuffer.Pointer, deviceIdentifierBuffer.Pointer, deviceOtpBuffer.Pointer, requestId);
-        if (cancellationToken.IsCancellationRequested)
+        if (cancellationToken.IsCancellationRequested && (result & 0xff) != (uint)AuthStatus.Authenticated)
         {
-            LogoutNative();
             return new AuthResult(AuthStatus.Cancelled, 0);
         }
         return new AuthResult((AuthStatus)(result & 0xff), result >> 8);
@@ -239,7 +238,6 @@ internal static partial class RustCore
             serverMode, serverBuffer.Pointer, requestId);
         if (cancellationToken.IsCancellationRequested)
         {
-            LogoutNative();
             return AuthStatus.Cancelled;
         }
         return status;
@@ -260,7 +258,6 @@ internal static partial class RustCore
             deviceIdentifierBuffer.Pointer, serverMode, serverBuffer.Pointer, requestId);
         if (cancellationToken.IsCancellationRequested)
         {
-            LogoutNative();
             return AuthStatus.Cancelled;
         }
         return status;
@@ -395,6 +392,8 @@ internal enum AuthStatus : uint
     Cancelled = 4,
     NewDeviceVerificationRequired = 5,
     InvalidNewDeviceVerificationCode = 6,
+    AccountAlreadySignedIn = 7,
+    AccountLimitReached = 8,
 }
 
 internal readonly record struct AuthResult(AuthStatus Status, uint AvailableTwoFactorMethods);

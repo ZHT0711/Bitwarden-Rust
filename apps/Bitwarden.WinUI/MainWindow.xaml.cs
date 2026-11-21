@@ -42,7 +42,7 @@ public sealed partial class MainWindow : Window
             if (NavFrame.Content is GeneratorPage generator) generator.ClearSensitiveState();
             WebsiteIcons.ClearCache();
             ClipboardCleaner.ClearOwned();
-            try { RustCore.Logout(); } catch (Exception error) when (IsCoreUnavailable(error)) { }
+            try { RustCore.LogoutAll(); } catch (Exception error) when (IsCoreUnavailable(error)) { }
         };
     }
 
@@ -155,20 +155,17 @@ public sealed partial class MainWindow : Window
 
     private async void SignIn_Click(object sender, RoutedEventArgs e)
     {
+        if (_closed || _accountTransition || _signInDialogOpen) return;
         try
         {
-            if (RustCore.SessionState != VaultSessionState.SignedOut)
+            if (ActiveAccount is null)
             {
-                await ChangeSessionAsync(RustCore.Logout);
+                await ShowSignInDialogAsync();
                 return;
             }
+            ShowAccountMenu();
         }
-        catch (Exception error) when (IsCoreUnavailable(error))
-        {
-            return;
-        }
-
-        await ShowSignInDialogAsync();
+        catch (Exception error) when (IsCoreUnavailable(error)) { }
     }
 
     private async void HomePage_SignInRequested(object? sender, EventArgs e)
@@ -190,11 +187,28 @@ public sealed partial class MainWindow : Window
             return;
         }
 
+        var previous = ActiveAccount;
         _signInDialogOpen = true;
-        SignInButton.IsEnabled = false;
+        UpdateSessionControls(RustCore.SessionState);
+        var changed = false;
         try
         {
-            await ShowSignInDialogCoreAsync();
+            var authenticated = await ShowSignInDialogCoreAsync();
+            if (!_closed)
+            {
+                if (!authenticated)
+                {
+                    RustCore.CancelPendingLogin();
+                    return;
+                }
+                var accounts = await Task.Run(RustCore.GetAccounts);
+                if (!_closed)
+                {
+                    changed = previous?.Id != accounts.FirstOrDefault(account => account.Active)?.Id;
+                    if (changed) ClearActiveAccountContents(cancelPasskeys: previous is not null);
+                    ApplyAccountSnapshot(accounts);
+                }
+            }
         }
         finally
         {
@@ -205,21 +219,17 @@ public sealed partial class MainWindow : Window
                 {
                     var state = RustCore.SessionState;
                     UpdateSessionControls(state);
-                    var timeoutHandled = await ApplyPendingWindowsTimeoutAsync();
-                    if (!timeoutHandled &&
-                        state == VaultSessionState.Unlocked && NavFrame.Content is HomePage page)
-                        page.ShowAuthenticated();
-                    else if (!timeoutHandled &&
-                        state == VaultSessionState.Unlocked && NavFrame.Content is FolderManagementPage folders)
-                        await folders.RefreshAsync(false);
+                    if (!await ApplyPendingWindowsTimeoutAsync() && changed)
+                        await ShowActiveVaultAsync(state, forceSync: true);
                 }
                 catch (Exception error) when (IsCoreUnavailable(error)) { SignInButton.IsEnabled = true; }
             }
         }
     }
 
-    private async Task ShowSignInDialogCoreAsync()
+    private async Task<bool> ShowSignInDialogCoreAsync()
     {
+        var added = false;
         var environment = LoginEnvironment.Load();
         var serverBox = new ComboBox
         {
@@ -456,7 +466,6 @@ public sealed partial class MainWindow : Window
                     return;
                 }
                 var provider = providerBox.SelectedItem is ComboBoxItem item && item.Tag is uint id ? id : 0;
-                DiscardPendingWindowsTimeout();
                 requestCancellation = new CancellationTokenSource();
                 var cancellationToken = requestCancellation.Token;
                 SetBusy(true);
@@ -465,12 +474,9 @@ public sealed partial class MainWindow : Window
                     needsToken ? token : string.Empty, deviceOtp, mode, url, deviceIdentifier, cancellationToken));
                 if (result.Status == AuthStatus.Authenticated)
                 {
-                    authenticated = true;
+                    added = authenticated = true;
                     deviceVerificationRequired = false;
                     pendingDeviceOtp = string.Empty;
-                    if (_closed) return;
-                    WebsiteIcons.SetServer(mode, url);
-                    UseTimeoutSettingsFor(mode, url, email);
                     return;
                 }
                 if (result.Status is AuthStatus.NewDeviceVerificationRequired or AuthStatus.InvalidNewDeviceVerificationCode)
@@ -514,6 +520,8 @@ public sealed partial class MainWindow : Window
                 {
                     AuthStatus.TimedOut => "服务器响应超时，请检查服务器地址和网络连接后重试。",
                     AuthStatus.Cancelled => "请求已取消。",
+                    AuthStatus.AccountAlreadySignedIn => "该账户已登录，请从账户菜单切换。",
+                    AuthStatus.AccountLimitReached => "最多可同时登录 5 个账户，请先退出其中一个。",
                     AuthStatus.Failed when deviceVerificationRequired && !needsToken => "新设备验证码无效或已过期。请重新输入或重新发送。",
                     _ => "登录失败。请检查账户、主密码、验证码和服务器地址后重试。",
                 };
@@ -548,6 +556,7 @@ public sealed partial class MainWindow : Window
             }
             catch (Exception error) when (IsCoreUnavailable(error)) { }
         }
+        return added;
     }
 
     private static bool IsCoreUnavailable(Exception error) =>

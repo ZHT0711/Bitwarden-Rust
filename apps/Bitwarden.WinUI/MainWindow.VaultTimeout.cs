@@ -16,27 +16,23 @@ public sealed partial class MainWindow
         Sleep = 2,
     }
 
+    private sealed class VaultActivity(VaultTimeoutSettings settings)
+    {
+        internal VaultTimeoutSettings Settings { get; set; } = settings;
+        internal long LastActivity { get; set; } = Environment.TickCount64;
+        internal uint LastWindowsInput { get; set; }
+    }
+
+    private readonly Dictionary<string, VaultActivity> _accountActivity = new();
     private WindowsVaultEvents? _windowsVaultEvents;
     private DispatcherQueueTimer? _vaultTimeoutTimer;
-    private VaultTimeoutSettings _vaultTimeout = VaultTimeoutSettings.Default;
-    private VaultSessionState _observedVaultState;
-    private string? _timeoutAccountKey;
     private PendingWindowsTimeout _pendingWindowsTimeout;
-    private uint _windowsTimeoutGeneration;
-    private long _lastVaultActivity;
-    private uint _lastWindowsInput;
 
     private void InitializeVaultTimeout()
     {
         var dispatcher = DispatcherQueue;
         _windowsVaultEvents = new(WinRT.Interop.WindowNative.GetWindowHandle(this), mode =>
-        {
-            var generation = _windowsTimeoutGeneration;
-            dispatcher.TryEnqueue(DispatcherQueuePriority.High, () =>
-            {
-                if (generation == _windowsTimeoutGeneration) OnWindowsVaultEvent(mode);
-            });
-        });
+            dispatcher.TryEnqueue(DispatcherQueuePriority.High, () => OnWindowsVaultEvent(mode)));
         _vaultTimeoutTimer = dispatcher.CreateTimer();
         _vaultTimeoutTimer.Tick += (_, _) => _ = CheckVaultTimeoutAsync();
         if (Content is UIElement root)
@@ -47,104 +43,113 @@ public sealed partial class MainWindow
         }
         Activated += (_, args) =>
         {
-            if (args.WindowActivationState == WindowActivationState.Deactivated) return;
-            _ = CheckVaultTimeoutAsync();
+            if (args.WindowActivationState != WindowActivationState.Deactivated) _ = CheckVaultTimeoutAsync();
         };
     }
 
-    private void UseTimeoutSettingsFor(uint serverMode, string address, string email)
+    private void RetainAccountTimeouts(VaultAccount[] accounts)
     {
-        AccountSettingsScope.Begin(serverMode, address, email);
-        DiscardPendingWindowsTimeout();
-        _timeoutAccountKey = VaultTimeoutSettings.AccountKey(serverMode, address, email);
-        _vaultTimeout = VaultTimeoutStore.Load(_timeoutAccountKey);
-        if (NavFrame.Content is GeneratorPage generator) generator.RefreshSettingsScope();
+        foreach (var id in _accountActivity.Keys.Where(id => accounts.All(account => account.Id != id)).ToArray())
+            _accountActivity.Remove(id);
+        foreach (var account in accounts)
+        {
+            if (!_accountActivity.TryGetValue(account.Id, out var activity))
+            {
+                activity = new(VaultTimeoutStore.Load(TimeoutKey(account)));
+                _accountActivity.Add(account.Id, activity);
+            }
+            if (account.State == VaultSessionState.Unlocked &&
+                _accounts.Any(previous => previous.Id == account.Id && previous.State == VaultSessionState.Locked))
+                RecordActivity(activity);
+        }
     }
+
+    private static string TimeoutKey(VaultAccount account) =>
+        VaultTimeoutSettings.AccountKey(account.ServerMode, account.ServerUrl, account.Email);
 
     private void RecordVaultActivity()
     {
-        _lastVaultActivity = Environment.TickCount64;
-        WindowsVaultEvents.TryGetLastInput(out _lastWindowsInput);
+        if (ActiveAccount is { State: VaultSessionState.Unlocked } account &&
+            _accountActivity.TryGetValue(account.Id, out var activity)) RecordActivity(activity);
     }
 
-    private VaultTimeoutMode EffectiveTimeoutMode => _vaultTimeout.EffectiveMode(
+    private static void RecordActivity(VaultActivity activity)
+    {
+        activity.LastActivity = Environment.TickCount64;
+        if (WindowsVaultEvents.TryGetLastInput(out var input)) activity.LastWindowsInput = input;
+    }
+
+    private VaultTimeoutMode EffectiveTimeoutMode(VaultActivity activity) => activity.Settings.EffectiveMode(
         _windowsVaultEvents?.CanMonitorLock == true, _windowsVaultEvents?.CanMonitorSleep == true);
 
-    private void UpdateVaultTimeoutMonitor(VaultSessionState state)
-    {
-        if (state != _observedVaultState && state == VaultSessionState.Unlocked) RecordVaultActivity();
-        _observedVaultState = state;
-        if (state == VaultSessionState.SignedOut)
-        {
-            AccountSettingsScope.End();
-            _timeoutAccountKey = null;
-            _vaultTimeout = VaultTimeoutSettings.Default;
-        }
-        if (NavFrame.Content is SettingsPage page) UpdateTimeoutControls(page);
+    private bool TimeoutAvailable => !_closed && !_accountTransition && !_signInDialogOpen;
 
-        _vaultTimeoutTimer?.Stop();
-        if (_closed || _accountTransition || _signInDialogOpen || _vaultTimeoutTimer is null) return;
-        var mode = EffectiveTimeoutMode;
-        if ((mode == VaultTimeoutMode.Inactivity && state == VaultSessionState.Unlocked) ||
-            (mode == VaultTimeoutMode.SystemIdle && CanApplyAutomaticTimeout(state)))
+    private void UpdateVaultTimeoutMonitor()
+    {
+        if (NavFrame.Content is SettingsPage page) UpdateTimeoutControls(page);
+        if (_vaultTimeoutTimer is null) return;
+        _vaultTimeoutTimer.Stop();
+        if (!TimeoutAvailable) return;
+        var modes = _accounts.Select(account => (account.State, Activity: _accountActivity[account.Id]))
+            .Where(entry => entry.Activity.Settings.CanApply(entry.State))
+            .Select(entry => EffectiveTimeoutMode(entry.Activity)).ToArray();
+        if (modes.Contains(VaultTimeoutMode.Inactivity) || modes.Contains(VaultTimeoutMode.SystemIdle))
         {
-            _vaultTimeoutTimer.Interval = mode == VaultTimeoutMode.SystemIdle
-                ? TimeSpan.FromSeconds(30) : TimeSpan.FromSeconds(10);
+            _vaultTimeoutTimer.Interval = TimeSpan.FromSeconds(modes.Contains(VaultTimeoutMode.Inactivity) ? 10 : 30);
             _vaultTimeoutTimer.Start();
         }
     }
 
-    private void UpdateTimeoutControls(SettingsPage page) =>
-        page.ShowVaultTimeout(_vaultTimeout, _observedVaultState == VaultSessionState.Unlocked &&
-            !_accountTransition && !_signInDialogOpen, _windowsVaultEvents?.CanMonitorLock == true,
-            _windowsVaultEvents?.CanMonitorSleep == true);
+    private void UpdateTimeoutControls(SettingsPage page)
+    {
+        var account = ActiveAccount;
+        var settings = account is null ? VaultTimeoutSettings.Default : _accountActivity[account.Id].Settings;
+        page.ShowVaultTimeout(settings, account?.State == VaultSessionState.Unlocked && TimeoutAvailable,
+            _windowsVaultEvents?.CanMonitorLock == true, _windowsVaultEvents?.CanMonitorSleep == true);
+    }
 
     private void SaveVaultTimeout(SettingsPage page, VaultTimeoutSettings settings)
     {
-        if (_timeoutAccountKey is null || _observedVaultState != VaultSessionState.Unlocked || _accountTransition || !settings.IsValid)
+        if (ActiveAccount is not { State: VaultSessionState.Unlocked } account || !TimeoutAvailable || !settings.IsValid)
             return;
-        var saved = VaultTimeoutStore.TrySave(_timeoutAccountKey, settings);
-        _vaultTimeout = settings;
+        var saved = VaultTimeoutStore.TrySave(TimeoutKey(account), settings);
+        _accountActivity[account.Id].Settings = settings;
         RecordVaultActivity();
-        UpdateVaultTimeoutMonitor(_observedVaultState);
+        UpdateVaultTimeoutMonitor();
         if (!saved) page.ReportTimeoutSaveFailure();
         else page.ReportTimeoutSaved();
     }
 
     private async Task CheckVaultTimeoutAsync()
     {
-        if (_closed || _accountTransition || _signInDialogOpen || !CanApplyAutomaticTimeout(_observedVaultState)) return;
-
+        if (!TimeoutAvailable || await ApplyPendingWindowsTimeoutAsync() || !TimeoutAvailable) return;
         var foreground = _windowsVaultEvents?.IsForeground() == true;
         var now = Environment.TickCount64;
-        long? idle = null;
-        if (WindowsVaultEvents.TryGetLastInput(out var input)) idle = WindowsVaultEvents.MillisecondsSinceInput(input);
-        if (EffectiveTimeoutMode == VaultTimeoutMode.Inactivity)
+        var hasInput = WindowsVaultEvents.TryGetLastInput(out var input);
+        long? idle = hasInput ? WindowsVaultEvents.MillisecondsSinceInput(input) : null;
+        var targets = new List<VaultAccountTimeout>();
+        foreach (var account in _accounts)
         {
-            var duration = (long)_vaultTimeout.Minutes * 60 * 1000;
-            // A modal dialog can receive input outside the primary XAML visual tree.
-            if (foreground && idle.HasValue && input != _lastWindowsInput)
+            var activity = _accountActivity[account.Id];
+            var mode = EffectiveTimeoutMode(activity);
+            var accountForeground = account.Active && foreground;
+            if (mode == VaultTimeoutMode.Inactivity && accountForeground && idle.HasValue && input != activity.LastWindowsInput)
             {
-                _lastWindowsInput = input;
-                var observed = now - WindowsVaultEvents.MillisecondsSinceInput(input);
-                if (observed > _lastVaultActivity && observed - _lastVaultActivity < duration)
-                    _lastVaultActivity = observed;
+                activity.LastWindowsInput = input;
+                var observed = now - idle.Value;
+                var duration = (long)activity.Settings.Minutes * 60 * 1000;
+                if (observed > activity.LastActivity && observed - activity.LastActivity < duration)
+                    activity.LastActivity = observed;
             }
+            if (activity.Settings.IsExpired(mode, account.State, accountForeground, now - activity.LastActivity, idle))
+                targets.Add(new(account.Id, activity.Settings.Action == VaultTimeoutAction.LogOut));
         }
-        if (!_vaultTimeout.IsExpired(EffectiveTimeoutMode, _observedVaultState, foreground, now - _lastVaultActivity, idle)) return;
-
-        await ApplyAutomaticTimeoutAsync();
-    }
-
-    private void DiscardPendingWindowsTimeout()
-    {
-        _pendingWindowsTimeout = PendingWindowsTimeout.None;
-        _windowsTimeoutGeneration++;
+        await ApplyAccountTimeoutsAsync(targets.ToArray(), systemEvent: false);
     }
 
     private void OnWindowsVaultEvent(VaultTimeoutMode mode)
     {
-        if (_closed || _timeoutAccountKey is null) return;
+        if (_closed || (_accounts.Length == 0 && !_signInDialogOpen)) return;
         _pendingWindowsTimeout |= mode == VaultTimeoutMode.SystemLock
             ? PendingWindowsTimeout.Lock : PendingWindowsTimeout.Sleep;
         _ = ApplyPendingWindowsTimeoutAsync();
@@ -152,30 +157,36 @@ public sealed partial class MainWindow
 
     private async Task<bool> ApplyPendingWindowsTimeoutAsync()
     {
-        if (_closed || _accountTransition || _signInDialogOpen || _pendingWindowsTimeout == PendingWindowsTimeout.None)
-            return false;
+        if (!TimeoutAvailable || _pendingWindowsTimeout == PendingWindowsTimeout.None) return false;
         var pending = _pendingWindowsTimeout;
         _pendingWindowsTimeout = PendingWindowsTimeout.None;
-        var expected = EffectiveTimeoutMode switch
+        var targets = new List<VaultAccountTimeout>();
+        foreach (var account in _accounts)
         {
-            VaultTimeoutMode.SystemLock => PendingWindowsTimeout.Lock,
-            VaultTimeoutMode.SystemSleep => PendingWindowsTimeout.Sleep,
-            _ => PendingWindowsTimeout.None,
-        };
-        if ((pending & expected) == PendingWindowsTimeout.None || !CanApplyAutomaticTimeout(_observedVaultState))
-            return false;
-        await ApplyAutomaticTimeoutAsync();
-        return true;
+            var activity = _accountActivity[account.Id];
+            var expected = EffectiveTimeoutMode(activity) switch
+            {
+                VaultTimeoutMode.SystemLock => PendingWindowsTimeout.Lock,
+                VaultTimeoutMode.SystemSleep => PendingWindowsTimeout.Sleep,
+                _ => PendingWindowsTimeout.None,
+            };
+            if ((pending & expected) != 0 && activity.Settings.CanApply(account.State))
+                targets.Add(new(account.Id, activity.Settings.Action == VaultTimeoutAction.LogOut));
+        }
+        return await ApplyAccountTimeoutsAsync(targets.ToArray(), systemEvent: true);
     }
 
-    private bool CanApplyAutomaticTimeout(VaultSessionState state) => _vaultTimeout.CanApply(state);
-
-    private async Task ApplyAutomaticTimeoutAsync()
+    private async Task<bool> ApplyAccountTimeoutsAsync(VaultAccountTimeout[] actions, bool systemEvent)
     {
+        if (actions.Length == 0) return false;
+        var activeId = ActiveAccount?.Id;
+        var affectsActive = actions.Any(action => action.Id == activeId);
         try
         {
-            await ChangeSessionAsync(_vaultTimeout.Action == VaultTimeoutAction.LogOut ? RustCore.Logout : LockVault);
+            await ChangeAccountsAsync(() => RustCore.ApplyAccountTimeouts(actions, affectsActive || systemEvent), affectsActive);
+            return affectsActive;
         }
-        catch (Exception error) when (IsCoreUnavailable(error)) { }
+        catch (VaultException error) when (error.Code == "busy") { return false; }
+        catch (Exception error) when (IsCoreUnavailable(error)) { return false; }
     }
 }

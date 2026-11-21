@@ -5,7 +5,7 @@ account. This server relays that ciphertext without decrypting it, simulates
 write outcomes, and never proxies requests or logs request bodies/tokens.
 
 Run --self-test for the stdlib-only HTTP/state tests. For actual DLL/UI tests:
-  python tests/fixture_server.py --fixture work/synthetic-sync.json --port 0
+  python tests/fixture_server.py --fixture work/synthetic-sync.json --port 0 --peer
 The first stdout line is JSON containing the selected loopback port.
 """
 
@@ -170,7 +170,7 @@ class FixtureState:
         self._last_revision = dt.datetime(1970, 1, 1, tzinfo=UTC)
         self.token = _encode({"alg": "fixture-only"}) + "." + _encode({
             "exp": int(time.time()) + 3600, "sub": PUBLIC_USER_ID,
-            "email": PUBLIC_EMAIL, "scope": ["api", "offline_access"],
+            "email": PUBLIC_EMAIL, "scope": ["api", "offline_access"], "jti": str(uuid.uuid4()),
             "premium": True,
         }) + ".fixture"
         self.identity = {
@@ -223,6 +223,8 @@ class FixtureState:
             self.attachment_downloads = 0
             self.attachment_uploads = 0
             self.fail_next_sync = False
+            self.pause_next_sync = False
+            self.sync_requests = 0
             self.require_new_device_verification = False
             self.require_authenticator = False
             self.challenged_device_identifier = None
@@ -304,6 +306,7 @@ class FixtureState:
 class FixtureServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    peer_port = None
 
     def __init__(self, address: tuple[str, int], state: FixtureState):
         checked_bind(address[0])
@@ -368,7 +371,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         state = self.server.state
         if path == "/health":
-            self.reply({"fixture": True})
+            self.reply({"fixture": True, **({"peerPort": self.server.peer_port} if self.server.peer_port else {})})
             return
         if path == "/icons/example.com/icon.png":
             icon = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAIAAABvFaqvAAAAKklEQVR4nGMwD2ukCmIYNYh8g170OkIQHpFRg0YNGjVoOBpEKho1iDACAE0Rlr98kVxNAAAAAElFTkSuQmCC")
@@ -382,7 +385,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
             with state.lock:
                 self.reply({"cipherCount": len(state.ciphers), "ids": sorted(state.ciphers),
                             "attachmentDownloads": state.attachment_downloads,
-                            "attachmentUploads": state.attachment_uploads})
+                            "attachmentUploads": state.attachment_uploads, "syncRequests": state.sync_requests})
             return
         blob_match = re.fullmatch(r"/fixture-attachments/([a-zA-Z0-9_-]+)", path)
         if blob_match:
@@ -408,14 +411,21 @@ class FixtureHandler(BaseHTTPRequestHandler):
             return
         if not self.authorized():
             return
-        with state.lock:
-            if path == "/api/sync":
+        if path == "/api/sync":
+            with state.lock:
+                state.sync_requests += 1
                 if state.fail_next_sync:
                     state.fail_next_sync = False
                     self.fail("Synthetic sync failure.", 503)
-                else:
-                    self.reply(state.sync())
-                return
+                    return
+                pause = state.pause_next_sync
+                state.pause_next_sync = False
+                response = state.sync()
+            if pause:
+                time.sleep(3)
+            self.reply(response)
+            return
+        with state.lock:
             match = re.fullmatch(r"/api/ciphers/([0-9a-fA-F-]{36})", path)
             if match and match.group(1).lower() in state.ciphers:
                 self.reply(copy.deepcopy(state.ciphers[match.group(1).lower()]))
@@ -510,6 +520,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
             "/control/fail-next-attachment-delete": "fail_next_attachment_delete",
             "/control/azure-next-attachment-upload": "use_azure_attachment_upload",
             "/control/fail-next-sync": "fail_next_sync",
+            "/control/pause-next-sync": "pause_next_sync",
             "/control/require-authenticator": "require_authenticator",
         }
         if path in controls:
@@ -1022,6 +1033,7 @@ def main() -> int:
     parser.add_argument("--bind", default="127.0.0.1", help="Literal loopback address only")
     parser.add_argument("--sdk-checkout", help="Pinned sdk-internal checkout root")
     parser.add_argument("--port-file", help="Write the selected port as a decimal number to this file")
+    parser.add_argument("--peer", action="store_true", help="Start a second independent loopback fixture for account switching")
     parser.add_argument("--self-test", action="store_true", help="Run the isolated stdlib HTTP/state tests")
     args = parser.parse_args()
     if args.self_test:
@@ -1033,26 +1045,34 @@ def main() -> int:
             raise ValueError("The port must be between 0 and 65535.")
         host = checked_bind(args.bind)
         fixture = checked_fixture(json.loads(Path(args.fixture).read_text(encoding="utf-8-sig")))
-        state = FixtureState(fixture, load_public_private_key(args.sdk_checkout))
+        private_key = load_public_private_key(args.sdk_checkout)
+        state = FixtureState(fixture, private_key)
         server = make_server(host, args.port, state)
+        peer = make_server(host, 0, FixtureState(fixture, private_key)) if args.peer else None
     except (OSError, ValueError, json.JSONDecodeError) as error:
         parser.error(str(error))
-    if args.port_file:
-        port_file = Path(args.port_file)
-        port_file.parent.mkdir(parents=True, exist_ok=True)
-        pending = port_file.with_name(f".{port_file.name}.{uuid.uuid4().hex}.tmp")
-        try:
-            pending.write_text(str(server.server_port) + "\n", encoding="ascii")
-            pending.replace(port_file)
-        finally:
-            pending.unlink(missing_ok=True)
-    print(json.dumps({"fixture": True, "host": host, "port": server.server_port}, separators=(",", ":")), flush=True)
+    if peer:
+        server.peer_port = peer.server_port
+        threading.Thread(target=peer.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True).start()
     try:
+        if args.port_file:
+            port_file = Path(args.port_file)
+            port_file.parent.mkdir(parents=True, exist_ok=True)
+            pending = port_file.with_name(f".{port_file.name}.{uuid.uuid4().hex}.tmp")
+            try:
+                pending.write_text(str(server.server_port) + "\n", encoding="ascii")
+                pending.replace(port_file)
+            finally:
+                pending.unlink(missing_ok=True)
+        print(json.dumps({"fixture": True, "host": host, "port": server.server_port}, separators=(",", ":")), flush=True)
         server.serve_forever(poll_interval=0.1)
     except KeyboardInterrupt:
         pass
     finally:
         server.server_close()
+        if peer:
+            peer.shutdown()
+            peer.server_close()
     return 0
 
 

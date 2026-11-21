@@ -2,6 +2,7 @@ using Bitwarden_WinUI.Interop;
 using Bitwarden_WinUI.Pages;
 using Bitwarden_WinUI.Controls;
 using Microsoft.UI.Xaml;
+using Microsoft.UI.Xaml.Automation;
 using Microsoft.UI.Xaml.Controls;
 
 namespace Bitwarden_WinUI;
@@ -11,17 +12,47 @@ public sealed partial class MainWindow
     private bool _accountTransition;
     private bool _closed;
     private CancellationTokenSource? _unlockRequest;
+    private VaultAccount[] _accounts = [];
+    private VaultAccount? ActiveAccount => _accounts.FirstOrDefault(account => account.Active);
+
+    private void ApplyAccountSnapshot(VaultAccount[] accounts)
+    {
+        var previous = ActiveAccount;
+        var removed = _accounts.Where(old => accounts.All(current => current.Id != old.Id)).ToArray();
+        RetainAccountTimeouts(accounts);
+        _accounts = accounts;
+        var active = ActiveAccount;
+        AccountSettingsScope.Use(active?.Scope);
+        foreach (var account in removed) AccountSettingsScope.NotifySignedOut(account.Scope);
+        if (previous?.Id == active?.Id) return;
+        if (active is null) WebsiteIcons.ClearServer();
+        else WebsiteIcons.SetServer(active.ServerMode, active.ServerUrl);
+        if (NavFrame.Content is GeneratorPage generator) generator.RefreshSettingsScope();
+        RecordVaultActivity();
+    }
 
     private void UpdateSessionControls(VaultSessionState state)
     {
         var unlocked = state == VaultSessionState.Unlocked;
         var signedIn = state != VaultSessionState.SignedOut;
-        SearchBox.IsEnabled = SyncButton.IsEnabled = unlocked && !_accountTransition;
+        SearchBox.IsEnabled = SyncButton.IsEnabled = unlocked && !_accountTransition && !_signInDialogOpen;
         LockButton.IsEnabled = SignInButton.IsEnabled = !_accountTransition && !_signInDialogOpen;
         LockButton.Visibility = signedIn ? Visibility.Visible : Visibility.Collapsed;
         LockButton.Content = unlocked ? "锁定" : "解锁";
-        SignInButton.Content = signedIn ? "退出登录" : "登录";
-        UpdateVaultTimeoutMonitor(state);
+        var account = ActiveAccount;
+        SignInButton.Content = account is null ? "登录" : new StackPanel
+        {
+            Children =
+            {
+                new TextBlock { Text = account.Email, MaxWidth = 152, TextTrimming = TextTrimming.CharacterEllipsis },
+                new TextBlock { Text = account.ServerLabel, MaxWidth = 152, TextTrimming = TextTrimming.CharacterEllipsis,
+                    Style = (Style)Application.Current.Resources["CaptionTextBlockStyle"] },
+            },
+        };
+        AutomationProperties.SetName(SignInButton, account is null
+            ? "登录" : $"账户 {account.Email} · {account.ServerLabel}");
+        ToolTipService.SetToolTip(SignInButton, account is null ? null : $"{account.Email}\n{account.ServerLabel}");
+        UpdateVaultTimeoutMonitor();
     }
 
     private async void Lock_Click(object sender, RoutedEventArgs e)
@@ -34,33 +65,42 @@ public sealed partial class MainWindow
             }
             else if (RustCore.SessionState == VaultSessionState.Unlocked)
             {
-                await ChangeSessionAsync(LockVault);
+                await ChangeAccountsAsync(() => { RustCore.Lock(); return RustCore.GetAccounts(); });
             }
         }
         catch (Exception error) when (IsCoreUnavailable(error)) { }
     }
 
-    private static void LockVault()
+    private void ClearActiveAccountContents(bool cancelPasskeys)
     {
-        if (!RustCore.Lock()) RustCore.Logout();
-    }
-
-    private async Task ChangeSessionAsync(Action change)
-    {
-        if (_accountTransition || _signInDialogOpen) return;
-        _accountTransition = true;
-        DiscardPendingWindowsTimeout();
-        UpdateSessionControls(RustCore.SessionState);
-        ClearPasskeySensitiveState();
-        NavView.IsEnabled = false;
+        if (cancelPasskeys) ClearPasskeySensitiveState();
         SearchBox.Text = string.Empty;
+        _folderToOpen = null;
+        NavFrame.BackStack.Clear();
+        NavFrame.ForwardStack.Clear();
         if (NavFrame.Content is HomePage vault) vault.ClearSensitiveState();
         if (NavFrame.Content is FolderManagementPage folders) folders.ClearSensitiveState();
         if (NavFrame.Content is GeneratorPage generator) generator.ClearSensitiveState();
         WebsiteIcons.ClearCache();
         ClipboardCleaner.ClearOwned();
+    }
 
-        try { await Task.Run(change); }
+    private async Task ChangeAccountsAsync(Func<VaultAccount[]> change, bool clearActive = true)
+    {
+        if (_accountTransition || _signInDialogOpen) return;
+        _accountTransition = true;
+        UpdateSessionControls(RustCore.SessionState);
+        if (clearActive)
+        {
+            NavView.IsEnabled = false;
+            ClearActiveAccountContents(cancelPasskeys: true);
+        }
+
+        try
+        {
+            var accounts = await Task.Run(change);
+            if (!_closed) ApplyAccountSnapshot(accounts);
+        }
         finally
         {
             _accountTransition = false;
@@ -69,19 +109,76 @@ public sealed partial class MainWindow
                 NavView.IsEnabled = true;
                 var state = RustCore.SessionState;
                 UpdateSessionControls(state);
-                var timeoutHandled = await ApplyPendingWindowsTimeoutAsync();
-                if (!timeoutHandled && NavFrame.Content is HomePage page)
-                {
-                    if (state == VaultSessionState.Locked) page.ShowLocked();
-                    else if (state == VaultSessionState.SignedOut) page.ShowLoggedOut();
-                    else await page.RefreshAsync(false);
-                }
-                else if (!timeoutHandled && NavFrame.Content is FolderManagementPage folderPage)
-                {
-                    await folderPage.RefreshAsync(false);
-                }
+                if (!await ApplyPendingWindowsTimeoutAsync() && clearActive)
+                    await ShowActiveVaultAsync(state, forceSync: false);
             }
         }
+    }
+
+    private async Task ShowActiveVaultAsync(VaultSessionState state, bool forceSync)
+    {
+        var accountId = ActiveAccount?.Id;
+        if (state == VaultSessionState.Unlocked)
+        {
+            try { await Task.Run(RustCore.SyncPasskeyMetadata); }
+            catch (VaultException) { }
+        }
+        if (_closed || _accountTransition || state != RustCore.SessionState || accountId != ActiveAccount?.Id) return;
+        if (NavFrame.Content is HomePage page)
+        {
+            if (state == VaultSessionState.Locked) page.ShowLocked();
+            else if (state == VaultSessionState.SignedOut) page.ShowLoggedOut();
+            else await page.RefreshAsync(forceSync);
+        }
+        else if (NavFrame.Content is FolderManagementPage folders)
+        {
+            await folders.RefreshAsync(forceSync);
+        }
+    }
+
+    private void ShowAccountMenu()
+    {
+        var menu = new MenuFlyout();
+        foreach (var account in _accounts)
+        {
+            var lockLabel = account.State == VaultSessionState.Locked ? "已锁定" : "已解锁";
+            var item = new RadioMenuFlyoutItem
+            {
+                Text = $"{account.Email} · {account.ServerLabel} · {lockLabel}",
+                GroupName = "VaultAccounts",
+                IsChecked = account.Active,
+            };
+            item.Click += async (_, _) =>
+            {
+                if (!account.Active) await RunAccountCommandAsync(() => RustCore.SwitchAccount(account.Id));
+            };
+            menu.Items.Add(item);
+        }
+        menu.Items.Add(new MenuFlyoutSeparator());
+        var add = new MenuFlyoutItem { Text = "添加账户", Icon = new SymbolIcon(Symbol.Add), IsEnabled = _accounts.Length < 5 };
+        add.Click += async (_, _) => await ShowSignInDialogAsync();
+        menu.Items.Add(add);
+        var logout = new MenuFlyoutItem { Text = "退出当前账户" };
+        logout.Click += async (_, _) => await RunAccountCommandAsync(() => { RustCore.Logout(); return RustCore.GetAccounts(); });
+        menu.Items.Add(logout);
+        menu.ShowAt(SignInButton);
+    }
+
+    private async Task RunAccountCommandAsync(Func<VaultAccount[]> change)
+    {
+        try { await ChangeAccountsAsync(change); }
+        catch (VaultException error)
+        {
+            if (_closed) return;
+            await new ContentDialog
+            {
+                XamlRoot = NavView.XamlRoot,
+                Title = "无法切换账户",
+                Content = error.UserMessage,
+                CloseButtonText = "关闭",
+            }.ShowAsync();
+        }
+        catch (Exception error) when (IsCoreUnavailable(error)) { }
     }
 
     private async Task ShowUnlockDialogAsync()
@@ -120,7 +217,6 @@ public sealed partial class MainWindow
             args.Cancel = true;
             if (_unlockRequest is not null || password.Password.Length == 0) return;
             var entered = password.Password;
-            DiscardPendingWindowsTimeout();
             using var request = _unlockRequest = new CancellationTokenSource();
             password.Password = string.Empty;
             password.IsEnabled = dialog.IsPrimaryButtonEnabled = false;
@@ -157,17 +253,21 @@ public sealed partial class MainWindow
         finally
         {
             password.Password = string.Empty;
-            _signInDialogOpen = false;
+            try
+            {
+                if (!_closed)
+                {
+                    var accounts = await Task.Run(RustCore.GetAccounts);
+                    if (!_closed) ApplyAccountSnapshot(accounts);
+                }
+            }
+            finally { _signInDialogOpen = false; }
             if (!_closed)
             {
                 var state = RustCore.SessionState;
                 UpdateSessionControls(state);
-                var timeoutHandled = await ApplyPendingWindowsTimeoutAsync();
-                if (!timeoutHandled && state == VaultSessionState.Unlocked)
-                {
-                    if (NavFrame.Content is HomePage page) await page.RefreshAsync(false);
-                    else if (NavFrame.Content is FolderManagementPage folderPage) await folderPage.RefreshAsync(false);
-                }
+                if (!await ApplyPendingWindowsTimeoutAsync() && state == VaultSessionState.Unlocked)
+                    await ShowActiveVaultAsync(state, forceSync: false);
             }
         }
     }

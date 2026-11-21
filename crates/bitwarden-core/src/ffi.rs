@@ -32,6 +32,8 @@ mod passkeys;
 use crate::auth_request::{self, RequestError};
 use crate::protocol_compat::{self, ResponseKind, SyncCompatibility};
 use crate::vault::{VaultCache, VaultEditorData, VaultError, VaultMutationResult, VaultTotp};
+mod accounts;
+use accounts::AuthAccounts;
 
 const AUTH_FAILED: u32 = 0;
 const AUTHENTICATED: u32 = 1;
@@ -40,6 +42,8 @@ const AUTH_TIMED_OUT: u32 = 3;
 const AUTH_CANCELLED: u32 = 4;
 const DEVICE_VERIFICATION_REQUIRED: u32 = 5;
 const DEVICE_VERIFICATION_INVALID: u32 = 6;
+const ACCOUNT_ALREADY_SIGNED_IN: u32 = 7;
+const ACCOUNT_LIMIT_REACHED: u32 = 8;
 const TWO_FACTOR_MASK_SHIFT: u32 = 8;
 const TWO_FACTOR_AUTHENTICATOR: u32 = 1 << 0;
 const TWO_FACTOR_EMAIL: u32 = 1 << 1;
@@ -49,7 +53,7 @@ const SESSION_SIGNED_OUT: u8 = 0;
 const SESSION_UNLOCKED: u8 = 1;
 const SESSION_LOCKED: u8 = 2;
 static SESSION_STATE: AtomicU8 = AtomicU8::new(SESSION_SIGNED_OUT);
-static AUTH_CLIENT: OnceLock<Mutex<Option<AuthSession>>> = OnceLock::new();
+static AUTH_CLIENT: OnceLock<Mutex<AuthAccounts>> = OnceLock::new();
 static ASYNC_RUNTIME: OnceLock<Option<tokio::runtime::Runtime>> = OnceLock::new();
 static GENERATOR: OnceLock<GeneratorClient> = OnceLock::new();
 
@@ -61,6 +65,11 @@ struct AuthServer {
 }
 
 struct AuthSession {
+    account_id: uuid::Uuid,
+    email: String,
+    server_mode: u32,
+    server_url: String,
+    state: u8,
     server: AuthServer,
     device_identifier: String,
     client: Client,
@@ -203,8 +212,8 @@ fn runtime() -> Option<&'static tokio::runtime::Runtime> {
         .as_ref()
 }
 
-fn auth_client() -> &'static Mutex<Option<AuthSession>> {
-    AUTH_CLIENT.get_or_init(|| Mutex::new(None))
+fn auth_client() -> &'static Mutex<AuthAccounts> {
+    AUTH_CLIENT.get_or_init(|| Mutex::new(AuthAccounts::default()))
 }
 
 fn auth_server(mode: u32, base_url: &str) -> Option<AuthServer> {
@@ -291,19 +300,29 @@ fn build_auth_client(server: &AuthServer, middleware: Arc<DeviceLoginMiddleware>
 fn auth_client_for_server<'a>(
     session: &'a mut Option<AuthSession>,
     server: &AuthServer,
+    identity: (&str, u32, &str),
     device_identifier: &str,
-) -> &'a Client {
+) -> &'a mut AuthSession {
+    let (email, server_mode, server_url) = identity;
+    let device_identifier = uuid::Uuid::parse_str(device_identifier)
+        .map(|id| id.to_string())
+        .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
     if session.as_ref().is_none_or(|current| {
-        current.server != *server || current.device_identifier != device_identifier
+        current.server != *server
+            || current.device_identifier != device_identifier
+            || current.email != email
     }) {
-        let device_identifier = if uuid::Uuid::parse_str(device_identifier).is_ok() {
-            device_identifier.to_owned()
-        } else {
-            // Never share one global device identifier across installations.
-            uuid::Uuid::new_v4().to_string()
-        };
         let middleware = Arc::new(DeviceLoginMiddleware::new(device_identifier.clone()));
         *session = Some(AuthSession {
+            account_id: uuid::Uuid::new_v4(),
+            email: email.to_owned(),
+            server_mode,
+            server_url: if server_mode == 2 {
+                server_url.to_owned()
+            } else {
+                String::new()
+            },
+            state: SESSION_SIGNED_OUT,
             server: server.clone(),
             device_identifier,
             client: build_auth_client(server, middleware.clone()),
@@ -314,10 +333,7 @@ fn auth_client_for_server<'a>(
         });
     }
 
-    &session
-        .as_ref()
-        .expect("auth session was initialized")
-        .client
+    session.as_mut().expect("auth session was initialized")
 }
 
 unsafe fn read_utf8(value: *const c_char) -> Option<String> {
@@ -539,7 +555,7 @@ pub unsafe extern "C" fn bw_auth_login(
             return AUTH_FAILED;
         };
 
-        let email = email.trim().to_owned();
+        let email = email.trim().to_lowercase();
         if email.is_empty() || password.is_empty() {
             return AUTH_FAILED;
         }
@@ -568,34 +584,41 @@ pub unsafe extern "C" fn bw_auth_login(
         let mut session = auth_client()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if bw_auth_session_state() != SESSION_SIGNED_OUT {
-            return AUTH_FAILED;
-        }
         if !auth_request::is_current(request_id) {
             return AUTH_CANCELLED;
         }
+        if let Err(status) = session.can_login(&server, &request.0.email) {
+            return status;
+        }
         let result = catch_unwind(AssertUnwindSafe(|| {
-            auth_client_for_server(&mut session, &server, &device_identifier);
-            let active_session = session
-                .as_mut()
-                .expect("authentication session was initialized");
-            active_session.device_login_middleware.arm(&device_otp);
+            let pending = auth_client_for_server(
+                &mut session.pending,
+                &server,
+                (&request.0.email, server_mode, server_url.trim()),
+                &device_identifier,
+            );
+            pending.device_login_middleware.arm(&device_otp);
             let response = runtime.block_on(auth_request::run(
                 request_id,
-                active_session
+                pending
                     .client
                     .auth()
                     .login_password_with_unlock_data(&request.0),
             ));
-            active_session.device_login_middleware.arm("");
+            pending.device_login_middleware.arm("");
             match response {
                 Ok(Ok((response, unlock_data))) if auth_request::is_current(request_id) => {
                     if response.authenticated {
                         if unlock_data.is_none() {
                             return AUTH_FAILED;
                         }
-                        active_session.unlock_data = unlock_data;
-                        SESSION_STATE.store(SESSION_UNLOCKED, Ordering::Release);
+                        let mut authenticated = session
+                            .pending
+                            .take()
+                            .expect("successful login has a client");
+                        authenticated.unlock_data = unlock_data;
+                        authenticated.state = SESSION_UNLOCKED;
+                        session.activate(authenticated);
                     }
                     login_status(Ok(response))
                 }
@@ -614,7 +637,7 @@ pub unsafe extern "C" fn bw_auth_login(
                 | DEVICE_VERIFICATION_INVALID
         ) {
             // Discard partially authenticated state if login failed after setting tokens.
-            *session = None;
+            session.pending = None;
         }
         result
     }))
@@ -644,7 +667,7 @@ pub unsafe extern "C" fn bw_auth_send_two_factor_email(
         let Some(server) = auth_server(server_mode, &server_url) else {
             return 0;
         };
-        let email = email.trim().to_owned();
+        let email = email.trim().to_lowercase();
         if email.is_empty() || password.is_empty() {
             return 0;
         }
@@ -658,17 +681,23 @@ pub unsafe extern "C" fn bw_auth_send_two_factor_email(
             let mut session = auth_client()
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if bw_auth_session_state() != SESSION_SIGNED_OUT {
-                return Ok(AUTH_FAILED as u8);
+            if let Err(status) = session.can_login(&server, &request.0.email) {
+                return Ok(status as u8);
             }
             let device_identifier = session
+                .pending
                 .as_ref()
                 .map(|current| current.device_identifier.clone())
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-            let client = auth_client_for_server(&mut session, &server, &device_identifier);
+            let pending = auth_client_for_server(
+                &mut session.pending,
+                &server,
+                (&request.0.email, server_mode, server_url.trim()),
+                &device_identifier,
+            );
             let response = runtime.block_on(auth_request::run(
                 request_id,
-                client.auth().send_two_factor_email(&request.0),
+                pending.client.auth().send_two_factor_email(&request.0),
             ));
             let status = match response {
                 Ok(Ok(())) => AUTHENTICATED as u8,
@@ -677,7 +706,7 @@ pub unsafe extern "C" fn bw_auth_send_two_factor_email(
                 Err(RequestError::Cancelled) => AUTH_CANCELLED as u8,
             };
             if status == AUTH_TIMED_OUT as u8 || status == AUTH_CANCELLED as u8 {
-                *session = None;
+                session.pending = None;
             }
             Ok::<_, ()>(status)
         }));
@@ -710,7 +739,7 @@ pub unsafe extern "C" fn bw_auth_resend_new_device_verification(
             return AUTH_FAILED as u8;
         };
         let password = Zeroizing::new(password);
-        let email = email.trim().to_owned();
+        let email = email.trim().to_lowercase();
         let Some(server) = auth_server(server_mode, &server_url) else {
             return AUTH_FAILED as u8;
         };
@@ -726,16 +755,18 @@ pub unsafe extern "C" fn bw_auth_resend_new_device_verification(
             let mut session = auth_client()
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if bw_auth_session_state() != SESSION_SIGNED_OUT {
-                return Ok(AUTH_FAILED as u8);
+            if let Err(status) = session.can_login(&server, &email) {
+                return Ok(status as u8);
             }
-            auth_client_for_server(&mut session, &server, &device_identifier);
-            let active_session = session
-                .as_ref()
-                .expect("authentication session was initialized");
+            let pending = auth_client_for_server(
+                &mut session.pending,
+                &server,
+                (&email, server_mode, server_url.trim()),
+                &device_identifier,
+            );
             let kdf = runtime.block_on(auth_request::run(
                 request_id,
-                active_session.client.auth().prelogin(email.clone()),
+                pending.client.auth().prelogin(email.clone()),
             ));
             let kdf = match kdf {
                 Ok(Ok(kdf)) => kdf,
@@ -748,7 +779,7 @@ pub unsafe extern "C" fn bw_auth_resend_new_device_verification(
             let password_hash =
                 Zeroizing::new(auth_data.master_password_authentication_hash.to_string());
             drop(auth_data);
-            let config = active_session.client.internal.get_api_configurations();
+            let config = pending.client.internal.get_api_configurations();
             let endpoint = format!(
                 "{}/accounts/resend-new-device-otp",
                 config.api_config.base_path.trim_end_matches('/')
@@ -795,52 +826,6 @@ pub extern "C" fn bw_auth_session_state() -> u8 {
 }
 
 #[no_mangle]
-pub extern "C" fn bw_auth_logout() {
-    #[cfg(windows)]
-    crate::passkey_provider::cancel("");
-    // Wake an in-flight network operation before waiting for its session guard.
-    auth_request::begin();
-    let mut session = auth_client()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(mut active) = session.take() {
-        active.clear_vault_keys();
-    }
-    SESSION_STATE.store(SESSION_SIGNED_OUT, Ordering::Release);
-    #[cfg(windows)]
-    crate::passkey_provider::clear_metadata();
-}
-
-#[no_mangle]
-pub extern "C" fn bw_auth_lock() -> u8 {
-    #[cfg(windows)]
-    crate::passkey_provider::cancel("");
-    catch_unwind(AssertUnwindSafe(|| {
-        auth_request::begin();
-        let mut guard = auth_client()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if bw_auth_session_state() == SESSION_LOCKED {
-            return 1;
-        }
-        let Some(session) = guard
-            .as_mut()
-            .filter(|_| bw_auth_session_state() == SESSION_UNLOCKED)
-        else {
-            return 0;
-        };
-        if !session.clear_vault_keys() {
-            *guard = None;
-            SESSION_STATE.store(SESSION_SIGNED_OUT, Ordering::Release);
-            return 0;
-        }
-        SESSION_STATE.store(SESSION_LOCKED, Ordering::Release);
-        1
-    }))
-    .unwrap_or(0)
-}
-
-#[no_mangle]
 pub unsafe extern "C" fn bw_auth_unlock(password: *const c_char, request_id: u64) -> *mut c_char {
     catch_unwind(AssertUnwindSafe(|| {
         let Some(password) = (unsafe { read_utf8(password) }) else {
@@ -854,6 +839,7 @@ pub unsafe extern "C" fn bw_auth_unlock(password: *const c_char, request_id: u64
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(session) = guard
+            .active
             .as_mut()
             .filter(|_| bw_auth_session_state() == SESSION_LOCKED)
         else {
@@ -871,7 +857,8 @@ pub unsafe extern "C" fn bw_auth_unlock(password: *const c_char, request_id: u64
         }));
         let code = match result {
             Ok(Ok(Ok(()))) if auth_request::is_current(request_id) => {
-                SESSION_STATE.store(SESSION_UNLOCKED, Ordering::Release);
+                session.state = SESSION_UNLOCKED;
+                guard.publish_state();
                 return vault_success(&true);
             }
             Ok(Ok(Ok(()))) | Ok(Err(RequestError::Cancelled)) => "cancelled".to_owned(),
@@ -880,8 +867,7 @@ pub unsafe extern "C" fn bw_auth_unlock(password: *const c_char, request_id: u64
             Err(_) => "internal".to_owned(),
         };
         if !session.clear_vault_keys() {
-            *guard = None;
-            SESSION_STATE.store(SESSION_SIGNED_OUT, Ordering::Release);
+            guard.remove_active();
             return vault_error("internal");
         }
         vault_error(&code)
@@ -912,6 +898,7 @@ pub extern "C" fn bw_vault_overview() -> *mut c_char {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(session) = guard
+            .active
             .as_ref()
             .filter(|_| bw_auth_session_state() == SESSION_UNLOCKED)
         else {
@@ -938,6 +925,7 @@ pub extern "C" fn bw_vault_sync(request_id: u64) -> *mut c_char {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(session) = guard
+            .active
             .as_mut()
             .filter(|_| bw_auth_session_state() == SESSION_UNLOCKED)
         else {
@@ -991,6 +979,7 @@ pub unsafe extern "C" fn bw_vault_detail(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(session) = guard
+            .active
             .as_mut()
             .filter(|_| bw_auth_session_state() == SESSION_UNLOCKED)
         else {
@@ -1039,6 +1028,7 @@ pub extern "C" fn bw_vault_totp_refresh(request_id: u64) -> *mut c_char {
             Err(TryLockError::Poisoned(error)) => error.into_inner(),
         };
         let Some(session) = guard
+            .active
             .as_ref()
             .filter(|_| bw_auth_session_state() == SESSION_UNLOCKED)
         else {
@@ -1088,6 +1078,7 @@ pub unsafe extern "C" fn bw_vault_download_attachment(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(session) = guard
+            .active
             .as_ref()
             .filter(|_| bw_auth_session_state() == SESSION_UNLOCKED)
         else {
@@ -1158,6 +1149,7 @@ pub unsafe extern "C" fn bw_vault_editor(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(session) = guard
+            .active
             .as_ref()
             .filter(|_| bw_auth_session_state() == SESSION_UNLOCKED)
         else {
@@ -1205,6 +1197,7 @@ fn perform_vault_write(command: VaultWriteCommand, request_id: u64) -> *mut c_ch
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(session) = guard
+            .active
             .as_mut()
             .filter(|_| bw_auth_session_state() == SESSION_UNLOCKED)
         else {
@@ -1637,7 +1630,7 @@ mod tests {
             super::SESSION_UNLOCKED,
             std::sync::atomic::Ordering::Release,
         );
-        super::bw_auth_logout();
+        super::accounts::bw_auth_logout_all();
         assert_eq!(super::bw_auth_is_authenticated(), 0);
     }
 

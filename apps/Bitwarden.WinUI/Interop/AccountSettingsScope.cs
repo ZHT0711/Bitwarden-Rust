@@ -18,6 +18,8 @@ internal static class AccountSettingsScope
     }
 
     internal static void Begin(uint serverMode, string address, string email) => Current = Create(serverMode, address, email);
+    internal static void Use(string? scope) => Current = scope;
+    internal static void NotifySignedOut(string scope) => SignedOut?.Invoke(scope);
 
     internal static void End()
     {
