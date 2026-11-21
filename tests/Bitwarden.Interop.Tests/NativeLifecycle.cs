@@ -66,18 +66,11 @@ internal static class NativeLifecycle
                 check(File.ReadAllText(destination) == fixtureContents && directory.GetFiles().Length == 1,
                     "failed decryption retains the original destination and leaves no temporary file");
 
-                var downloadsBefore = (await http.GetFromJsonAsync<JsonElement>("/control/snapshot")).GetProperty("attachmentDownloads").GetInt32();
+                var downloadsBefore = await FixtureCount("attachmentDownloads");
                 await Control("pause-next-attachment");
                 using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
                 var pending = Task.Run(() => RustCore.DownloadVaultAttachment(attachment.Id, destination, attachmentRequest, cancellation.Token));
-                var live = false;
-                var deadline = DateTime.UtcNow.AddSeconds(2);
-                do
-                {
-                    var count = (await http.GetFromJsonAsync<JsonElement>("/control/snapshot")).GetProperty("attachmentDownloads").GetInt32();
-                    if (count > downloadsBefore) { live = true; break; }
-                    await Task.Delay(20);
-                } while (DateTime.UtcNow < deadline && !pending.IsCompleted);
+                var live = await WaitForTransfer("attachmentDownloads", downloadsBefore, pending);
                 cancellation.Cancel();
                 try { await pending; throw new Exception("Cancelled download completed unexpectedly."); }
                 catch (OperationCanceledException)
@@ -96,6 +89,80 @@ internal static class NativeLifecycle
             {
                 File.Delete(destination);
                 directory.Delete();
+            }
+            var uploadDirectory = Directory.CreateTempSubdirectory("bitwarden-upload-test-");
+            var source = Path.Combine(uploadDirectory.FullName, "合成上传.txt");
+            var received = Path.Combine(uploadDirectory.FullName, "合成下载.txt");
+            var editableId = initial.Items.Single(item => item.Name == "Synthetic login").Id;
+            VaultDetail OpenEditable() => RustCore.GetVaultDetail(editableId, "", CancellationToken.None);
+            try
+            {
+                File.WriteAllText(source, fixtureContents);
+                var editable = OpenEditable();
+                check(editable.Attachments == 0 && editable.CanUploadAttachments && editable.CanDeleteAttachments,
+                    "editable item without attachments grants an authorized upload");
+                RustCore.UploadVaultAttachment(source, editable.AttachmentRequestId!.Value, CancellationToken.None);
+                editable = OpenEditable();
+                var uploaded = editable.AttachmentFiles!.Single();
+                check(uploaded.Name == Path.GetFileName(source) && uploaded.CanDownload &&
+                    editable.Passkeys?.Length == 1, "direct upload preserves the encrypted filename and existing passkey");
+                RustCore.DownloadVaultAttachment(uploaded.Id, received, editable.AttachmentRequestId!.Value, CancellationToken.None);
+                check(File.ReadAllText(received) == fixtureContents && File.ReadAllText(source) == fixtureContents,
+                    "the encrypted direct upload round-trips without modifying the source");
+
+                await Control("azure-next-attachment-upload");
+                RustCore.UploadVaultAttachment(source, editable.AttachmentRequestId!.Value, CancellationToken.None);
+                editable = OpenEditable();
+                var azure = editable.AttachmentFiles!.Single(file => file.Id != uploaded.Id);
+                RustCore.DownloadVaultAttachment(azure.Id, received, editable.AttachmentRequestId!.Value, CancellationToken.None);
+                check(File.ReadAllText(received) == fixtureContents, "presigned upload round-trips without sending the vault token");
+                RustCore.DeleteVaultAttachment(azure.Id, editable.AttachmentRequestId!.Value, CancellationToken.None);
+                RustCore.SyncVault(CancellationToken.None);
+                editable = OpenEditable();
+                check(editable.AttachmentFiles!.Single().Id == uploaded.Id, "delete removes only the selected attachment after sync");
+
+                await Control("fail-next-attachment-upload");
+                ExpectCode(() => RustCore.UploadVaultAttachment(source, editable.AttachmentRequestId!.Value, CancellationToken.None),
+                    "attachmentUploadFailed", "an upload failure rolls back the newly created attachment");
+                check(RustCore.GetVaultOverview().Items.Any(item => item.Id == editableId),
+                    "confirmed rollback leaves the vault ready for use");
+                RustCore.SyncVault(CancellationToken.None);
+                editable = OpenEditable();
+                check(editable.AttachmentFiles!.Single().Id == uploaded.Id, "upload rollback keeps every pre-existing attachment");
+
+                var uploadsBefore = await FixtureCount("attachmentUploads");
+                await Control("pause-next-attachment-upload");
+                using (var cancelUpload = new CancellationTokenSource(TimeSpan.FromSeconds(10)))
+                {
+                    var pending = Task.Run(() => RustCore.UploadVaultAttachment(
+                        source, editable.AttachmentRequestId!.Value, cancelUpload.Token));
+                    var live = await WaitForTransfer("attachmentUploads", uploadsBefore, pending);
+                    cancelUpload.Cancel();
+                    try { await pending; throw new Exception("Cancelled upload completed unexpectedly."); }
+                    catch (OperationCanceledException) { check(live, "live upload cancellation waits for slot cleanup"); }
+                }
+                RustCore.SyncVault(CancellationToken.None);
+                editable = OpenEditable();
+                check(editable.AttachmentFiles!.Single().Id == uploaded.Id, "cancelled upload removes the new data without removing any prior attachment");
+
+                await Control("fail-next-attachment-upload");
+                await Control("fail-next-attachment-delete");
+                ExpectCode(() => RustCore.UploadVaultAttachment(source, editable.AttachmentRequestId!.Value, CancellationToken.None),
+                    "writeUncertain", "unconfirmed cleanup blocks another write pending sync");
+                ExpectCode(() => RustCore.GetVaultOverview(), "notSynced", "unconfirmed attachment cleanup invalidates the overview");
+                RustCore.SyncVault(CancellationToken.None);
+                editable = OpenEditable();
+                var orphan = editable.AttachmentFiles!.Single(file => file.Id != uploaded.Id);
+                RustCore.DeleteVaultAttachment(orphan.Id, editable.AttachmentRequestId!.Value, CancellationToken.None);
+                editable = OpenEditable();
+                RustCore.DeleteVaultAttachment(uploaded.Id, editable.AttachmentRequestId!.Value, CancellationToken.None);
+                check(OpenEditable().Attachments == 0, "deleting the last attachment leaves the item available");
+            }
+            finally
+            {
+                File.Delete(source);
+                File.Delete(received);
+                uploadDirectory.Delete();
             }
             const string seed = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
             var draft = new VaultEditorData(null, "ABI synthetic login", 1, null, false, true, null, "synthetic notes",
@@ -309,7 +376,19 @@ internal static class NativeLifecycle
             using var response = await http.PostAsync($"/control/{command}", null);
             response.EnsureSuccessStatusCode();
         }
-        async Task<int> Count() => (await http.GetFromJsonAsync<JsonElement>("/control/snapshot")).GetProperty("cipherCount").GetInt32();
+        Task<int> Count() => FixtureCount("cipherCount");
+        async Task<int> FixtureCount(string property) =>
+            (await http.GetFromJsonAsync<JsonElement>("/control/snapshot")).GetProperty(property).GetInt32();
+        async Task<bool> WaitForTransfer(string counter, int before, Task pending)
+        {
+            var deadline = DateTime.UtcNow.AddSeconds(2);
+            do
+            {
+                if (await FixtureCount(counter) > before) return !pending.IsCompleted;
+                await Task.Delay(20);
+            } while (DateTime.UtcNow < deadline && !pending.IsCompleted);
+            return false;
+        }
         void ExpectCode(Action operation, string expected, string name)
         {
             try { operation(); throw new Exception($"Expected native error {expected}: {name}"); }

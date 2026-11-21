@@ -15,6 +15,7 @@ import argparse
 import base64
 import copy
 import datetime as dt
+from email.parser import BytesParser
 import http.client
 import ipaddress
 import json
@@ -40,6 +41,7 @@ PUBLIC_WRAPPED_USER_KEY = (
 )
 OUT_OF_DATE = "The item cannot be saved because it is out of date."
 MAX_BODY_BYTES = 2 * 1024 * 1024
+ATTACHMENT_PATH = re.compile(r"/api/ciphers/([0-9a-fA-F-]{36})/attachment/([a-zA-Z0-9_-]+)")
 UTC = dt.timezone.utc
 
 
@@ -213,7 +215,13 @@ class FixtureState:
             self.fail_next_move_after_first = False
             self.tamper_next_attachment = False
             self.pause_next_attachment = False
+            self.fail_next_attachment_upload = False
+            self.pause_next_attachment_upload = False
+            self.fail_next_attachment_delete = False
+            self.use_azure_attachment_upload = False
+            self.azure_slots = {}
             self.attachment_downloads = 0
+            self.attachment_uploads = 0
             self.fail_next_sync = False
             self.require_new_device_verification = False
             self.require_authenticator = False
@@ -373,7 +381,8 @@ class FixtureHandler(BaseHTTPRequestHandler):
         if path == "/control/snapshot":
             with state.lock:
                 self.reply({"cipherCount": len(state.ciphers), "ids": sorted(state.ciphers),
-                            "attachmentDownloads": state.attachment_downloads})
+                            "attachmentDownloads": state.attachment_downloads,
+                            "attachmentUploads": state.attachment_uploads})
             return
         blob_match = re.fullmatch(r"/fixture-attachments/([a-zA-Z0-9_-]+)", path)
         if blob_match:
@@ -496,6 +505,10 @@ class FixtureHandler(BaseHTTPRequestHandler):
             "/control/fail-next-move-after-first": "fail_next_move_after_first",
             "/control/tamper-next-attachment": "tamper_next_attachment",
             "/control/pause-next-attachment": "pause_next_attachment",
+            "/control/fail-next-attachment-upload": "fail_next_attachment_upload",
+            "/control/pause-next-attachment-upload": "pause_next_attachment_upload",
+            "/control/fail-next-attachment-delete": "fail_next_attachment_delete",
+            "/control/azure-next-attachment-upload": "use_azure_attachment_upload",
             "/control/fail-next-sync": "fail_next_sync",
             "/control/require-authenticator": "require_authenticator",
         }
@@ -533,8 +546,58 @@ class FixtureHandler(BaseHTTPRequestHandler):
             return
         if not self.authorized():
             return
+        attachment = ATTACHMENT_PATH.fullmatch(path)
+        if attachment and attachment[2] != "v2":
+            content_type = self.headers.get("Content-Type", "")
+            if not content_type.startswith("multipart/form-data;"):
+                self.fail("Expected a multipart attachment upload.")
+                return
+            message = BytesParser().parsebytes(b"Content-Type: " + content_type.encode() + b"\r\n\r\n" + body)
+            parts = message.get_payload() if message.is_multipart() else []
+            if len(parts) != 1 or parts[0].get_param("name", header="content-disposition") != "data":
+                self.fail("Expected one encrypted data part.")
+                return
+            self.upload_attachment(attachment[1].lower(), attachment[2], parts[0].get_payload(decode=True), 204)
+            return
         value = self.json_body(body)
         if value is None:
+            return
+        if attachment:
+            with state.lock:
+                cipher = state.ciphers.get(attachment[1].lower())
+                if cipher is None or not cipher["edit"] or cipher.get("deletedDate"):
+                    self.fail("Attachment upload denied.", 403)
+                    return
+                try:
+                    revision = parse_date(value.get("lastKnownRevisionDate"))
+                except ValueError:
+                    self.fail("Invalid attachment revision.")
+                    return
+                if abs((revision - parse_date(cipher["revisionDate"])).total_seconds()) > 1:
+                    self.fail(OUT_OF_DATE)
+                    return
+                size, name, key = value.get("fileSize"), value.get("fileName"), value.get("key")
+                if (not isinstance(size, int) or not 0 < size <= MAX_BODY_BYTES
+                        or not all(isinstance(field, str) and field.startswith(("2.", "7.")) for field in (name, key))):
+                    self.fail("Invalid encrypted attachment metadata.")
+                    return
+                attachment_id = uuid.uuid4().hex
+                cipher["attachments"] = [
+                    *(cipher.get("attachments") or []),
+                    {"id": attachment_id, "fileName": name, "key": key, "size": str(size), "sizeName": f"{size} B"},
+                ]
+                cipher["revisionDate"] = state.revision()
+                azure = state.use_azure_attachment_upload
+                state.use_azure_attachment_upload = False
+                if azure:
+                    state.azure_slots[attachment_id] = cipher["id"]
+                    host, port = self.server.server_address[:2]
+                    host = f"[{host}]" if ":" in host else host
+                    target = f"http://{host}:{port}/fixture-upload/{attachment_id}?sv=2024-11-04"
+                else:
+                    target = f"/ciphers/{cipher['id']}/attachment/{attachment_id}"
+                self.reply({"attachmentId": attachment_id, "url": target,
+                            "fileUploadType": 1 if azure else 0, "cipherResponse": cipher})
             return
         if path == "/api/folders":
             with state.lock:
@@ -571,12 +634,26 @@ class FixtureHandler(BaseHTTPRequestHandler):
 
     def do_PUT(self):
         body = self.body()
-        if body is None or not self.authorized():
+        if body is None:
+            return
+        path = urlsplit(self.path).path
+        azure_attachment = re.fullmatch(r"/fixture-upload/([a-zA-Z0-9_-]+)", path)
+        if azure_attachment:
+            state = self.server.state
+            with state.lock:
+                cipher_id = state.azure_slots.get(azure_attachment[1])
+            if (cipher_id is None or self.headers.get("Authorization") or self.headers.get("Device-Identifier")
+                    or self.headers.get("x-ms-blob-type") != "BlockBlob"
+                    or self.headers.get("x-ms-version") != "2024-11-04"):
+                self.fail("Invalid presigned upload request.")
+                return
+            self.upload_attachment(cipher_id, azure_attachment[1], body, 201)
+            return
+        if not self.authorized():
             return
         value = self.json_body(body)
         if value is None:
             return
-        path = urlsplit(self.path).path
         if path == "/api/ciphers/move":
             ids = value.get("ids")
             folder_id = value.get("folderId")
@@ -674,6 +751,29 @@ class FixtureHandler(BaseHTTPRequestHandler):
             return
         state = self.server.state
         path = urlsplit(self.path).path
+        attachment = ATTACHMENT_PATH.fullmatch(path)
+        if attachment:
+            cipher_id, attachment_id = attachment[1].lower(), attachment[2]
+            with state.lock:
+                if state.fail_next_attachment_delete:
+                    state.fail_next_attachment_delete = False
+                    self.fail("Synthetic attachment delete failed.", 503)
+                    return
+                cipher = state.ciphers.get(cipher_id)
+                if cipher is None or not cipher["permissions"].get("delete", False):
+                    self.fail("Attachment delete denied.", 403)
+                    return
+                current = cipher.get("attachments") or []
+                kept = [entry for entry in current if entry["id"] != attachment_id]
+                if len(kept) == len(current):
+                    self.fail("Attachment not found.", 404)
+                    return
+                cipher["attachments"] = kept
+                cipher["revisionDate"] = state.revision()
+                state.attachment_blobs.pop(attachment_id, None)
+                state.azure_slots.pop(attachment_id, None)
+                self.reply({"cipher": cipher})
+            return
         folder_match = re.fullmatch(r"/api/folders/([0-9a-fA-F-]{36})", path)
         if path == "/api/folders" or folder_match:
             if folder_match:
@@ -721,6 +821,26 @@ class FixtureHandler(BaseHTTPRequestHandler):
                 return
             del state.ciphers[key]
         self.reply(None, 204)
+
+    def upload_attachment(self, cipher_id, attachment_id, contents, status):
+        state = self.server.state
+        with state.lock:
+            cipher = state.ciphers.get(cipher_id, {})
+            attachment = next((entry for entry in cipher.get("attachments") or [] if entry["id"] == attachment_id), None)
+            if attachment is None or not contents or len(contents) != int(attachment["size"]) or contents[0] not in (2, 7):
+                self.fail("Invalid synthetic encrypted file upload.")
+                return
+            state.attachment_blobs[attachment_id] = base64.b64encode(contents).decode("ascii")
+            state.attachment_uploads += 1
+            if state.fail_next_attachment_upload:
+                state.fail_next_attachment_upload = False
+                self.fail("Synthetic failure after storing the uploaded bytes.", 503)
+                return
+            pause = state.pause_next_attachment_upload
+            state.pause_next_attachment_upload = False
+        if pause:
+            time.sleep(3)
+        self.reply(None, status)
 
 
 def make_server(host: str, port: int, state: FixtureState) -> FixtureServer:

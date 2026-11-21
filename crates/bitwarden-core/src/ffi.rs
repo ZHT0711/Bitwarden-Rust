@@ -1003,7 +1003,8 @@ pub unsafe extern "C" fn bw_vault_detail(
             Ok(Ok(mut detail)) if auth_request::is_current(request_id) => {
                 // Reuse this authorization only for the currently open item. The cache remains encrypted.
                 let has_totp = matches!(detail.totp, Some(VaultTotp::Ready { .. }));
-                let has_attachments = !detail.attachment_files.is_empty();
+                let has_attachments =
+                    !detail.attachment_files.is_empty() || detail.can_upload_attachments;
                 detail.totp_request_id = has_totp.then_some(request_id);
                 detail.attachment_request_id = has_attachments.then_some(request_id);
                 session.open_detail = (has_totp || has_attachments).then(|| OpenDetail {
@@ -1185,6 +1186,8 @@ enum VaultWriteCommand {
     },
     DeleteFolders(Vec<FolderId>),
     MoveItems(VaultItemMove),
+    UploadAttachment(String),
+    DeleteAttachment(String),
     Action {
         id: String,
         action: String,
@@ -1208,6 +1211,8 @@ fn perform_vault_write(command: VaultWriteCommand, request_id: u64) -> *mut c_ch
             return vault_access_error();
         };
         session.vault.reset_write_attempt();
+        let upload = matches!(&command, VaultWriteCommand::UploadAttachment(_));
+        let mut pending_upload = None;
         #[cfg(windows)]
         let affects_passkeys = matches!(
             &command,
@@ -1217,7 +1222,7 @@ fn perform_vault_write(command: VaultWriteCommand, request_id: u64) -> *mut c_ch
         );
         // Catch inside the session guard: a panic after sending a write must force reconciliation.
         let result = catch_unwind(AssertUnwindSafe(|| {
-            runtime.block_on(auth_request::run(request_id, async {
+            let write = async {
                 match command {
                     VaultWriteCommand::Create(data) => {
                         session.vault.create(&session.client, data).await
@@ -1243,6 +1248,38 @@ fn perform_vault_write(command: VaultWriteCommand, request_id: u64) -> *mut c_ch
                             .move_items(&session.client, args.ids, args.folder_id)
                             .await
                     }
+                    VaultWriteCommand::UploadAttachment(path) => {
+                        let detail = session
+                            .open_detail
+                            .as_ref()
+                            .filter(|detail| {
+                                detail.request_id == request_id && detail.has_attachments
+                            })
+                            .ok_or(VaultError::AttachmentViewExpired)?;
+                        Box::pin(session.vault.upload_attachment(
+                            &session.client,
+                            (&detail.item_id, &detail.revision),
+                            Path::new(&path),
+                            request_id,
+                            &mut pending_upload,
+                        ))
+                        .await
+                    }
+                    VaultWriteCommand::DeleteAttachment(id) => {
+                        let detail = session
+                            .open_detail
+                            .as_ref()
+                            .filter(|detail| {
+                                detail.request_id == request_id && detail.has_attachments
+                            })
+                            .ok_or(VaultError::AttachmentViewExpired)?;
+                        Box::pin(session.vault.delete_attachment(
+                            &session.client,
+                            (&detail.item_id, &detail.revision),
+                            &id,
+                        ))
+                        .await
+                    }
                     VaultWriteCommand::Action {
                         id,
                         action,
@@ -1255,8 +1292,27 @@ fn perform_vault_write(command: VaultWriteCommand, request_id: u64) -> *mut c_ch
                             .await
                     }
                 }
-            }))
+            };
+            if upload {
+                runtime.block_on(auth_request::run_transfer(request_id, Box::pin(write)))
+            } else {
+                runtime.block_on(auth_request::run(request_id, write))
+            }
         }));
+        if let Some(pending) = pending_upload {
+            // Once the upload future stops, rollback only the slot created by this request.
+            let recovered = catch_unwind(AssertUnwindSafe(|| {
+                runtime.block_on(Box::pin(
+                    session.vault.rollback_upload(&session.client, pending),
+                ))
+            }))
+            .unwrap_or(false);
+            if !recovered || session.vault.needs_reconciliation() {
+                session.vault.mark_write_uncertain();
+                return vault_error("writeUncertain");
+            }
+            session.open_detail = None;
+        }
         match result {
             // An acknowledged success is authoritative even if cancellation races its return.
             Ok(Ok(Ok(result))) => {
@@ -1278,6 +1334,34 @@ fn perform_vault_write(command: VaultWriteCommand, request_id: u64) -> *mut c_ch
             Ok(Err(RequestError::TimedOut)) => vault_error("timedOut"),
             Err(_) => vault_error("internal"),
         }
+    }))
+    .unwrap_or_else(|_| vault_error("internal"))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn bw_vault_upload_attachment(
+    path: *const c_char,
+    detail_request_id: u64,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(path) = (unsafe { read_utf8(path) }) else {
+            return vault_error("attachmentFileRead");
+        };
+        perform_vault_write(VaultWriteCommand::UploadAttachment(path), detail_request_id)
+    }))
+    .unwrap_or_else(|_| vault_error("internal"))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn bw_vault_delete_attachment(
+    attachment_id: *const c_char,
+    detail_request_id: u64,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(id) = (unsafe { read_utf8(attachment_id) }) else {
+            return vault_error("validation");
+        };
+        perform_vault_write(VaultWriteCommand::DeleteAttachment(id), detail_request_id)
     }))
     .unwrap_or_else(|_| vault_error("internal"))
 }

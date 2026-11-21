@@ -63,6 +63,12 @@ pub(crate) enum VaultError {
     AttachmentUnavailable,
     #[error("attachmentDownloadFailed")]
     AttachmentDownloadFailed,
+    #[error("attachmentViewExpired")]
+    AttachmentViewExpired,
+    #[error("attachmentUploadFailed")]
+    AttachmentUploadFailed,
+    #[error("attachmentFileRead")]
+    AttachmentFileRead,
     #[error("attachmentTooLarge")]
     AttachmentTooLarge,
     #[error("fileAccess")]
@@ -146,6 +152,8 @@ pub(crate) struct VaultDetail {
     pub(crate) attachment_files: Vec<attachments::AttachmentSummary>,
     attachment_failures: usize,
     pub(crate) attachment_request_id: Option<u64>,
+    pub(crate) can_upload_attachments: bool,
+    can_delete_attachments: bool,
     pub(crate) totp: Option<VaultTotp>,
     pub(crate) totp_request_id: Option<u64>,
     passkeys: Vec<VaultPasskey>,
@@ -723,6 +731,7 @@ fn display_detail(view: CipherView) -> VaultDetail {
         fields.retain(|field| !field.sensitive);
     }
     let (attachment_files, attachment_failures) = attachments::summaries(&view);
+    let (can_upload_attachments, can_delete_attachments) = attachments::permissions(&view);
     VaultDetail {
         name: view.name,
         item_type: view.r#type as u8,
@@ -734,6 +743,8 @@ fn display_detail(view: CipherView) -> VaultDetail {
         attachment_files,
         attachment_failures,
         attachment_request_id: None,
+        can_upload_attachments,
+        can_delete_attachments,
         totp: None,
         totp_request_id: None,
         passkeys,

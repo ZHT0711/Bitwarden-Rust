@@ -14,6 +14,7 @@ argon2.workspace = true
 base64.workspace = true
 bitwarden-auth.workspace = true
 bitwarden-api-api.workspace = true
+bitwarden-api-base.workspace = true
 bitwarden-vault.workspace = true
 bitwarden-state.workspace = true
 bitwarden-crypto.workspace = true
@@ -21,6 +22,7 @@ bitwarden-crypto-sync-handler.workspace = true
 bitwarden-generators.workspace = true
 bitwarden-fido.workspace = true
 bw-sdk-core = { workspace = true, features = ["internal"] }
+bytes.workspace = true
 chrono.workspace = true
 hmac.workspace = true
 http.workspace = true

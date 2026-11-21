@@ -759,7 +759,10 @@ impl VaultCache {
         VaultError::WriteUncertain
     }
 
-    async fn secure_metadata_cache(&mut self, previous: &Cipher) -> Result<(), VaultError> {
+    pub(super) async fn secure_metadata_cache(
+        &mut self,
+        previous: &Cipher,
+    ) -> Result<(), VaultError> {
         let id = previous.id.ok_or_else(|| self.uncertain())?;
         let updated = self
             .find_cipher(&id.to_string())
@@ -815,7 +818,7 @@ impl VaultCache {
         Ok(updated)
     }
 
-    fn classify_api_error(&mut self, error: bw_sdk_core::ApiError) -> VaultError {
+    pub(super) fn classify_api_error(&mut self, error: bw_sdk_core::ApiError) -> VaultError {
         if let bw_sdk_core::ApiError::Response(response) = error {
             let status = response.status.as_u16();
             let out_of_date = response

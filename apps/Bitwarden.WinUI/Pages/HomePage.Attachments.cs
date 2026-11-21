@@ -14,7 +14,7 @@ public sealed partial class HomePage
     private void ShowAttachmentDetails(VaultDetail detail)
     {
         var requestId = _attachmentRequestId = detail.AttachmentRequestId;
-        if (detail.Attachments == 0) return;
+        if (detail.Attachments == 0 && !detail.CanUploadAttachments) return;
 
         var section = new StackPanel { Spacing = 8 };
         section.Children.Add(new TextBlock
@@ -22,13 +22,21 @@ public sealed partial class HomePage
             Text = "附件",
             Style = (Style)Application.Current.Resources["BodyStrongTextBlockStyle"],
         });
+        if (requestId is { } uploadRequest && detail.CanUploadAttachments)
+        {
+            var upload = new Button { Content = "添加附件", HorizontalAlignment = HorizontalAlignment.Left };
+            upload.Click += async (_, _) => await RunAttachmentWriteAsync(uploadRequest, PickAttachmentAsync,
+                RustCore.UploadVaultAttachment, "正在上传附件", "附件已上传");
+            section.Children.Add(upload);
+        }
         foreach (var attachment in detail.AttachmentFiles ?? [])
         {
             var row = new Grid { ColumnSpacing = 8 };
             row.ColumnDefinitions.Add(new ColumnDefinition());
             row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             var label = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
-            label.Children.Add(new TextBlock { Text = attachment.Name, TextWrapping = TextWrapping.Wrap });
+            var name = string.IsNullOrEmpty(attachment.Name) ? "无法解密的附件" : attachment.Name;
+            label.Children.Add(new TextBlock { Text = name, TextWrapping = TextWrapping.Wrap });
             if (attachment.Size is { } size)
                 label.Children.Add(new TextBlock
                 {
@@ -36,19 +44,25 @@ public sealed partial class HomePage
                     Style = (Style)Application.Current.Resources["CaptionTextBlockStyle"],
                 });
             row.Children.Add(label);
-            var download = new Button
+            var actions = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
+            if (requestId is { } activeId && attachment.CanDownload)
             {
-                Content = "下载",
-                IsEnabled = requestId.HasValue,
-                VerticalAlignment = VerticalAlignment.Center,
-            };
-            AutomationProperties.SetName(download, $"下载 {attachment.Name}");
-            download.Click += async (_, _) =>
+                var download = new Button { Content = "下载", VerticalAlignment = VerticalAlignment.Center };
+                AutomationProperties.SetName(download, $"下载 {name}");
+                download.Click += async (_, _) => await DownloadAttachmentAsync(attachment, activeId);
+                actions.Children.Add(download);
+            }
+            if (requestId is { } deleteRequest && detail.CanDeleteAttachments)
             {
-                if (requestId is { } activeId) await DownloadAttachmentAsync(attachment, activeId);
-            };
-            Grid.SetColumn(download, 1);
-            row.Children.Add(download);
+                var delete = new Button { Content = "删除", VerticalAlignment = VerticalAlignment.Center };
+                AutomationProperties.SetName(delete, $"删除 {name}");
+                delete.Click += async (_, _) => await RunAttachmentWriteAsync(deleteRequest,
+                    _ => ConfirmAttachmentDeletionAsync(attachment.Id, name), RustCore.DeleteVaultAttachment,
+                    "正在删除附件", "附件已删除");
+                actions.Children.Add(delete);
+            }
+            Grid.SetColumn(actions, 1);
+            row.Children.Add(actions);
             section.Children.Add(row);
         }
         if (detail.AttachmentFailures > 0)
@@ -56,9 +70,80 @@ public sealed partial class HomePage
             {
                 IsOpen = true,
                 Severity = InfoBarSeverity.Warning,
-                Message = $"{detail.AttachmentFailures} 个附件的文件名或密钥无法读取。",
+                Message = $"{detail.AttachmentFailures} 个附件的标识无法读取。",
             });
         DetailPanel.Children.Add(section);
+    }
+
+    private async Task<string?> PickAttachmentAsync(CancellationToken token)
+    {
+        var picker = new FileOpenPicker(XamlRoot.ContentIslandEnvironment.AppWindowId);
+        picker.FileTypeFilter.Add("*");
+        return (await picker.PickSingleFileAsync().AsTask(token))?.Path;
+    }
+
+    private async Task<string?> ConfirmAttachmentDeletionAsync(string id, string name)
+    {
+        var dialog = _actionDialog = new ContentDialog
+        {
+            XamlRoot = XamlRoot,
+            Title = "删除附件？",
+            Content = new TextBlock { Text = $"将永久删除“{name}”。", TextWrapping = TextWrapping.Wrap },
+            PrimaryButtonText = "删除",
+            CloseButtonText = "取消",
+            DefaultButton = ContentDialogButton.Close,
+        };
+        try { return await dialog.ShowAsync() == ContentDialogResult.Primary ? id : null; }
+        finally { if (ReferenceEquals(_actionDialog, dialog)) _actionDialog = null; }
+    }
+
+    private async Task RunAttachmentWriteAsync(ulong requestId, Func<CancellationToken, Task<string?>> select,
+        Func<string, ulong, CancellationToken, VaultMutationResult> write, string pendingTitle, string successTitle)
+    {
+        if (_busy || _requiresSync || _attachmentRequestId != requestId || _operation is null) return;
+        var version = _version;
+        var token = _operation.Token;
+        SetBusy(true);
+        try
+        {
+            var value = await select(token);
+            if (value is null || !IsCurrent(version, token)) return;
+            SetNotice(pendingTitle, string.Empty, InfoBarSeverity.Informational);
+            var result = await Task.Run(() => write(value, requestId, token), token);
+            if (!_loaded || version != _version) return;
+            CancelOperation();
+            DetailPanel.Children.Clear();
+            ApplyMutationResult(result, successTitle);
+        }
+        catch (OperationCanceledException)
+        {
+            if (_loaded && version == _version)
+                SetNotice("附件操作已取消", "可重新打开条目后重试。", InfoBarSeverity.Informational);
+        }
+        catch (VaultException error)
+        {
+            if (_loaded && version == _version)
+            {
+                _requiresSync |= error.Code is "conflict" or "writeUncertain" or "notSynced";
+                var message = error.Code switch
+                {
+                    "conflict" => "条目已更新，请先同步保险库。",
+                    "writeUncertain" => "服务器上的附件状态待确认，请先同步保险库。",
+                    "premiumRequired" => "上传附件需要个人或组织提供的高级会员资格。",
+                    _ => error.UserMessage,
+                };
+                SetNotice("附件操作失败", message, InfoBarSeverity.Error);
+            }
+        }
+        catch (Exception error) when (error is COMException or ArgumentException or InvalidOperationException || IsCoreUnavailable(error))
+        {
+            if (IsCurrent(version, token))
+                SetNotice("无法操作附件", "请关闭其他文件对话框，或检查应用安装后重试。", InfoBarSeverity.Error);
+        }
+        finally
+        {
+            if (version == _version) SetBusy(false);
+        }
     }
 
     private async Task DownloadAttachmentAsync(VaultAttachment attachment, ulong requestId)
