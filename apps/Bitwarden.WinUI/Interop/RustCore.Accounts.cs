@@ -4,7 +4,7 @@ using System.Text.Json;
 namespace Bitwarden_WinUI.Interop;
 
 internal sealed record VaultAccount(string Id, string Email, uint ServerMode, string ServerUrl,
-    VaultSessionState State, bool Active)
+    VaultSessionState State, bool Active, bool NeedsSignIn = false)
 {
     internal string ServerLabel => ServerMode switch
     {
@@ -27,7 +27,9 @@ internal static partial class RustCore
     [DllImport(LibraryName, EntryPoint = "bw_auth_cancel_login", CallingConvention = CallingConvention.Cdecl)]
     private static extern void CancelLoginNative();
     [DllImport(LibraryName, EntryPoint = "bw_auth_logout_all", CallingConvention = CallingConvention.Cdecl)]
-    private static extern void LogoutAllNative();
+    private static extern byte LogoutAllNative();
+    [DllImport(LibraryName, EntryPoint = "bw_auth_shutdown", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern void Shutdown();
     [DllImport(LibraryName, EntryPoint = "bw_auth_apply_timeouts", CallingConvention = CallingConvention.Cdecl)]
     private static extern IntPtr ApplyTimeoutsNative(IntPtr actions, byte interrupt);
 
@@ -46,5 +48,9 @@ internal static partial class RustCore
     }
 
     internal static void CancelPendingLogin() => CancelLoginNative();
-    internal static void LogoutAll() => LogoutAllNative();
+
+    internal static void LogoutAll()
+    {
+        if (LogoutAllNative() == 0) throw new VaultException("cacheRevocationFailed");
+    }
 }

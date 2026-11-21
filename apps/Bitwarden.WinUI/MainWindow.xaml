@@ -107,7 +107,10 @@
                 </NavigationViewItem>
             </NavigationView.FooterMenuItems>
 
-            <Frame x:Name="NavFrame" />
+            <Grid RowDefinitions="Auto,*">
+                <InfoBar x:Name="AccountWarning" Margin="24,0,24,8" Severity="Warning" />
+                <Frame x:Name="NavFrame" Grid.Row="1" />
+            </Grid>
         </NavigationView>
     </Grid>
 </Window>

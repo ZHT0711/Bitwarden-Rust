@@ -1,6 +1,8 @@
 mod auth_request;
 mod crypto;
 mod ffi;
+#[cfg(windows)]
+mod local_cache;
 mod model;
 #[cfg(windows)]
 mod passkey_provider;

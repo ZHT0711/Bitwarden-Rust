@@ -1,6 +1,6 @@
 namespace Bitwarden_WinUI.Interop;
 
-internal sealed record VaultOverview(VaultItem[] Items, VaultFolder[] Folders, DateTimeOffset LastSync, int Failures);
+internal sealed record VaultOverview(VaultItem[] Items, VaultFolder[] Folders, DateTimeOffset LastSync, int Failures, bool ReadOnly = false);
 internal sealed record VaultFolder(string Id, string Name);
 public sealed record VaultItem(string Id, string Name, string Subtitle, int ItemType, bool Favorite,
     string? FolderId, string? OrganizationId, bool Deleted, bool Archived, bool Reprompt, bool Restricted, string RevisionDate = "",
@@ -35,6 +35,9 @@ internal sealed class VaultException(string code) : Exception(code)
         "locked" => "保险库已锁定，请先解锁。",
         "unlockUnavailable" => "本次会话需要重新登录。请取消解锁，选择「退出登录」，然后重新连接账户。",
         "network" => "无法同步。请检查网络连接和登录状态后重试。",
+        "signInRequired" => "此账户只有本机缓存。请从账户菜单选择「重新连接当前账户」后再同步。",
+        "localStorage" => "无法写入本机缓存，请检查磁盘空间及应用的数据目录权限后重试。",
+        "cacheRevocationFailed" => "无法移除或停用本机保险库缓存。请检查应用数据目录权限后再试。",
         "invalidResponse" => "服务器返回的保险库数据不完整或格式不受支持。",
         "notFound" => "未找到条目或尚未完成首次同步，请重新同步。",
         "decryptionFailed" => "无法解密保险库数据，请重新登录后重试。",

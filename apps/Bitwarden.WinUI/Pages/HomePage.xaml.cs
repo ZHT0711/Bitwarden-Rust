@@ -128,19 +128,50 @@ public sealed partial class HomePage : Page
             }
             if (!IsCurrent(version, token)) return;
             _overview = result;
-            _requiresSync = false;
+            _requiresSync = result.ReadOnly;
             PopulateFolders();
             ApplyFilters();
-            SetNotice(result.Failures > 0 ? "保险库已加载，部分条目无法读取" : "保险库已加载",
-                $"共 {result.Items.Length} 个条目；上次同步 {result.LastSync.ToLocalTime():MM-dd HH:mm:ss}。" +
-                (result.Failures > 0 ? $" {result.Failures} 个条目或文件夹解析 / 解密失败。" : string.Empty),
-                result.Failures > 0 ? InfoBarSeverity.Warning : InfoBarSeverity.Success);
+            var count = $"共 {result.Items.Length} 个条目；上次同步 {result.LastSync.ToLocalTime():MM-dd HH:mm:ss}。" +
+                (result.Failures > 0 ? $" {result.Failures} 个条目或文件夹解析 / 解密失败。" : string.Empty);
+            if (result.ReadOnly)
+                SetNotice("本机保险库缓存（只读）", count + " 重新连接或成功同步后可编辑。", InfoBarSeverity.Informational);
+            else
+                SetNotice(result.Failures > 0 ? "保险库已加载，部分条目无法读取" : "保险库已加载",
+                    count, result.Failures > 0 ? InfoBarSeverity.Warning : InfoBarSeverity.Success);
         }
         catch (OperationCanceledException)
         {
             if (_loaded && version == _version) SetNotice("请求已取消", "你可以重新同步。", InfoBarSeverity.Informational);
         }
-        catch (VaultException error) { if (IsCurrent(version, token)) SetNotice("无法加载保险库", error.UserMessage, InfoBarSeverity.Error); }
+        catch (VaultException error)
+        {
+            if (IsCurrent(version, token) && forceSync)
+            {
+                try
+                {
+                    var cached = await Task.Run(RustCore.GetVaultOverview, token);
+                    if (!IsCurrent(version, token)) return;
+                    _overview = cached;
+                    _requiresSync |= cached.ReadOnly;
+                    PopulateFolders();
+                    ApplyFilters();
+                    SetNotice("同步失败，显示上次同步的数据", error.UserMessage, InfoBarSeverity.Warning);
+                    return;
+                }
+                catch (OperationCanceledException) { return; }
+                catch (VaultException cacheError)
+                {
+                    if (!IsCurrent(version, token)) return;
+                    if (cacheError.Code == "notSynced")
+                    {
+                        _overview = null;
+                        _requiresSync = true;
+                        PopulateFolders();
+                    }
+                }
+            }
+            if (IsCurrent(version, token)) SetNotice("无法加载保险库", error.UserMessage, InfoBarSeverity.Error);
+        }
         catch (Exception error) when (IsCoreUnavailable(error)) { if (IsCurrent(version, token)) SetNotice("核心不可用", "请重新构建或修复应用安装。", InfoBarSeverity.Error); }
         finally
         {

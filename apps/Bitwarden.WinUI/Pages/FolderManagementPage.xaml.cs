@@ -96,8 +96,9 @@ public sealed partial class FolderManagementPage : Page
             }
 
             if (!ReferenceEquals(_operation, operation)) return;
-            _requiresSync = false;
             ApplyOverview(overview);
+            if (overview.ReadOnly)
+                SetNotice("本机文件夹缓存（只读）", "重新连接或成功同步后可编辑。", InfoBarSeverity.Informational);
         }
         catch (OperationCanceledException) { }
         catch (VaultException error)
@@ -121,6 +122,7 @@ public sealed partial class FolderManagementPage : Page
 
     private void ApplyOverview(VaultOverview overview)
     {
+        _requiresSync = overview.ReadOnly;
         var counts = new Dictionary<string, int>();
         foreach (var item in overview.Items)
         {

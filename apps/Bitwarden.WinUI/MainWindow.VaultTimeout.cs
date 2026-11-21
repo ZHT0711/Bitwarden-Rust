@@ -47,6 +47,19 @@ public sealed partial class MainWindow
         };
     }
 
+    private VaultAccount[] ApplyRestartTimeouts(VaultAccount[] accounts)
+    {
+        var targets = new List<VaultAccountTimeout>();
+        foreach (var account in accounts)
+        {
+            var settings = VaultTimeoutStore.Load(TimeoutKey(account));
+            if (settings.Action == VaultTimeoutAction.LogOut && settings.EffectiveMode(
+                _windowsVaultEvents?.CanMonitorLock == true, _windowsVaultEvents?.CanMonitorSleep == true) == VaultTimeoutMode.AppRestart)
+                targets.Add(new(account.Id, LogOut: true));
+        }
+        return targets.Count == 0 ? accounts : RustCore.ApplyAccountTimeouts(targets.ToArray(), interrupt: true);
+    }
+
     private void RetainAccountTimeouts(VaultAccount[] accounts)
     {
         foreach (var id in _accountActivity.Keys.Where(id => accounts.All(account => account.Id != id)).ToArray())
@@ -187,6 +200,11 @@ public sealed partial class MainWindow
             return affectsActive;
         }
         catch (VaultException error) when (error.Code == "busy") { return false; }
+        catch (VaultException error) when (error.Code == "cacheRevocationFailed")
+        {
+            if (!_closed) WarnAboutAccountStorage("自动登出未完成", error.UserMessage);
+            return affectsActive;
+        }
         catch (Exception error) when (IsCoreUnavailable(error)) { return false; }
     }
 }

@@ -28,6 +28,7 @@ use bw_sdk_core::{
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum VaultError {
@@ -69,6 +70,8 @@ pub(crate) enum VaultError {
     AttachmentUploadFailed,
     #[error("attachmentFileRead")]
     AttachmentFileRead,
+    #[error("localStorage")]
+    LocalStorage,
     #[error("attachmentTooLarge")]
     AttachmentTooLarge,
     #[error("fileAccess")]
@@ -114,6 +117,7 @@ pub(crate) struct VaultOverview {
     folders: Vec<VaultFolder>,
     last_sync: String,
     failures: usize,
+    read_only: bool,
 }
 
 #[derive(Default)]
@@ -130,6 +134,23 @@ pub(crate) struct VaultCache {
     can_generate_totp: bool,
     write_uncertain: bool,
     write_started: bool,
+    user_id: Option<Uuid>,
+    local_read_only: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct EncryptedVaultState {
+    #[serde(default)]
+    user_id: Option<Uuid>,
+    ciphers: Vec<Cipher>,
+    folders: Vec<Folder>,
+    org_keys: Vec<(OrganizationId, UnsignedSharedKey)>,
+    encrypted_user_key: Option<String>,
+    last_sync: Option<String>,
+    parse_failures: usize,
+    can_archive: bool,
+    can_generate_totp: bool,
+    write_uncertain: bool,
 }
 
 #[derive(Serialize)]
@@ -183,6 +204,63 @@ fn passkey_summaries(view: &CipherView) -> Vec<VaultPasskey> {
 }
 
 impl VaultCache {
+    pub(crate) fn snapshot_state(&self) -> Result<EncryptedVaultState, VaultError> {
+        Ok(EncryptedVaultState {
+            user_id: self.user_id,
+            ciphers: self
+                .ciphers
+                .snapshot()
+                .map_err(|_| VaultError::LocalStorage)?
+                .into_values()
+                .collect(),
+            folders: self
+                .folders
+                .snapshot()
+                .map_err(|_| VaultError::LocalStorage)?,
+            org_keys: self.org_keys.clone(),
+            encrypted_user_key: self.encrypted_user_key.clone(),
+            last_sync: self.last_sync.clone(),
+            parse_failures: self.parse_failures,
+            can_archive: self.can_archive,
+            can_generate_totp: self.can_generate_totp,
+            write_uncertain: self.write_uncertain,
+        })
+    }
+
+    pub(crate) fn has_cached_snapshot(&self) -> bool {
+        self.last_sync.is_some()
+    }
+
+    pub(crate) fn from_saved_state(state: EncryptedVaultState) -> Result<Self, VaultError> {
+        if state.last_sync.is_some() && state.user_id.is_none() {
+            return Err(VaultError::LocalStorage);
+        }
+        let mut ciphers = HashMap::with_capacity(state.ciphers.len());
+        for cipher in state.ciphers {
+            let id = cipher.id.ok_or(VaultError::LocalStorage)?;
+            if ciphers.insert(id.to_string(), cipher).is_some() {
+                return Err(VaultError::LocalStorage);
+            }
+        }
+        Ok(Self {
+            user_id: state.user_id,
+            ciphers: Arc::new(CipherRepository::from(ciphers)),
+            folders: Arc::new(
+                FolderRepository::from_folders(state.folders)
+                    .map_err(|_| VaultError::LocalStorage)?,
+            ),
+            org_keys: state.org_keys,
+            encrypted_user_key: state.encrypted_user_key,
+            last_sync: state.last_sync,
+            parse_failures: state.parse_failures,
+            can_archive: state.can_archive,
+            can_generate_totp: state.can_generate_totp,
+            write_uncertain: state.write_uncertain,
+            local_read_only: true,
+            ..Self::default()
+        })
+    }
+
     /// The same encrypted map is used by this cache and the SDK's high-level write clients.
     /// Registration is synchronous, so a cancelled sync cannot partially replace SDK storage.
     pub(crate) fn activate(&self, client: &Client) {
@@ -194,6 +272,10 @@ impl VaultCache {
             .platform()
             .state()
             .register_client_managed(self.folders.clone());
+    }
+
+    pub(crate) fn is_read_only(&self) -> bool {
+        self.local_read_only
     }
 
     pub(crate) fn mark_write_uncertain(&mut self) {
@@ -324,15 +406,7 @@ impl VaultCache {
                 Err(_) => failures += 1,
             }
         }
-        // This client must report corrupted encrypted fields, rather than silently replacing
-        // them with empty strings. Preserve unrelated SDK flags when enabling strict decoding.
-        let mut flags: HashMap<String, bool> = serde_json::from_value(
-            serde_json::to_value(client.flags().get().await)
-                .map_err(|_| VaultError::InvalidResponse)?,
-        )
-        .map_err(|_| VaultError::InvalidResponse)?;
-        flags.insert("strict-cipher-decryption".to_owned(), true);
-        client.flags().load(flags).await;
+        Self::enable_strict_decryption(client).await?;
         let parsed_folders = api_folders
             .iter()
             .filter_map(|raw| {
@@ -353,6 +427,7 @@ impl VaultCache {
             .any(|org| org.users_get_premium.unwrap_or(false));
         let mut cache = Self {
             ciphers: Arc::new(CipherRepository::from(ciphers)),
+            user_id: Some(user_id),
             org_keys,
             parse_failures: failures + api_folders.len() - parsed_folder_count,
             folders,
@@ -385,8 +460,28 @@ impl VaultCache {
         }
     }
 
+    async fn enable_strict_decryption(client: &Client) -> Result<(), VaultError> {
+        // Report corrupted fields instead of replacing them with blank values.
+        let mut flags: HashMap<String, bool> = serde_json::from_value(
+            serde_json::to_value(client.flags().get().await)
+                .map_err(|_| VaultError::InvalidResponse)?,
+        )
+        .map_err(|_| VaultError::InvalidResponse)?;
+        flags.insert("strict-cipher-decryption".to_owned(), true);
+        client.flags().load(flags).await;
+        Ok(())
+    }
+
     pub(crate) async fn restore_overview(&mut self, client: &Client) -> Result<(), VaultError> {
+        if let Some(user_id) = self.user_id {
+            client
+                .internal
+                .init_user_id(bw_sdk_core::UserId::new(user_id))
+                .await
+                .map_err(|_| VaultError::InvalidResponse)?;
+        }
         if self.last_sync.is_some() && !self.write_uncertain {
+            Self::enable_strict_decryption(client).await?;
             client
                 .internal
                 .initialize_org_crypto(self.org_keys.clone())
@@ -488,6 +583,7 @@ impl VaultCache {
             folders,
             failures: failures + decryption_failures,
             last_sync,
+            read_only: self.local_read_only,
         });
         Ok(())
     }
@@ -528,6 +624,10 @@ impl VaultCache {
             .map_err(|_| VaultError::DecryptionFailed)?;
         let totp = self.take_totp(&mut view);
         let mut detail = display_detail(view);
+        if self.local_read_only {
+            detail.can_upload_attachments = false;
+            detail.can_delete_attachments = false;
+        }
         detail.totp = totp;
         Ok(detail)
     }

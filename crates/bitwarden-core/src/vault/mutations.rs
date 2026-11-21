@@ -294,8 +294,8 @@ impl VaultCache {
         })
     }
 
-    pub(super) fn ensure_synced(&self) -> Result<(), VaultError> {
-        if self.overview.is_none() || self.write_uncertain {
+    pub(crate) fn ensure_synced(&self) -> Result<(), VaultError> {
+        if self.overview.is_none() || self.write_uncertain || self.local_read_only {
             Err(VaultError::NotSynced)
         } else {
             Ok(())

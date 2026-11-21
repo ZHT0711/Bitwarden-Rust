@@ -181,7 +181,9 @@ pub unsafe extern "C" fn bw_passkey_respond(
             if !request.is_current() { return Err(VaultError::NotFound); }
             if is_vault_registration(&session.server, &request.operation) { return Err(VaultError::NotFound); }
             let runtime = runtime().ok_or(VaultError::Internal)?;
+            session.vault.ensure_synced()?;
             session.vault.reset_write_attempt();
+            let cache_write = request.operation.creating.then(|| super::CacheWrite::begin(session)).transpose()?;
             let result = catch_unwind(AssertUnwindSafe(|| runtime.block_on(async {
                 tokio::select! {
                     result = session.vault.perform_passkey(&session.client, &request.operation, &approval.item_id,
@@ -189,13 +191,22 @@ pub unsafe extern "C" fn bw_passkey_respond(
                     _ = async { while request.is_current() { tokio::time::sleep(std::time::Duration::from_millis(50)).await; } } => None,
                 }
             })));
+            let interrupted = !matches!(result, Ok(Some(_))) && session.vault.write_in_flight();
+            if interrupted {
+                session.vault.mark_write_uncertain();
+            }
+            if let Some(cache_write) = cache_write {
+                cache_write.finish(session, matches!(result, Ok(Some(Ok(_)))));
+            }
             match result {
                 Ok(Some(Ok(result))) => {
-                    runtime.block_on(passkey_provider::sync_metadata(&session.vault, &session.client));
+                    if request.operation.creating {
+                        runtime.block_on(passkey_provider::sync_metadata(&session.vault, &session.client));
+                    }
                     passkey_provider::encode_response(result)
                 }
-                Ok(Some(Err(e))) => Err(e),
-                _ if session.vault.write_in_flight() => { session.vault.mark_write_uncertain(); Err(VaultError::WriteUncertain) }
+                Ok(Some(Err(error))) => Err(error),
+                _ if interrupted => Err(VaultError::WriteUncertain),
                 _ => Err(VaultError::Internal),
             }
         })();

@@ -101,6 +101,13 @@ public sealed partial class MainWindow
             var accounts = await Task.Run(change);
             if (!_closed) ApplyAccountSnapshot(accounts);
         }
+        catch (VaultException error) when (error.Code == "cacheRevocationFailed")
+        {
+            // A failed disk cleanup may still have locked or removed accounts in memory.
+            var accounts = await Task.Run(RustCore.GetAccounts);
+            if (!_closed) ApplyAccountSnapshot(accounts);
+            throw;
+        }
         finally
         {
             _accountTransition = false;
@@ -158,6 +165,12 @@ public sealed partial class MainWindow
         var add = new MenuFlyoutItem { Text = "添加账户", Icon = new SymbolIcon(Symbol.Add), IsEnabled = _accounts.Length < 5 };
         add.Click += async (_, _) => await ShowSignInDialogAsync();
         menu.Items.Add(add);
+        if (ActiveAccount is { NeedsSignIn: true } accountToReconnect)
+        {
+            var reconnect = new MenuFlyoutItem { Text = "重新连接当前账户" };
+            reconnect.Click += async (_, _) => await ShowSignInDialogAsync(accountToReconnect);
+            menu.Items.Add(reconnect);
+        }
         var logout = new MenuFlyoutItem { Text = "退出当前账户" };
         logout.Click += async (_, _) => await RunAccountCommandAsync(() => { RustCore.Logout(); return RustCore.GetAccounts(); });
         menu.Items.Add(logout);
@@ -170,15 +183,21 @@ public sealed partial class MainWindow
         catch (VaultException error)
         {
             if (_closed) return;
-            await new ContentDialog
-            {
-                XamlRoot = NavView.XamlRoot,
-                Title = "无法切换账户",
-                Content = error.UserMessage,
-                CloseButtonText = "关闭",
-            }.ShowAsync();
+            await ShowAccountErrorAsync(error);
         }
         catch (Exception error) when (IsCoreUnavailable(error)) { }
+    }
+
+    private async Task ShowAccountErrorAsync(VaultException error)
+    {
+        if (_closed || NavView.XamlRoot is not { } root) return;
+        await new ContentDialog
+        {
+            XamlRoot = root,
+            Title = "账户操作未完成",
+            Content = error.UserMessage,
+            CloseButtonText = "关闭",
+        }.ShowAsync();
     }
 
     private async Task ShowUnlockDialogAsync()

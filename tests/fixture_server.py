@@ -15,12 +15,14 @@ import argparse
 import base64
 import copy
 import datetime as dt
+from email.message import Message
 from email.parser import BytesParser
 import http.client
 import ipaddress
 import json
 import os
 from pathlib import Path
+from typing import Any, cast
 import re
 import socket
 import threading
@@ -209,6 +211,7 @@ class FixtureState:
                 self._last_revision = max(self._last_revision, parse_date(folder["revisionDate"]))
             self.conflict_next_write = False
             self.drop_next_create_response = False
+            self.pause_next_create_response = False
             self.reject_folder_batch = False
             self.fail_second_folder_delete = False
             self.fail_next_single_folder_delete = False
@@ -224,10 +227,11 @@ class FixtureState:
             self.attachment_uploads = 0
             self.fail_next_sync = False
             self.pause_next_sync = False
+            self.duplicate_next_sync_cipher = False
             self.sync_requests = 0
             self.require_new_device_verification = False
             self.require_authenticator = False
-            self.challenged_device_identifier = None
+            self.challenged_device_identifier: str | None = None
 
     def revision(self) -> str:
         # Called while lock is held. Generated revisions stay at least two seconds apart.
@@ -306,7 +310,7 @@ class FixtureState:
 class FixtureServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
-    peer_port = None
+    peer_port: int | None = None
 
     def __init__(self, address: tuple[str, int], state: FixtureState):
         checked_bind(address[0])
@@ -319,10 +323,18 @@ class FixtureServer(ThreadingHTTPServer):
 
 
 class FixtureHandler(BaseHTTPRequestHandler):
-    server: FixtureServer
     protocol_version = "HTTP/1.0"
 
-    def log_message(self, *_):
+    @property
+    def fixture(self) -> FixtureServer:
+        return cast(FixtureServer, self.server)
+
+    def loopback_origin(self) -> str:
+        host, port = self.fixture.server_address[:2]
+        host = str(host)
+        return f"http://[{host}]:{port}" if ":" in host else f"http://{host}:{port}"
+
+    def log_message(self, format, *args):
         pass
 
     def reply(self, value: object = None, status: int = 200):
@@ -362,16 +374,17 @@ class FixtureHandler(BaseHTTPRequestHandler):
         return value
 
     def authorized(self) -> bool:
-        if self.headers.get("Authorization") == "Bearer " + self.server.state.token:
+        if self.headers.get("Authorization") == "Bearer " + self.fixture.state.token:
             return True
         self.fail("Only the synthetic fixture session is allowed.", 401)
         return False
 
     def do_GET(self):
         path = urlsplit(self.path).path
-        state = self.server.state
+        state = self.fixture.state
         if path == "/health":
-            self.reply({"fixture": True, **({"peerPort": self.server.peer_port} if self.server.peer_port else {})})
+            peer_port = self.fixture.peer_port
+            self.reply({"fixture": True, **({"peerPort": peer_port} if peer_port else {})})
             return
         if path == "/icons/example.com/icon.png":
             icon = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAIAAABvFaqvAAAAKklEQVR4nGMwD2ukCmIYNYh8g170OkIQHpFRg0YNGjVoOBpEKho1iDACAE0Rlr98kVxNAAAAAElFTkSuQmCC")
@@ -421,6 +434,9 @@ class FixtureHandler(BaseHTTPRequestHandler):
                 pause = state.pause_next_sync
                 state.pause_next_sync = False
                 response = state.sync()
+                if state.duplicate_next_sync_cipher:
+                    state.duplicate_next_sync_cipher = False
+                    response["ciphers"].extend(response["ciphers"][:1])
             if pause:
                 time.sleep(3)
             self.reply(response)
@@ -436,9 +452,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
                 cipher = state.ciphers.get(cipher_id.lower(), {})
                 if (attachment_id in state.attachment_blobs
                         and any(entry.get("id") == attachment_id for entry in cipher.get("attachments") or [])):
-                    host, port = self.server.server_address[:2]
-                    host = f"[{host}]" if ":" in host else host
-                    self.reply({"id": attachment_id, "url": f"http://{host}:{port}/fixture-attachments/{attachment_id}"})
+                    self.reply({"id": attachment_id, "url": f"{self.loopback_origin()}/fixture-attachments/{attachment_id}"})
                     return
         self.fail("Fixture route or cipher not found.", 404)
 
@@ -447,7 +461,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
         if body is None:
             return
         path = urlsplit(self.path).path
-        state = self.server.state
+        state = self.fixture.state
         if path in ("/identity/accounts/prelogin/password", "/identity/accounts/prelogin"):
             value = self.json_body(body)
             if value is not None:
@@ -510,6 +524,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
         controls = {
             "/control/conflict-next-write": "conflict_next_write",
             "/control/drop-next-write-response": "drop_next_create_response",
+            "/control/pause-next-write-response": "pause_next_create_response",
             "/control/reject-folder-batch": "reject_folder_batch",
             "/control/fail-second-folder-delete": "fail_second_folder_delete",
             "/control/fail-next-move-after-first": "fail_next_move_after_first",
@@ -521,6 +536,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
             "/control/azure-next-attachment-upload": "use_azure_attachment_upload",
             "/control/fail-next-sync": "fail_next_sync",
             "/control/pause-next-sync": "pause_next_sync",
+            "/control/duplicate-next-sync-cipher": "duplicate_next_sync_cipher",
             "/control/require-authenticator": "require_authenticator",
         }
         if path in controls:
@@ -553,7 +569,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
             return
         if path == "/control/stop":
             self.reply({"ok": True})
-            threading.Thread(target=self.server.shutdown, daemon=True).start()
+            threading.Thread(target=self.fixture.shutdown, daemon=True).start()
             return
         if not self.authorized():
             return
@@ -564,11 +580,16 @@ class FixtureHandler(BaseHTTPRequestHandler):
                 self.fail("Expected a multipart attachment upload.")
                 return
             message = BytesParser().parsebytes(b"Content-Type: " + content_type.encode() + b"\r\n\r\n" + body)
-            parts = message.get_payload() if message.is_multipart() else []
-            if len(parts) != 1 or parts[0].get_param("name", header="content-disposition") != "data":
+            parts = message.get_payload()
+            if (not isinstance(parts, list) or len(parts) != 1 or not isinstance(parts[0], Message)
+                    or parts[0].get_param("name", header="content-disposition") != "data"):
                 self.fail("Expected one encrypted data part.")
                 return
-            self.upload_attachment(attachment[1].lower(), attachment[2], parts[0].get_payload(decode=True), 204)
+            data = parts[0].get_payload(decode=True)
+            if not isinstance(data, bytes):
+                self.fail("Expected encrypted attachment bytes.")
+                return
+            self.upload_attachment(attachment[1].lower(), attachment[2], data, 204)
             return
         value = self.json_body(body)
         if value is None:
@@ -602,9 +623,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
                 state.use_azure_attachment_upload = False
                 if azure:
                     state.azure_slots[attachment_id] = cipher["id"]
-                    host, port = self.server.server_address[:2]
-                    host = f"[{host}]" if ":" in host else host
-                    target = f"http://{host}:{port}/fixture-upload/{attachment_id}?sv=2024-11-04"
+                    target = f"{self.loopback_origin()}/fixture-upload/{attachment_id}?sv=2024-11-04"
                 else:
                     target = f"/ciphers/{cipher['id']}/attachment/{attachment_id}"
                 self.reply({"attachmentId": attachment_id, "url": target,
@@ -631,7 +650,11 @@ class FixtureHandler(BaseHTTPRequestHandler):
                 return
             state.ciphers[cipher["id"]] = cipher
             drop = state.drop_next_create_response
+            pause = state.pause_next_create_response
             state.drop_next_create_response = False
+            state.pause_next_create_response = False
+        if pause:
+            time.sleep(20)  # Allows an integration test to terminate its client before acknowledgment.
         if drop:
             # Commit first, then lose the acknowledgment: callers must synchronize before retrying.
             self.close_connection = True
@@ -649,8 +672,8 @@ class FixtureHandler(BaseHTTPRequestHandler):
             return
         path = urlsplit(self.path).path
         azure_attachment = re.fullmatch(r"/fixture-upload/([a-zA-Z0-9_-]+)", path)
+        state = self.fixture.state
         if azure_attachment:
-            state = self.server.state
             with state.lock:
                 cipher_id = state.azure_slots.get(azure_attachment[1])
             if (cipher_id is None or self.headers.get("Authorization") or self.headers.get("Device-Identifier")
@@ -668,7 +691,6 @@ class FixtureHandler(BaseHTTPRequestHandler):
         if path == "/api/ciphers/move":
             ids = value.get("ids")
             folder_id = value.get("folderId")
-            state = self.server.state
             with state.lock:
                 if (not isinstance(ids, list) or not 1 <= len(ids) <= 500
                         or not all(isinstance(key, str) and key in state.ciphers for key in ids)
@@ -686,7 +708,6 @@ class FixtureHandler(BaseHTTPRequestHandler):
         folder_match = re.fullmatch(r"/api/folders/([0-9a-fA-F-]{36})", path)
         if folder_match:
             folder_id = folder_match.group(1).lower()
-            state = self.server.state
             with state.lock:
                 if folder_id not in state.folders:
                     self.fail("Synthetic folder not found.", 404)
@@ -704,7 +725,6 @@ class FixtureHandler(BaseHTTPRequestHandler):
             self.fail("Fixture route not found.", 404)
             return
         key, action = match.group(1).lower(), match.group(2)
-        state = self.server.state
         with state.lock:
             previous = state.ciphers.get(key)
             if previous is None:
@@ -760,7 +780,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         if not self.authorized():
             return
-        state = self.server.state
+        state = self.fixture.state
         path = urlsplit(self.path).path
         attachment = ATTACHMENT_PATH.fullmatch(path)
         if attachment:
@@ -834,7 +854,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
         self.reply(None, 204)
 
     def upload_attachment(self, cipher_id, attachment_id, contents, status):
-        state = self.server.state
+        state = self.fixture.state
         with state.lock:
             cipher = state.ciphers.get(cipher_id, {})
             attachment = next((entry for entry in cipher.get("attachments") or [] if entry["id"] == attachment_id), None)
@@ -879,7 +899,7 @@ def self_test() -> bool:
             self.server.server_close()
             self.thread.join(timeout=2)
 
-        def request(self, method, path, data=None, *, raw=None, authenticated=True, device_identifier=None):
+        def request(self, method, path, data=None, *, raw=None, authenticated=True, device_identifier=None) -> tuple[int, dict[str, Any]]:
             connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=3)
             headers = {"Content-Type": "application/json"}
             if authenticated:
@@ -891,7 +911,10 @@ def self_test() -> bool:
                 connection.request(method, path, body=body, headers=headers)
                 response = connection.getresponse()
                 body = response.read()
-                return response.status, json.loads(body) if body else None
+                value = json.loads(body) if body else {}
+                if not isinstance(value, dict):
+                    raise ValueError("Expected a fixture response object.")
+                return response.status, value
             finally:
                 connection.close()
 

@@ -9,6 +9,9 @@ internal static partial class RustCore
 {
     private const string LibraryName = "bitwarden_core.dll";
 
+    [DllImport(LibraryName, EntryPoint = "bw_local_cache_set_root", CallingConvention = CallingConvention.Cdecl)]
+    private static extern byte SetLocalCacheRootNative(IntPtr path);
+
     [DllImport(LibraryName, EntryPoint = "bw_core_version", CallingConvention = CallingConvention.Cdecl)]
     private static extern IntPtr GetVersionNative();
 
@@ -70,7 +73,7 @@ internal static partial class RustCore
     private static extern byte SessionStateNative();
 
     [DllImport(LibraryName, EntryPoint = "bw_auth_logout", CallingConvention = CallingConvention.Cdecl)]
-    private static extern void LogoutNative();
+    private static extern byte LogoutNative();
 
     [DllImport(LibraryName, EntryPoint = "bw_auth_lock", CallingConvention = CallingConvention.Cdecl)]
     private static extern byte LockNative();
@@ -178,6 +181,11 @@ internal static partial class RustCore
     private sealed record NativeResponse<T>(bool Ok, T? Data, string? Error);
 
     internal static string Version => Marshal.PtrToStringUTF8(GetVersionNative()) ?? "unknown";
+    internal static bool ConfigureLocalCache(string root)
+    {
+        using var buffer = new Utf8Buffer(root);
+        return SetLocalCacheRootNative(buffer.Pointer) != 0;
+    }
     internal static bool IsAuthenticated => IsAuthenticatedNative() != 0;
     internal static VaultSessionState SessionState => (VaultSessionState)SessionStateNative();
     internal static bool IsValidServer(uint serverMode, string serverUrl) => ValidateServerNative(serverMode, serverUrl) != 0;
@@ -212,8 +220,14 @@ internal static partial class RustCore
         return new AuthResult((AuthStatus)(result & 0xff), result >> 8);
     }
 
-    internal static void Logout() => LogoutNative();
+    internal static void Logout()
+    {
+        if (LogoutNative() == 0) throw new VaultException("cacheRevocationFailed");
+    }
     internal static bool Lock() => LockNative() != 0;
+
+    // Opening a new request supersedes any outstanding native operation.
+    internal static void CancelActiveRequest() => BeginAuthRequestNative();
 
     internal static void Unlock(string password, CancellationToken token)
     {

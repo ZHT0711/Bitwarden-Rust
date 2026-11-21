@@ -17,6 +17,15 @@ public sealed partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
+        try
+        {
+            if (!RustCore.ConfigureLocalCache(Windows.Storage.ApplicationData.Current.LocalFolder.Path))
+                WarnAboutAccountStorage("本机缓存不可用", "本次会话仍可在线使用，但关闭应用后可能无法恢复保险库。");
+        }
+        catch (Exception error) when (IsCoreUnavailable(error) || error is System.Runtime.InteropServices.COMException)
+        {
+            WarnAboutAccountStorage("本机缓存不可用", "请检查应用的安装和 Windows 本机数据目录。");
+        }
 
         ExtendsContentIntoTitleBar = true;
         SetTitleBar(AppTitleBar);
@@ -24,6 +33,18 @@ public sealed partial class MainWindow : Window
         AppWindow.SetIcon("Assets/AppIcon.ico");
         AccountSettingsScope.SignedOut += GeneratorPage.ResetSavedAlgorithm;
         InitializeVaultTimeout();
+        try
+        {
+            ApplyAccountSnapshot(ApplyRestartTimeouts(RustCore.GetAccounts()));
+            UpdateSessionControls(RustCore.SessionState);
+        }
+        catch (VaultException error) when (error.Code == "cacheRevocationFailed")
+        {
+            ApplyAccountSnapshot(RustCore.GetAccounts());
+            UpdateSessionControls(RustCore.SessionState);
+            WarnAboutAccountStorage("重启时自动登出未完成", error.UserMessage);
+        }
+        catch (Exception error) when (IsCoreUnavailable(error)) { }
         NavFrame.Navigated += NavFrame_Navigated;
         NavFrame.Navigate(typeof(HomePage), "vault");
         StartPasskeyProvider();
@@ -35,15 +56,31 @@ public sealed partial class MainWindow : Window
             _passkeyTimer?.Stop();
             ClearPasskeySensitiveState();
             _vaultTimeoutTimer?.Stop();
-            _windowsVaultEvents?.Dispose();
             _unlockRequest?.Cancel();
             if (NavFrame.Content is HomePage page) page.ClearSensitiveState();
             if (NavFrame.Content is FolderManagementPage folders) folders.ClearSensitiveState();
             if (NavFrame.Content is GeneratorPage generator) generator.ClearSensitiveState();
             WebsiteIcons.ClearCache();
             ClipboardCleaner.ClearOwned();
-            try { RustCore.LogoutAll(); } catch (Exception error) when (IsCoreUnavailable(error)) { }
+            try
+            {
+                RustCore.CancelActiveRequest();
+                _ = ApplyRestartTimeouts(RustCore.GetAccounts());
+            }
+            catch (Exception error) when (error is VaultException || IsCoreUnavailable(error)) { }
+            finally
+            {
+                try { RustCore.Shutdown(); } catch (Exception error) when (IsCoreUnavailable(error)) { }
+                _windowsVaultEvents?.Dispose();
+            }
         };
+    }
+
+    private void WarnAboutAccountStorage(string title, string message)
+    {
+        AccountWarning.Title = title;
+        AccountWarning.Message = message;
+        AccountWarning.IsOpen = true;
     }
 
     private void TitleBar_PaneToggleRequested(TitleBar sender, object args)
@@ -180,7 +217,7 @@ public sealed partial class MainWindow : Window
 
     private bool _signInDialogOpen;
 
-    private async Task ShowSignInDialogAsync()
+    private async Task ShowSignInDialogAsync(VaultAccount? reconnect = null)
     {
         if (_signInDialogOpen || _accountTransition)
         {
@@ -193,7 +230,7 @@ public sealed partial class MainWindow : Window
         var changed = false;
         try
         {
-            var authenticated = await ShowSignInDialogCoreAsync();
+            var authenticated = await ShowSignInDialogCoreAsync(reconnect);
             if (!_closed)
             {
                 if (!authenticated)
@@ -204,7 +241,8 @@ public sealed partial class MainWindow : Window
                 var accounts = await Task.Run(RustCore.GetAccounts);
                 if (!_closed)
                 {
-                    changed = previous?.Id != accounts.FirstOrDefault(account => account.Active)?.Id;
+                    var current = accounts.FirstOrDefault(account => account.Active);
+                    changed = previous?.Id != current?.Id || previous?.NeedsSignIn != current?.NeedsSignIn;
                     if (changed) ClearActiveAccountContents(cancelPasskeys: previous is not null);
                     ApplyAccountSnapshot(accounts);
                 }
@@ -227,10 +265,10 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    private async Task<bool> ShowSignInDialogCoreAsync()
+    private async Task<bool> ShowSignInDialogCoreAsync(VaultAccount? reconnect)
     {
         var added = false;
-        var environment = LoginEnvironment.Load();
+        var environment = reconnect is null ? LoginEnvironment.Load() : new LoginEnvironment(reconnect.ServerMode, reconnect.ServerUrl);
         var serverBox = new ComboBox
         {
             Name = "ServerRegion",
@@ -242,6 +280,7 @@ public sealed partial class MainWindow : Window
                 new ComboBoxItem { Content = "自托管 / 自定义服务器", Tag = 2u },
             },
             SelectedIndex = (int)environment.Mode,
+            IsEnabled = reconnect is null,
         };
         var serverUrlBox = new TextBox
         {
@@ -249,6 +288,7 @@ public sealed partial class MainWindow : Window
             Header = "服务器 URL",
             PlaceholderText = "https://vault.example.com",
             Text = environment.CustomUrl,
+            IsReadOnly = reconnect is not null,
             Visibility = environment.Mode == 2 ? Visibility.Visible : Visibility.Collapsed,
         };
         var serverHelp = new TextBlock
@@ -257,7 +297,8 @@ public sealed partial class MainWindow : Window
             TextWrapping = TextWrapping.Wrap,
             Visibility = serverUrlBox.Visibility,
         };
-        var emailBox = new TextBox { Header = "电子邮箱", PlaceholderText = "name@example.com" };
+        var emailBox = new TextBox { Header = "电子邮箱", PlaceholderText = "name@example.com",
+            Text = reconnect?.Email ?? string.Empty, IsReadOnly = reconnect is not null };
         var passwordBox = new PasswordBox { Header = "主密码", PlaceholderText = "输入 Bitwarden 主密码" };
         var providerBox = new ComboBox { Header = "二步验证方式", Visibility = Visibility.Collapsed, HorizontalAlignment = HorizontalAlignment.Stretch };
         var tokenBox = new TextBox { Header = "验证码", PlaceholderText = "输入一次性验证码", Visibility = Visibility.Collapsed };
@@ -275,7 +316,7 @@ public sealed partial class MainWindow : Window
 
         var dialog = new ContentDialog
         {
-            Title = "登录 Bitwarden",
+            Title = reconnect is null ? "登录 Bitwarden" : "重新连接当前账户",
             Content = new ScrollViewer { Content = content, VerticalScrollBarVisibility = ScrollBarVisibility.Auto },
             PrimaryButtonText = "登录",
             CloseButtonText = "取消",
@@ -302,7 +343,8 @@ public sealed partial class MainWindow : Window
         {
             busy = value;
             progress.Visibility = value ? Visibility.Visible : Visibility.Collapsed;
-            serverBox.IsEnabled = serverUrlBox.IsEnabled = !value;
+            serverBox.IsEnabled = !value && reconnect is null;
+            serverUrlBox.IsEnabled = !value;
             emailBox.IsEnabled = passwordBox.IsEnabled = !value;
             providerBox.IsEnabled = tokenBox.IsEnabled = !value;
             deviceOtpBox.IsEnabled = sendEmailButton.IsEnabled = resendDeviceOtpButton.IsEnabled = !value;

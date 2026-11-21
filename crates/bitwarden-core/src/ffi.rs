@@ -23,6 +23,8 @@ use bw_sdk_core::{
     key_management::MasterPasswordAuthenticationData,
     Client, ClientBuilder,
 };
+#[cfg(windows)]
+use serde::{Deserialize, Serialize};
 use url::Url;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -31,6 +33,8 @@ mod passkeys;
 
 use crate::auth_request::{self, RequestError};
 use crate::protocol_compat::{self, ResponseKind, SyncCompatibility};
+#[cfg(windows)]
+use crate::vault::EncryptedVaultState;
 use crate::vault::{VaultCache, VaultEditorData, VaultError, VaultMutationResult, VaultTotp};
 mod accounts;
 use accounts::AuthAccounts;
@@ -64,7 +68,7 @@ struct AuthServer {
     self_hosted: bool,
 }
 
-struct AuthSession {
+pub(super) struct AuthSession {
     account_id: uuid::Uuid,
     email: String,
     server_mode: u32,
@@ -77,6 +81,7 @@ struct AuthSession {
     unlock_data: Option<PasswordLoginUnlockData>,
     vault: VaultCache,
     open_detail: Option<OpenDetail>,
+    offline_only: bool,
 }
 
 struct OpenDetail {
@@ -87,6 +92,49 @@ struct OpenDetail {
     has_attachments: bool,
 }
 
+#[cfg(windows)]
+#[derive(PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedUnlockData {
+    master_password: bw_sdk_core::key_management::MasterPasswordUnlockData,
+    account:
+        bw_sdk_core::key_management::account_cryptographic_state::WrappedAccountCryptographicState,
+}
+
+#[cfg(windows)]
+impl From<&PasswordLoginUnlockData> for PersistedUnlockData {
+    fn from(value: &PasswordLoginUnlockData) -> Self {
+        Self {
+            master_password: value.master_password.clone(),
+            account: value.account.clone(),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl From<PersistedUnlockData> for PasswordLoginUnlockData {
+    fn from(value: PersistedUnlockData) -> Self {
+        Self {
+            master_password: value.master_password,
+            account: value.account,
+        }
+    }
+}
+
+#[cfg(windows)]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedVaultEnvelope {
+    version: u8,
+    email: String,
+    server_mode: u32,
+    server_url: String,
+    device_identifier: String,
+    account_id: uuid::Uuid,
+    unlock_data: Option<PersistedUnlockData>,
+    state: EncryptedVaultState,
+}
+
 impl AuthSession {
     fn clear_vault_keys(&mut self) -> bool {
         self.open_detail = None;
@@ -95,6 +143,183 @@ impl AuthSession {
             self.client.internal.get_key_store().clear()
         }))
         .is_ok()
+    }
+
+    #[cfg(windows)]
+    fn restore_local_vault(&mut self, runtime: &tokio::runtime::Runtime) {
+        let identity = local_cache_identity(self);
+        let Some(encoded) = crate::local_cache::load(&identity) else {
+            return;
+        };
+        let pending_write = crate::local_cache::has_pending(&identity);
+        let Ok(envelope) = serde_json::from_slice::<PersistedVaultEnvelope>(&encoded) else {
+            crate::local_cache::remove(&identity);
+            return;
+        };
+        if envelope.version != 2 || envelope.email != self.email {
+            crate::local_cache::remove(&identity);
+            return;
+        }
+        self.account_id = envelope.account_id;
+        let (Some(saved_unlock), Some(current_unlock)) = (
+            envelope.unlock_data,
+            self.unlock_data.as_ref().map(PersistedUnlockData::from),
+        ) else {
+            crate::local_cache::remove(&identity);
+            return;
+        };
+        if saved_unlock != current_unlock {
+            crate::local_cache::remove(&identity);
+            return;
+        }
+        let Ok(mut cache) = VaultCache::from_saved_state(envelope.state) else {
+            crate::local_cache::remove(&identity);
+            return;
+        };
+        if pending_write {
+            cache.mark_write_uncertain();
+        }
+        if runtime
+            .block_on(cache.restore_overview(&self.client))
+            .is_ok()
+        {
+            // Install the SDK repositories only after the cached overview is validated.
+            cache.activate(&self.client);
+            // Even after fresh login, writes require a fresh server snapshot.
+            self.vault = cache;
+        } else {
+            crate::local_cache::remove(&identity);
+        }
+    }
+}
+
+#[cfg(windows)]
+pub(super) fn restore_persisted_sessions(limit: usize) -> Vec<AuthSession> {
+    let mut sessions = crate::local_cache::entries()
+        .filter_map(|(digest, encoded)| {
+            let pending_write = crate::local_cache::has_pending_digest(&digest);
+            let envelope = serde_json::from_slice::<PersistedVaultEnvelope>(&encoded).ok()?;
+            if envelope.version != 2 || envelope.email != envelope.email.trim().to_lowercase() {
+                return None;
+            }
+            let server = auth_server(envelope.server_mode, &envelope.server_url)?;
+            if crate::local_cache::account_digest(&format!(
+                "{}\n{}",
+                server.api_url, envelope.email
+            )) != digest
+                || uuid::Uuid::parse_str(&envelope.device_identifier).is_err()
+            {
+                return None;
+            }
+            let unlock_data = envelope.unlock_data.map(PasswordLoginUnlockData::from)?;
+            let mut vault = VaultCache::from_saved_state(envelope.state).ok()?;
+            if pending_write {
+                vault.mark_write_uncertain();
+            }
+            if !vault.has_cached_snapshot() {
+                return None;
+            }
+            let middleware = Arc::new(DeviceLoginMiddleware::new(
+                envelope.device_identifier.clone(),
+            ));
+            Some(AuthSession {
+                account_id: envelope.account_id,
+                email: envelope.email,
+                server_mode: envelope.server_mode,
+                server_url: envelope.server_url,
+                state: SESSION_LOCKED,
+                server: server.clone(),
+                device_identifier: envelope.device_identifier,
+                client: build_auth_client(&server, middleware.clone()),
+                device_login_middleware: middleware,
+                unlock_data: Some(unlock_data),
+                vault,
+                open_detail: None,
+                offline_only: true,
+            })
+        })
+        .take(limit)
+        .collect::<Vec<_>>();
+    sessions.sort_by(|left, right| {
+        left.email
+            .cmp(&right.email)
+            .then_with(|| left.server.api_url.cmp(&right.server.api_url))
+    });
+    sessions
+}
+
+#[cfg(windows)]
+fn local_cache_identity(session: &AuthSession) -> String {
+    format!("{}\n{}", session.server.api_url, session.email)
+}
+
+#[cfg(windows)]
+fn remove_cached_vault(session: &AuthSession) -> bool {
+    crate::local_cache::remove(&local_cache_identity(session))
+}
+
+#[cfg(windows)]
+fn persist_cached_vault(session: &AuthSession) {
+    if !crate::local_cache::is_configured() || !session.vault.has_cached_snapshot() {
+        return;
+    }
+    let Some(unlock_data) = session.unlock_data.as_ref() else {
+        return;
+    };
+    let Ok(state) = session.vault.snapshot_state() else {
+        return;
+    };
+    let envelope = PersistedVaultEnvelope {
+        version: 2,
+        email: session.email.clone(),
+        server_mode: session.server_mode,
+        server_url: session.server_url.clone(),
+        device_identifier: session.device_identifier.clone(),
+        account_id: session.account_id,
+        unlock_data: Some(unlock_data.into()),
+        state,
+    };
+    let Ok(encoded) = serde_json::to_vec(&envelope).map(Zeroizing::new) else {
+        return;
+    };
+    let identity = local_cache_identity(session);
+    if crate::local_cache::save(&identity, &encoded) {
+        crate::local_cache::clear_pending(&identity);
+    }
+}
+
+#[cfg(windows)]
+struct CacheWrite {
+    new_marker: bool,
+}
+
+#[cfg(windows)]
+impl CacheWrite {
+    fn begin(session: &AuthSession) -> Result<Self, VaultError> {
+        use crate::local_cache;
+
+        if !session.vault.has_cached_snapshot() || !local_cache::is_configured() {
+            return Ok(Self { new_marker: false });
+        }
+        let identity = local_cache_identity(session);
+        // An older marker may represent a confirmed write whose snapshot could not be saved.
+        let new_marker = !local_cache::has_pending(&identity);
+        if !local_cache::mark_pending(&identity) {
+            return Err(VaultError::LocalStorage);
+        }
+        Ok(Self { new_marker })
+    }
+
+    fn finish(self, session: &AuthSession, snapshot_changed: bool) {
+        if session.vault.needs_reconciliation() {
+            // Keep the last confirmed snapshot and the durable marker; don't save partial state.
+            return;
+        }
+        if snapshot_changed {
+            persist_cached_vault(session);
+        } else if self.new_marker {
+            crate::local_cache::clear_pending(&local_cache_identity(session));
+        }
     }
 }
 
@@ -330,6 +555,7 @@ fn auth_client_for_server<'a>(
             unlock_data: None,
             vault: VaultCache::default(),
             open_detail: None,
+            offline_only: false,
         });
     }
 
@@ -581,9 +807,7 @@ pub unsafe extern "C" fn bw_auth_login(
         let Some(runtime) = runtime() else {
             return AUTH_FAILED;
         };
-        let mut session = auth_client()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut session = accounts::sessions();
         if !auth_request::is_current(request_id) {
             return AUTH_CANCELLED;
         }
@@ -618,6 +842,8 @@ pub unsafe extern "C" fn bw_auth_login(
                             .expect("successful login has a client");
                         authenticated.unlock_data = unlock_data;
                         authenticated.state = SESSION_UNLOCKED;
+                        #[cfg(windows)]
+                        authenticated.restore_local_vault(runtime);
                         session.activate(authenticated);
                     }
                     login_status(Ok(response))
@@ -678,9 +904,7 @@ pub unsafe extern "C" fn bw_auth_send_two_factor_email(
 
         let result = catch_unwind(AssertUnwindSafe(|| {
             let runtime = runtime().ok_or(())?;
-            let mut session = auth_client()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut session = accounts::sessions();
             if let Err(status) = session.can_login(&server, &request.0.email) {
                 return Ok(status as u8);
             }
@@ -752,9 +976,7 @@ pub unsafe extern "C" fn bw_auth_resend_new_device_verification(
 
         let result = catch_unwind(AssertUnwindSafe(|| -> Result<u8, ()> {
             let runtime = runtime().ok_or(())?;
-            let mut session = auth_client()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut session = accounts::sessions();
             if let Err(status) = session.can_login(&server, &email) {
                 return Ok(status as u8);
             }
@@ -852,6 +1074,23 @@ pub unsafe extern "C" fn bw_auth_unlock(password: *const c_char, request_id: u64
             runtime.block_on(auth_request::run(request_id, async {
                 keys.unlock(&session.client, &password)
                     .map_err(|_| VaultError::WrongPassword)?;
+                if session.offline_only {
+                    #[cfg(windows)]
+                    session
+                        .client
+                        .platform()
+                        .state()
+                        .value::<bw_sdk_core::client::persisted_state::USER_LOGIN_METHOD>()
+                        .set(
+                            bw_sdk_core::client::login_method::UserLoginMethod::Username {
+                                client_id: "web".to_owned(), // Mirrors the SDK password flow.
+                                email: keys.master_password.salt.clone(),
+                                kdf: keys.master_password.kdf.clone(),
+                            },
+                        )
+                        .await
+                        .map_err(|_| VaultError::Internal)?;
+                }
                 session.vault.restore_overview(&session.client).await
             }))
         }));
@@ -931,13 +1170,28 @@ pub extern "C" fn bw_vault_sync(request_id: u64) -> *mut c_char {
         else {
             return vault_access_error();
         };
-        match runtime.block_on(auth_request::run(
-            request_id,
-            VaultCache::fetch(&session.client, &mut session.unlock_data),
-        )) {
-            Ok(Ok(cache)) if auth_request::is_current(request_id) => {
+        if session.offline_only {
+            return vault_error("signInRequired");
+        }
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            runtime.block_on(auth_request::run(
+                request_id,
+                VaultCache::fetch(&session.client, &mut session.unlock_data),
+            ))
+        }));
+        // Sync can discover key rotation before rejecting other data or being cancelled.
+        // Revocation must not depend on installing the replacement overview.
+        #[cfg(windows)]
+        if session.unlock_data.is_none() && !remove_cached_vault(session) {
+            return vault_error("cacheRevocationFailed");
+        }
+        match result {
+            Ok(Ok(Ok(cache))) if auth_request::is_current(request_id) => {
                 cache.activate(&session.client);
                 session.vault = cache;
+                session.open_detail = None;
+                #[cfg(windows)]
+                persist_cached_vault(session);
                 #[cfg(windows)]
                 runtime.block_on(crate::passkey_provider::sync_metadata(
                     &session.vault,
@@ -950,9 +1204,10 @@ pub extern "C" fn bw_vault_sync(request_id: u64) -> *mut c_char {
                         .expect("successful sync has an overview"),
                 )
             }
-            Ok(Ok(_)) | Err(RequestError::Cancelled) => vault_error("cancelled"),
-            Err(RequestError::TimedOut) => vault_error("timedOut"),
-            Ok(Err(error)) => vault_error(&error.to_string()),
+            Ok(Ok(Ok(_))) | Ok(Err(RequestError::Cancelled)) => vault_error("cancelled"),
+            Ok(Err(RequestError::TimedOut)) => vault_error("timedOut"),
+            Ok(Ok(Err(error))) => vault_error(&error.to_string()),
+            Err(_) => vault_error("internal"),
         }
     }))
     .unwrap_or_else(|_| vault_error("internal"))
@@ -992,8 +1247,8 @@ pub unsafe extern "C" fn bw_vault_detail(
             Ok(Ok(mut detail)) if auth_request::is_current(request_id) => {
                 // Reuse this authorization only for the currently open item. The cache remains encrypted.
                 let has_totp = matches!(detail.totp, Some(VaultTotp::Ready { .. }));
-                let has_attachments =
-                    !detail.attachment_files.is_empty() || detail.can_upload_attachments;
+                let has_attachments = !session.vault.is_read_only()
+                    && (!detail.attachment_files.is_empty() || detail.can_upload_attachments);
                 detail.totp_request_id = has_totp.then_some(request_id);
                 detail.attachment_request_id = has_attachments.then_some(request_id);
                 session.open_detail = (has_totp || has_attachments).then(|| OpenDetail {
@@ -1203,7 +1458,15 @@ fn perform_vault_write(command: VaultWriteCommand, request_id: u64) -> *mut c_ch
         else {
             return vault_access_error();
         };
+        if let Err(error) = session.vault.ensure_synced() {
+            return vault_error(&error.to_string());
+        }
         session.vault.reset_write_attempt();
+        #[cfg(windows)]
+        let cache_write = match CacheWrite::begin(session) {
+            Ok(write) => write,
+            Err(error) => return vault_error(&error.to_string()),
+        };
         let upload = matches!(&command, VaultWriteCommand::UploadAttachment(_));
         let mut pending_upload = None;
         #[cfg(windows)]
@@ -1292,6 +1555,8 @@ fn perform_vault_write(command: VaultWriteCommand, request_id: u64) -> *mut c_ch
                 runtime.block_on(auth_request::run(request_id, write))
             }
         }));
+        #[cfg(windows)]
+        let rolled_back_upload = pending_upload.is_some();
         if let Some(pending) = pending_upload {
             // Once the upload future stops, rollback only the slot created by this request.
             let recovered = catch_unwind(AssertUnwindSafe(|| {
@@ -1306,6 +1571,15 @@ fn perform_vault_write(command: VaultWriteCommand, request_id: u64) -> *mut c_ch
             }
             session.open_detail = None;
         }
+        let interrupted = matches!(result, Ok(Err(_)) | Err(_)) && session.vault.write_in_flight();
+        if interrupted {
+            session.vault.mark_write_uncertain();
+        }
+        #[cfg(windows)]
+        cache_write.finish(
+            session,
+            rolled_back_upload || matches!(result, Ok(Ok(Ok(_)))),
+        );
         match result {
             // An acknowledged success is authoritative even if cancellation races its return.
             Ok(Ok(Ok(result))) => {
@@ -1319,10 +1593,7 @@ fn perform_vault_write(command: VaultWriteCommand, request_id: u64) -> *mut c_ch
                 vault_write_success(&result)
             }
             Ok(Ok(Err(error))) => vault_error(&error.to_string()),
-            _ if session.vault.write_in_flight() => {
-                session.vault.mark_write_uncertain();
-                vault_error("writeUncertain")
-            }
+            _ if interrupted => vault_error("writeUncertain"),
             Ok(Err(RequestError::Cancelled)) => vault_error("cancelled"),
             Ok(Err(RequestError::TimedOut)) => vault_error("timedOut"),
             Err(_) => vault_error("internal"),

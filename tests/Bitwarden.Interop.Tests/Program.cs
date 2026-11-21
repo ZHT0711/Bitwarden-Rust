@@ -3,6 +3,17 @@ using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 
+static void UseNativeLibrary(string libraryPath) =>
+    NativeLibrary.SetDllImportResolver(typeof(RustCore).Assembly, (name, _, _) =>
+        name == "bitwarden_core.dll" ? NativeLibrary.Load(libraryPath) : IntPtr.Zero);
+
+if (args is ["--cache-child", _, _, _, _, _])
+{
+    UseNativeLibrary(Path.GetFullPath(args[1]));
+    await LocalCacheChecks.ChildAsync(args);
+    return;
+}
+
 var count = 0;
 void Check(bool result, string name)
 {
@@ -35,8 +46,7 @@ Check(VaultQuery.Apply(mixed, "vault", "*", "no match").Length == 0, "unmatched 
 if (args.Length > 0)
 {
     var libraryPath = Path.GetFullPath(args[0]);
-    NativeLibrary.SetDllImportResolver(typeof(RustCore).Assembly, (name, _, _) =>
-        name == "bitwarden_core.dll" ? NativeLibrary.Load(libraryPath) : IntPtr.Zero);
+    UseNativeLibrary(libraryPath);
     Check(RustCore.Version == "0.2.0", "managed interop loads current native core");
     Check(RustCore.GeneratePassword(24, true, true, true, true, false, 2, 2).Length == 24, "password generator ABI");
     Check(RustCore.IsValidServer(2, "http://127.0.0.1:23456"), "loopback server validation ABI");
@@ -57,6 +67,10 @@ if (args.Length > 0)
         Check(!RustCore.IsAuthenticated, "cancelled login leaves no authenticated session");
     }
     finally { cancellation.Cancel(); listener.Stop(); RustCore.Logout(); }
-    if (args.Length > 1) await NativeLifecycle.RunAsync(args[1], Check);
+    if (args.Length > 1)
+    {
+        await NativeLifecycle.RunAsync(args[1], Check);
+        await LocalCacheChecks.RunAsync(libraryPath, args[1], Check);
+    }
 }
 Console.WriteLine($"{count} checks passed.");
