@@ -11,6 +11,8 @@ internal static partial class RustCore
     private static extern IntPtr FolderRenameNative(IntPtr id, IntPtr name, ulong requestId);
     [DllImport(LibraryName, EntryPoint = "bw_folders_delete", CallingConvention = CallingConvention.Cdecl)]
     private static extern IntPtr FoldersDeleteNative(IntPtr ids, ulong requestId);
+    [DllImport(LibraryName, EntryPoint = "bw_vault_move_items", CallingConvention = CallingConvention.Cdecl)]
+    private static extern IntPtr VaultMoveItemsNative(IntPtr data, ulong requestId);
 
     internal static VaultMutationResult CreateFolder(string name, CancellationToken token)
     {
@@ -29,5 +31,11 @@ internal static partial class RustCore
     {
         using var idsBuffer = new Utf8Buffer(JsonSerializer.Serialize(ids));
         return RunVaultRequest<VaultMutationResult>(requestId => FoldersDeleteNative(idsBuffer.Pointer, requestId), token, acknowledgedWrite: true);
+    }
+
+    internal static VaultMutationResult MoveVaultItems(string[] ids, string? folderId, CancellationToken token)
+    {
+        using var data = new Utf8Buffer(JsonSerializer.Serialize(new { ids, folderId }));
+        return RunVaultRequest<VaultMutationResult>(requestId => VaultMoveItemsNative(data.Pointer, requestId), token, acknowledgedWrite: true);
     }
 }

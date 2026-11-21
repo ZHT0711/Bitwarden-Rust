@@ -8,10 +8,13 @@ namespace Bitwarden_WinUI.Pages;
 
 public sealed partial class HomePage : Page
 {
+    internal sealed record FolderNavigation(string Id);
+
     public event EventHandler? SignInRequested;
     private VaultOverview? _overview;
     private string _category = "vault";
     private string _query = string.Empty;
+    private string? _initialFolderId;
     private bool _loaded;
     private bool _syncing;
     private int _version;
@@ -29,6 +32,7 @@ public sealed partial class HomePage : Page
     protected override void OnNavigatedTo(NavigationEventArgs e)
     {
         _category = e.Parameter as string ?? "vault";
+        _initialFolderId = (e.Parameter as FolderNavigation)?.Id;
         (PageTitle.Text, PageSubtitle.Text) = _category switch
         {
             "favorites" => ("收藏夹", "你标记为收藏的保险库条目。"),
@@ -74,10 +78,13 @@ public sealed partial class HomePage : Page
         _version++;
         CancelOperation();
         _overview = null;
+        _initialFolderId = null;
         _editorOpen = false;
+        _selectingItems = false;
         _requiresSync = false;
         _syncing = false;
         VaultList.ItemsSource = null;
+        VaultList.SelectionMode = ListViewSelectionMode.Single;
         foreach (var field in DetailPanel.Children.OfType<StackPanel>())
         {
             foreach (var box in field.Children.OfType<Grid>().SelectMany(row => row.Children.OfType<PasswordBox>()))
@@ -143,7 +150,8 @@ public sealed partial class HomePage : Page
 
     private void PopulateFolders()
     {
-        var selected = (FolderFilter.SelectedItem as ComboBoxItem)?.Tag as string;
+        var selected = _initialFolderId ?? (FolderFilter.SelectedItem as ComboBoxItem)?.Tag as string;
+        if (_overview is not null) _initialFolderId = null;
         FolderFilter.Items.Clear();
         FolderFilter.Items.Add(new ComboBoxItem { Content = "所有文件夹", Tag = "*" });
         FolderFilter.Items.Add(new ComboBoxItem { Content = "无文件夹", Tag = "" });
@@ -165,6 +173,11 @@ public sealed partial class HomePage : Page
     private async void VaultList_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         if (_syncing || _editorOpen) return;
+        if (_selectingItems)
+        {
+            UpdateMutationCommands();
+            return;
+        }
         if (VaultList.SelectedItem is not VaultItem item)
         {
             CancelOperation();

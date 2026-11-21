@@ -16,6 +16,8 @@
                 <AppBarButton x:Name="NewItemButton" Icon="Add" Label="新增" Click="NewItem_Click" IsEnabled="False" />
                 <AppBarButton x:Name="EditItemButton" Icon="Edit" Label="编辑" Click="EditItem_Click" IsEnabled="False" />
                 <CommandBar.SecondaryCommands>
+                    <AppBarButton x:Name="SelectItemsButton" Label="批量选择" Click="SelectItems_Click" IsEnabled="False" />
+                    <AppBarButton x:Name="MoveItemsButton" Icon="Folder" Label="移动到文件夹" Click="MoveItems_Click" IsEnabled="False" />
                     <AppBarButton x:Name="FavoriteItemButton" Icon="Favorite" Label="收藏" Tag="favorite" Click="ItemAction_Click" IsEnabled="False" />
                     <AppBarButton x:Name="ArchiveItemButton" Icon="Folder" Label="归档" Tag="archive" Click="ItemAction_Click" IsEnabled="False" />
                     <AppBarButton x:Name="TrashItemButton" Icon="Delete" Label="移至回收站" Tag="trash" Click="ItemAction_Click" IsEnabled="False" />

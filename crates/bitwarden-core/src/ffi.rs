@@ -12,7 +12,7 @@ use bitwarden_auth::token_management::PasswordManagerTokenHandler;
 use bitwarden_generators::{
     GeneratorClient, GeneratorClientsExt, PassphraseGeneratorRequest, PasswordGeneratorRequest,
 };
-use bitwarden_vault::FolderId;
+use bitwarden_vault::{CipherId, FolderId};
 use bw_sdk_core::{
     auth::login::{
         LoginError, PasswordLoginRequest, PasswordLoginUnlockData, TwoFactorProvider,
@@ -1101,6 +1101,7 @@ enum VaultWriteCommand {
         name: String,
     },
     DeleteFolders(Vec<FolderId>),
+    MoveItems(VaultItemMove),
     Action {
         id: String,
         action: String,
@@ -1152,6 +1153,12 @@ fn perform_vault_write(command: VaultWriteCommand, request_id: u64) -> *mut c_ch
                     }
                     VaultWriteCommand::DeleteFolders(ids) => {
                         session.vault.delete_folders(&session.client, ids).await
+                    }
+                    VaultWriteCommand::MoveItems(args) => {
+                        session
+                            .vault
+                            .move_items(&session.client, args.ids, args.folder_id)
+                            .await
                     }
                     VaultWriteCommand::Action {
                         id,
@@ -1272,6 +1279,27 @@ pub unsafe extern "C" fn bw_folders_delete(ids: *const c_char, request_id: u64) 
             return vault_error("validation");
         };
         perform_vault_write(VaultWriteCommand::DeleteFolders(ids), request_id)
+    }))
+    .unwrap_or_else(|_| vault_error("internal"))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VaultItemMove {
+    ids: Vec<CipherId>,
+    folder_id: Option<FolderId>,
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn bw_vault_move_items(data: *const c_char, request_id: u64) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(data) = (unsafe { read_utf8(data) }) else {
+            return vault_error("validation");
+        };
+        let Ok(args) = serde_json::from_str(&data) else {
+            return vault_error("validation");
+        };
+        perform_vault_write(VaultWriteCommand::MoveItems(args), request_id)
     }))
     .unwrap_or_else(|_| vault_error("internal"))
 }

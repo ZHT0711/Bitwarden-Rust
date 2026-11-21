@@ -29,8 +29,11 @@
                         <DataTemplate>
                             <Grid Padding="10,12" ColumnSpacing="14" ColumnDefinitions="*,Auto,Auto">
                                 <StackPanel Spacing="4" VerticalAlignment="Center">
-                                    <TextBlock Text="{Binding Name}" Style="{StaticResource BodyStrongTextBlockStyle}"
-                                        TextTrimming="CharacterEllipsis" />
+                                    <HyperlinkButton Padding="0" HorizontalAlignment="Stretch" HorizontalContentAlignment="Left"
+                                        Tag="{Binding}" Click="OpenFolder_Click" AutomationProperties.Name="{Binding Name}">
+                                        <TextBlock Text="{Binding Name}" Style="{StaticResource BodyStrongTextBlockStyle}"
+                                            TextTrimming="CharacterEllipsis" />
+                                    </HyperlinkButton>
                                     <TextBlock Text="{Binding ItemCountLabel}"
                                         Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                                         Style="{StaticResource CaptionTextBlockStyle}" />

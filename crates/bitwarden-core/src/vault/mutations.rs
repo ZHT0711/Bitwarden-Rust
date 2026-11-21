@@ -60,6 +60,64 @@ pub(crate) struct VaultMutationResult {
 }
 
 impl VaultCache {
+    pub(crate) async fn move_items(
+        &mut self,
+        client: &Client,
+        ids: Vec<bitwarden_vault::CipherId>,
+        folder_id: Option<FolderId>,
+    ) -> Result<VaultMutationResult, VaultError> {
+        self.write_started = false;
+        self.ensure_synced()?;
+        let selected: HashSet<String> = ids.iter().map(ToString::to_string).collect();
+        if ids.is_empty() || ids.len() > 500 || selected.len() != ids.len() {
+            return Err(VaultError::Validation);
+        }
+        if let Some(folder_id) = folder_id {
+            if self
+                .folders
+                .get(folder_id)
+                .await
+                .map_err(|_| VaultError::Internal)?
+                .is_none()
+            {
+                return Err(VaultError::NotFound);
+            }
+        }
+        let overview = self.overview.as_ref().ok_or(VaultError::NotSynced)?;
+        if overview
+            .items
+            .iter()
+            .filter(|item| !item.deleted && selected.contains(&item.id))
+            .count()
+            != ids.len()
+        {
+            return Err(VaultError::NotFound);
+        }
+
+        self.activate(client);
+        self.write_started = true;
+        client
+            .vault()
+            .ciphers()
+            .move_many(ids, folder_id)
+            .await
+            // A self-hosted server may report a client error after moving a subset.
+            .map_err(|_| self.uncertain())?;
+
+        let folder_id = folder_id.map(|id| id.to_string());
+        let overview = self.overview.as_mut().ok_or(VaultError::NotSynced)?;
+        for item in &mut overview.items {
+            if selected.contains(&item.id) {
+                item.folder_id.clone_from(&folder_id);
+            }
+        }
+        self.write_started = false;
+        Ok(VaultMutationResult {
+            overview: overview.clone(),
+            id: None,
+        })
+    }
+
     fn validate_folder_name(name: &str) -> Result<(), VaultError> {
         if name.trim().is_empty() {
             return Err(VaultError::Validation);

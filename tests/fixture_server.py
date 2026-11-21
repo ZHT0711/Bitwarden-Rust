@@ -209,6 +209,7 @@ class FixtureState:
             self.reject_folder_batch = False
             self.fail_second_folder_delete = False
             self.fail_next_single_folder_delete = False
+            self.fail_next_move_after_first = False
             self.fail_next_sync = False
             self.require_new_device_verification = False
             self.require_authenticator = False
@@ -455,6 +456,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
             "/control/drop-next-write-response": "drop_next_create_response",
             "/control/reject-folder-batch": "reject_folder_batch",
             "/control/fail-second-folder-delete": "fail_second_folder_delete",
+            "/control/fail-next-move-after-first": "fail_next_move_after_first",
             "/control/fail-next-sync": "fail_next_sync",
             "/control/require-authenticator": "require_authenticator",
         }
@@ -535,7 +537,26 @@ class FixtureHandler(BaseHTTPRequestHandler):
         value = self.json_body(body)
         if value is None:
             return
-        folder_match = re.fullmatch(r"/api/folders/([0-9a-fA-F-]{36})", urlsplit(self.path).path)
+        path = urlsplit(self.path).path
+        if path == "/api/ciphers/move":
+            ids = value.get("ids")
+            folder_id = value.get("folderId")
+            state = self.server.state
+            with state.lock:
+                if (not isinstance(ids, list) or not 1 <= len(ids) <= 500
+                        or not all(isinstance(key, str) and key in state.ciphers for key in ids)
+                        or (folder_id is not None and (not isinstance(folder_id, str) or folder_id not in state.folders))):
+                    self.fail("Invalid synthetic item move.")
+                    return
+                for cipher_id in ids:
+                    state.ciphers[cipher_id]["folderId"] = folder_id
+                    if state.fail_next_move_after_first:
+                        state.fail_next_move_after_first = False
+                        self.fail("Only one of the selected items was moved.")
+                        return
+            self.reply(None, 204)
+            return
+        folder_match = re.fullmatch(r"/api/folders/([0-9a-fA-F-]{36})", path)
         if folder_match:
             folder_id = folder_match.group(1).lower()
             state = self.server.state
@@ -551,7 +572,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
                 state.folders[folder_id] = updated
             self.reply(updated)
             return
-        match = re.fullmatch(r"/api/ciphers/([0-9a-fA-F-]{36})(?:/(partial|delete|restore|archive|unarchive))?", urlsplit(self.path).path)
+        match = re.fullmatch(r"/api/ciphers/([0-9a-fA-F-]{36})(?:/(partial|delete|restore|archive|unarchive))?", path)
         if not match:
             self.fail("Fixture route not found.", 404)
             return

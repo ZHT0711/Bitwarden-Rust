@@ -12,6 +12,8 @@ namespace Bitwarden_WinUI;
 
 public sealed partial class MainWindow : Window
 {
+    private string? _folderToOpen;
+
     public MainWindow()
     {
         InitializeComponent();
@@ -76,8 +78,18 @@ public sealed partial class MainWindow : Window
         }
         else
         {
-            NavFrame.Navigate(typeof(HomePage), tag);
+            var folder = _folderToOpen;
+            _folderToOpen = null;
+            NavFrame.Navigate(typeof(HomePage),
+                folder is null ? tag : new HomePage.FolderNavigation(folder));
         }
+    }
+
+    private void OpenVaultFolder(object? sender, string folderId)
+    {
+        SearchBox.Text = string.Empty;
+        _folderToOpen = folderId;
+        NavView.SelectedItem = VaultNavigationItem;
     }
 
     private void SearchBox_QuerySubmitted(AutoSuggestBox sender, AutoSuggestBoxQuerySubmittedEventArgs args)
@@ -135,6 +147,8 @@ public sealed partial class MainWindow : Window
         {
             folders.SignInRequested -= HomePage_SignInRequested;
             folders.SignInRequested += HomePage_SignInRequested;
+            folders.OpenFolderRequested -= OpenVaultFolder;
+            folders.OpenFolderRequested += OpenVaultFolder;
             folders.SetSearch(SearchBox.Text);
         }
     }

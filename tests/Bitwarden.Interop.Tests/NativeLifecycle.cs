@@ -108,6 +108,29 @@ internal static class NativeLifecycle
                 RustCore.GetVaultEditor(id, FixturePassword, CancellationToken.None).FolderId is null,
                 "bulk delete clears the assigned folder in both item metadata and the encrypted cache");
 
+            var otherItem = batchDelete.Overview.Items.Single(item => item.Name == "Synthetic login").Id;
+            var movedIds = new[] { id, otherItem };
+            var moved = RustCore.MoveVaultItems(movedIds, retainedFolder, CancellationToken.None);
+            check(moved.Overview.Items.Where(item => movedIds.Contains(item.Id))
+                .All(item => item.FolderId == retainedFolder),
+                "bulk move changes personal folder metadata without requiring an item password");
+            var movedEditor = RustCore.GetVaultEditor(id, FixturePassword, CancellationToken.None);
+            check(movedEditor.FolderId == retainedFolder && movedEditor.Values["password"] == "synthetic-abi-updated"
+                && movedEditor.Reprompt && movedEditor.CustomFields.Single().Value == "synthetic hidden value",
+                "moving a protected item preserves the secret fields and reprompt");
+            await Control("fail-next-move-after-first");
+            ExpectCode(() => RustCore.MoveVaultItems(movedIds, null, CancellationToken.None), "writeUncertain",
+                "a server error after a partial item move requires reconciliation");
+            ExpectCode(() => RustCore.GetVaultOverview(), "notSynced", "partial move blocks stale overview reads");
+            var reconciledMove = RustCore.SyncVault(CancellationToken.None);
+            check(reconciledMove.Items.Single(item => item.Id == id).FolderId is null &&
+                reconciledMove.Items.Single(item => item.Id == otherItem).FolderId == retainedFolder,
+                "sync discovers which item was moved before the server error");
+            RustCore.MoveVaultItems(movedIds, null, CancellationToken.None);
+            check(RustCore.SyncVault(CancellationToken.None).Items.Where(item => movedIds.Contains(item.Id))
+                .All(item => item.FolderId is null),
+                "a full sync confirms the move to no folder");
+
             var first = CreateFolderId("Synthetic fallback first");
             var second = CreateFolderId("Synthetic fallback second");
             await Control("reject-folder-batch");

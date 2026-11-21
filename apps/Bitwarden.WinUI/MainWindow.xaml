@@ -56,7 +56,7 @@
             </NavigationView.Header>
 
             <NavigationView.MenuItems>
-                <NavigationViewItem Content="我的保险库" IsSelected="True" Tag="vault">
+                <NavigationViewItem x:Name="VaultNavigationItem" Content="我的保险库" IsSelected="True" Tag="vault">
                     <NavigationViewItem.Icon><SymbolIcon Symbol="Home" /></NavigationViewItem.Icon>
                 </NavigationViewItem>
                 <NavigationViewItem Content="我的文件夹" Tag="folder-manager">

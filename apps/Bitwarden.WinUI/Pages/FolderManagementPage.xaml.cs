@@ -7,6 +7,7 @@ namespace Bitwarden_WinUI.Pages;
 public sealed partial class FolderManagementPage : Page
 {
     public event EventHandler? SignInRequested;
+    internal event EventHandler<string>? OpenFolderRequested;
 
     private FolderRow[]? _folders;
     private CancellationTokenSource? _operation;
@@ -288,6 +289,12 @@ public sealed partial class FolderManagementPage : Page
     }
 
     private void FolderList_SelectionChanged(object sender, SelectionChangedEventArgs e) => UpdateCommands();
+
+    private void OpenFolder_Click(object sender, RoutedEventArgs e)
+    {
+        if (CanWrite && sender is HyperlinkButton { Tag: FolderRow folder })
+            OpenFolderRequested?.Invoke(this, folder.Id);
+    }
 
     private void ConnectAccount_Click(object sender, RoutedEventArgs e) => SignInRequested?.Invoke(this, EventArgs.Empty);
 

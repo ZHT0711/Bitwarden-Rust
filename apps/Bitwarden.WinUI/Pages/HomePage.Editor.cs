@@ -10,6 +10,7 @@ public sealed partial class HomePage
     private bool _busy;
     private bool _editorOpen;
     private bool _requiresSync;
+    private bool _selectingItems;
     private bool _abortAction;
     private VaultEditorDialog? _activeEditor;
     private ContentDialog? _actionDialog;
@@ -18,6 +19,11 @@ public sealed partial class HomePage
     {
         if (NewItemButton is null) return;
         var available = _loaded && _overview is not null && !_busy && !_syncing && !_editorOpen && !_requiresSync;
+        var canMove = available && _category != "trash";
+        SelectItemsButton.IsEnabled = canMove;
+        SelectItemsButton.Label = _selectingItems ? "退出批量选择" : "批量选择";
+        MoveItemsButton.IsEnabled = canMove && VaultList.SelectedItems.Count > 0;
+        available &= !_selectingItems;
         var item = VaultList.SelectedItem as VaultItem;
         NewItemButton.IsEnabled = available;
         EditItemButton.IsEnabled = available && item is { Deleted: false, Restricted: false };
@@ -41,6 +47,102 @@ public sealed partial class HomePage
     private async void NewItem_Click(object sender, RoutedEventArgs e) => await OpenEditorAsync(null);
     private async void EditItem_Click(object sender, RoutedEventArgs e)
     { if (VaultList.SelectedItem is VaultItem item) await OpenEditorAsync(item); }
+
+    private void SelectItems_Click(object sender, RoutedEventArgs e)
+    {
+        if (!SelectItemsButton.IsEnabled) return;
+        CancelOperation();
+        _version++;
+        SetItemSelectionMode(!_selectingItems);
+        DetailPanel.Children.Clear();
+        DetailPanel.Children.Add(new TextBlock
+        {
+            Text = _selectingItems ? "选择要移动的条目" : "选择一个条目查看详情",
+        });
+        UpdateMutationCommands();
+    }
+
+    private void SetItemSelectionMode(bool multiple)
+    {
+        if (_selectingItems) VaultList.SelectedItems.Clear();
+        else VaultList.SelectedItem = null;
+        _selectingItems = multiple;
+        VaultList.SelectionMode = multiple ? ListViewSelectionMode.Multiple : ListViewSelectionMode.Single;
+    }
+
+    private async void MoveItems_Click(object sender, RoutedEventArgs e)
+    {
+        if (!MoveItemsButton.IsEnabled || _overview is null) return;
+        var items = VaultList.SelectedItems.OfType<VaultItem>().ToArray();
+        if (items.Length == 0) return;
+        var previousSelection = _selectingItems ? null : items[0];
+        if (items.Length > 500)
+        {
+            SetNotice("所选条目过多", "每次最多可移动 500 个条目。", InfoBarSeverity.Warning);
+            return;
+        }
+
+        var folders = new ComboBox { Header = "目标文件夹", MinWidth = 240 };
+        folders.Items.Add(new ComboBoxItem { Content = "无文件夹" });
+        foreach (var folder in _overview.Folders)
+            folders.Items.Add(new ComboBoxItem { Content = folder.Name, Tag = folder.Id });
+        folders.SelectedIndex = 0;
+        var dialog = _actionDialog = new ContentDialog
+        {
+            XamlRoot = XamlRoot,
+            Title = $"移动 {items.Length} 个条目",
+            Content = folders,
+            PrimaryButtonText = "移动",
+            CloseButtonText = "取消",
+            DefaultButton = ContentDialogButton.Primary,
+        };
+
+        CancelOperation();
+        var version = ++_version;
+        using var operation = _operation = new CancellationTokenSource();
+        var token = operation.Token;
+        _editorOpen = true;
+        SetBusy(true);
+        DetailPanel.Children.Clear();
+        try
+        {
+            if (await dialog.ShowAsync() != ContentDialogResult.Primary || !IsCurrent(version, token)) return;
+            var target = (folders.SelectedItem as ComboBoxItem)?.Tag as string;
+            folders.Items.Clear();
+            _actionDialog = null;
+            var ids = items.Select(item => item.Id).ToArray();
+            var result = await Task.Run(() => RustCore.MoveVaultItems(ids, target, token), token);
+            if (!_loaded || version != _version) return;
+            previousSelection = null;
+            SetItemSelectionMode(false);
+            ApplyMutationResult(result, $"已移动 {items.Length} 个条目");
+        }
+        catch (OperationCanceledException)
+        {
+            if (_loaded && version == _version)
+            {
+                _requiresSync = true;
+                SetNotice("请求已取消", "请先同步并核对移动结果。", InfoBarSeverity.Warning);
+            }
+        }
+        catch (VaultException error) { if (_loaded && version == _version) MutationError(error); }
+        catch (Exception error) when (IsCoreUnavailable(error))
+        {
+            if (IsCurrent(version, token)) SetNotice("核心不可用", "请修复应用安装后重试。", InfoBarSeverity.Error);
+        }
+        finally
+        {
+            folders.Items.Clear();
+            if (ReferenceEquals(_actionDialog, dialog)) _actionDialog = null;
+            if (ReferenceEquals(_operation, operation)) _operation = null;
+            if (version == _version)
+            {
+                _editorOpen = false;
+                SetBusy(false);
+                if (previousSelection is not null && !_requiresSync) RestoreSelection(previousSelection);
+            }
+        }
+    }
 
     private async Task OpenEditorAsync(VaultItem? item)
     {
