@@ -17,6 +17,8 @@ public sealed partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
+        ApplyDesktopTheme(DesktopPreferences.ReadTheme());
+        ClipboardCleaner.Copied += MinimizeAfterCopy;
         try
         {
             if (!RustCore.ConfigureLocalCache(Windows.Storage.ApplicationData.Current.LocalFolder.Path))
@@ -33,6 +35,7 @@ public sealed partial class MainWindow : Window
         AppWindow.SetIcon("Assets/AppIcon.ico");
         AccountSettingsScope.SignedOut += GeneratorPage.ResetSavedAlgorithm;
         InitializeVaultTimeout();
+        InitializeTray();
         try
         {
             ApplyAccountSnapshot(ApplyRestartTimeouts(RustCore.GetAccounts()));
@@ -48,10 +51,18 @@ public sealed partial class MainWindow : Window
         NavFrame.Navigated += NavFrame_Navigated;
         NavFrame.Navigate(typeof(HomePage), "vault");
         StartPasskeyProvider();
-        Activated += (_, _) => { if (NavFrame.Content is SettingsPage settings) settings.RefreshPasskeyStatus(); };
+        Activated += (_, args) =>
+        {
+            if (args.WindowActivationState != WindowActivationState.Deactivated && NavFrame.Content is SettingsPage settings)
+            {
+                settings.RefreshPasskeyStatus();
+                _ = settings.RefreshStartupAsync();
+            }
+        };
         Closed += (_, _) =>
         {
             _closed = true;
+            DisposeTray();
             AccountSettingsScope.SignedOut -= GeneratorPage.ResetSavedAlgorithm;
             _passkeyTimer?.Stop();
             ClearPasskeySensitiveState();
@@ -59,8 +70,10 @@ public sealed partial class MainWindow : Window
             _unlockRequest?.Cancel();
             if (NavFrame.Content is HomePage page) page.ClearSensitiveState();
             if (NavFrame.Content is FolderManagementPage folders) folders.ClearSensitiveState();
+            if (NavFrame.Content is SendsPage sends) sends.ClearSensitiveState();
             if (NavFrame.Content is GeneratorPage generator) generator.ClearSensitiveState();
             WebsiteIcons.ClearCache();
+            ClipboardCleaner.Copied -= MinimizeAfterCopy;
             ClipboardCleaner.ClearOwned();
             try
             {
@@ -109,6 +122,10 @@ public sealed partial class MainWindow : Window
         {
             NavFrame.Navigate(typeof(FolderManagementPage));
         }
+        else if (tag == "sends")
+        {
+            NavFrame.Navigate(typeof(SendsPage));
+        }
         else if (tag == "about")
         {
             NavFrame.Navigate(typeof(AboutPage));
@@ -139,6 +156,7 @@ public sealed partial class MainWindow : Window
         {
             folderPage.SetSearch(args.QueryText);
         }
+        else if (NavFrame.Content is SendsPage sends) sends.SetSearch(args.QueryText);
         else
         {
             NavFrame.Navigate(typeof(HomePage), "vault");
@@ -153,12 +171,14 @@ public sealed partial class MainWindow : Window
     {
         if (NavFrame.Content is HomePage page) page.SetSearch(sender.Text);
         else if (NavFrame.Content is FolderManagementPage folderPage) folderPage.SetSearch(sender.Text);
+        else if (NavFrame.Content is SendsPage sends) sends.SetSearch(sender.Text);
     }
 
     private async void Sync_Click(object sender, RoutedEventArgs e)
     {
         if (NavFrame.Content is HomePage page) await page.RefreshAsync(true);
         else if (NavFrame.Content is FolderManagementPage folderPage) await folderPage.RefreshAsync(true);
+        else if (NavFrame.Content is SendsPage sends) await sends.RefreshAsync();
         else
         {
             NavFrame.Navigate(typeof(HomePage), "vault");
@@ -168,7 +188,12 @@ public sealed partial class MainWindow : Window
 
     private void NavFrame_Navigated(object sender, NavigationEventArgs e)
     {
-        SearchBox.PlaceholderText = e.Content is FolderManagementPage ? "搜索文件夹" : "搜索保险库";
+        SearchBox.PlaceholderText = e.Content switch
+        {
+            FolderManagementPage => "搜索文件夹",
+            SendsPage => "搜索 Send",
+            _ => "搜索保险库",
+        };
         if (e.Content is HomePage page)
         {
             page.SignInRequested -= HomePage_SignInRequested;
@@ -178,7 +203,19 @@ public sealed partial class MainWindow : Window
         else if (e.Content is SettingsPage settings)
         {
             settings.VaultTimeoutChanged = value => SaveVaultTimeout(settings, value);
+            settings.ApplyTheme = ApplyDesktopTheme;
+            settings.ChangeHelloUnlock = () => ChangeHelloUnlockAsync(settings);
+            settings.ExportVault = () => ExportVaultAsync(settings);
+            settings.ImportVault = () => ImportVaultAsync(settings);
+            settings.ShowHelloUnlock(ActiveAccount, _signInDialogOpen || _accountTransition);
+            settings.ShowVaultExport(ActiveAccount, _signInDialogOpen || _accountTransition);
             UpdateTimeoutControls(settings);
+        }
+        else if (e.Content is SendsPage sends)
+        {
+            sends.ConnectRequested -= SendsPage_ConnectRequested;
+            sends.ConnectRequested += SendsPage_ConnectRequested;
+            _ = sends.ShowAccountAsync(ActiveAccount, SearchBox.Text);
         }
         else if (e.Content is FolderManagementPage folders)
         {
@@ -203,6 +240,16 @@ public sealed partial class MainWindow : Window
             ShowAccountMenu();
         }
         catch (Exception error) when (IsCoreUnavailable(error)) { }
+    }
+
+    private async void SendsPage_ConnectRequested(object? sender, EventArgs e)
+    {
+        if (ActiveAccount is { State: VaultSessionState.Unlocked, NeedsSignIn: true } account)
+        {
+            try { await ShowSignInDialogAsync(account); }
+            catch (Exception error) when (IsCoreUnavailable(error)) { }
+        }
+        else HomePage_SignInRequested(sender, e);
     }
 
     private async void HomePage_SignInRequested(object? sender, EventArgs e)
@@ -303,13 +350,27 @@ public sealed partial class MainWindow : Window
         var providerBox = new ComboBox { Header = "二步验证方式", Visibility = Visibility.Collapsed, HorizontalAlignment = HorizontalAlignment.Stretch };
         var tokenBox = new TextBox { Header = "验证码", PlaceholderText = "输入一次性验证码", Visibility = Visibility.Collapsed };
         var sendEmailButton = new Button { Content = "发送邮箱验证码", Visibility = Visibility.Collapsed, HorizontalAlignment = HorizontalAlignment.Left };
+        var rememberTwoFactorBox = new CheckBox
+        {
+            Name = "RememberTwoFactor",
+            Content = "记住我（30 天）",
+            IsChecked = false,
+            Visibility = Visibility.Collapsed,
+        };
+        var rememberTwoFactorHelp = new TextBlock
+        {
+            Text = "此设备 30 天内免二步验证，仍需输入主密码。仅在可信的个人设备上使用；服务器可提前撤销。",
+            TextWrapping = TextWrapping.Wrap,
+            Visibility = Visibility.Collapsed,
+        };
         var deviceOtpBox = new TextBox { Header = "新设备邮箱验证码", PlaceholderText = "输入新设备验证邮件中的验证码", Visibility = Visibility.Collapsed };
         var resendDeviceOtpButton = new Button { Content = "重新发送新设备验证码", Visibility = Visibility.Collapsed, HorizontalAlignment = HorizontalAlignment.Left };
         var progress = new ProgressBar { IsIndeterminate = true, Visibility = Visibility.Collapsed };
         var statusText = new TextBlock { Name = "LoginStatus", TextWrapping = TextWrapping.Wrap };
         var content = new StackPanel { Spacing = 12, MinWidth = 320, MaxWidth = 440 };
         foreach (var element in new UIElement[] { serverBox, serverUrlBox, serverHelp, emailBox,
-            PasswordVisibility.WithToggle(passwordBox), deviceOtpBox, resendDeviceOtpButton, providerBox, tokenBox, sendEmailButton, progress, statusText })
+            PasswordVisibility.WithToggle(passwordBox), deviceOtpBox, resendDeviceOtpButton, providerBox, tokenBox, sendEmailButton,
+            rememberTwoFactorBox, rememberTwoFactorHelp, progress, statusText })
         {
             content.Children.Add(element);
         }
@@ -346,7 +407,7 @@ public sealed partial class MainWindow : Window
             serverBox.IsEnabled = !value && reconnect is null;
             serverUrlBox.IsEnabled = !value;
             emailBox.IsEnabled = passwordBox.IsEnabled = !value;
-            providerBox.IsEnabled = tokenBox.IsEnabled = !value;
+            providerBox.IsEnabled = tokenBox.IsEnabled = rememberTwoFactorBox.IsEnabled = !value;
             deviceOtpBox.IsEnabled = sendEmailButton.IsEnabled = resendDeviceOtpButton.IsEnabled = !value;
             dialog.IsPrimaryButtonEnabled = !value && !unsupportedTwoFactor;
             dialog.CloseButtonText = value ? "取消请求" : "取消";
@@ -361,6 +422,8 @@ public sealed partial class MainWindow : Window
             providerBox.Items.Clear();
             providerBox.Visibility = tokenBox.Visibility = sendEmailButton.Visibility = Visibility.Collapsed;
             deviceOtpBox.Visibility = resendDeviceOtpButton.Visibility = Visibility.Collapsed;
+            rememberTwoFactorBox.Visibility = rememberTwoFactorHelp.Visibility = Visibility.Collapsed;
+            rememberTwoFactorBox.IsChecked = false;
             deviceOtpBox.Text = string.Empty;
             tokenBox.Text = string.Empty;
             statusText.Text = string.Empty;
@@ -508,12 +571,13 @@ public sealed partial class MainWindow : Window
                     return;
                 }
                 var provider = providerBox.SelectedItem is ComboBoxItem item && item.Tag is uint id ? id : 0;
+                var rememberTwoFactor = needsToken && rememberTwoFactorBox.IsChecked == true;
                 requestCancellation = new CancellationTokenSource();
                 var cancellationToken = requestCancellation.Token;
                 SetBusy(true);
                 statusText.Text = "正在验证账户…";
                 var result = await Task.Run(() => RustCore.Login(email, password, provider,
-                    needsToken ? token : string.Empty, deviceOtp, mode, url, deviceIdentifier, cancellationToken));
+                    needsToken ? token : string.Empty, deviceOtp, mode, url, deviceIdentifier, cancellationToken, rememberTwoFactor));
                 if (result.Status == AuthStatus.Authenticated)
                 {
                     added = authenticated = true;
@@ -526,6 +590,7 @@ public sealed partial class MainWindow : Window
                     deviceVerificationRequired = true;
                     deviceOtpBox.Visibility = resendDeviceOtpButton.Visibility = Visibility.Visible;
                     providerBox.Visibility = tokenBox.Visibility = sendEmailButton.Visibility = Visibility.Collapsed;
+                    rememberTwoFactorBox.Visibility = rememberTwoFactorHelp.Visibility = Visibility.Collapsed;
                     tokenBox.Text = string.Empty;
                     statusText.Text = result.Status == AuthStatus.InvalidNewDeviceVerificationCode
                         ? "新设备验证码无效或已过期。请重新输入或重新发送。"
@@ -542,26 +607,43 @@ public sealed partial class MainWindow : Window
                         deviceOtpBox.Visibility = resendDeviceOtpButton.Visibility = Visibility.Collapsed;
                     }
                     var previousProvider = providerBox.SelectedItem is ComboBoxItem previous ? previous.Tag : null;
-                    PopulateTwoFactorMethods(providerBox, result.AvailableTwoFactorMethods);
+                    var advertised = result.AvailableTwoFactorMethods;
+                    var manualAuthenticator = TwoFactorMethods.OffersManualAuthenticator(advertised, mode);
+                    PopulateTwoFactorMethods(providerBox, advertised, manualAuthenticator);
                     foreach (var candidate in providerBox.Items.OfType<ComboBoxItem>())
                     {
                         if (Equals(candidate.Tag, previousProvider)) providerBox.SelectedItem = candidate;
                     }
-                    providerBox.Visibility = Visibility.Visible;
-                    tokenBox.Visibility = Visibility.Visible;
-                    tokenBox.Text = string.Empty;
-                    sendEmailButton.Visibility = providerBox.SelectedItem is ComboBoxItem selected && selected.Tag is uint selectedProvider && selectedProvider == 1
-                        ? Visibility.Visible : Visibility.Collapsed;
                     unsupportedTwoFactor = providerBox.Items.Count == 0;
-                    statusText.Text = unsupportedTwoFactor
-                        ? "此账户的二步验证方式暂不受支持。当前支持身份验证器、邮箱验证码和 YubiKey。"
-                        : "请选择二步验证方式并输入新的验证码。";
+                    providerBox.Visibility = tokenBox.Visibility = unsupportedTwoFactor ? Visibility.Collapsed : Visibility.Visible;
+                    rememberTwoFactorBox.Visibility = rememberTwoFactorHelp.Visibility = tokenBox.Visibility;
+                    tokenBox.Text = string.Empty;
+                    sendEmailButton.Visibility = providerBox.SelectedItem is ComboBoxItem { Tag: TwoFactorMethods.Email }
+                        ? Visibility.Visible : Visibility.Collapsed;
+                    statusText.Text = manualAuthenticator
+                        ? TwoFactorMethods.UnsupportedReason(advertised) + (needsToken
+                            ? "服务器没有接受此次验证。如果确定同一账户启用了身份验证器，可用下一组 6 位验证码重试；否则请用网页保险库或官方客户端。"
+                            : "如果你确实为此账户启用了 TOTP，可手动输入 6 位验证码；是否接受仍由服务器决定。")
+                        : unsupportedTwoFactor
+                            ? TwoFactorMethods.UnsupportedReason(advertised) + "请使用网页保险库或官方客户端完成验证。"
+                            : providerBox.SelectedItem is ComboBoxItem { Tag: TwoFactorMethods.Authenticator }
+                                ? "请输入身份验证器为该账户生成的 6 位验证码。"
+                                : "请选择二步验证方式并输入新的验证码。";
+                    return;
+                }
+                if (result.Status == AuthStatus.InvalidTwoFactorCode)
+                {
+                    tokenBox.Text = string.Empty;
+                    statusText.Text = provider == 0
+                        ? "身份验证器验证码无效、过期或已使用。请确认设备时间同步，并等待下一组 6 位验证码后重试。"
+                        : "二步验证码无效或已过期。请用新的验证码重试。";
                     return;
                 }
                 statusText.Text = result.Status switch
                 {
                     AuthStatus.TimedOut => "服务器响应超时，请检查服务器地址和网络连接后重试。",
                     AuthStatus.Cancelled => "请求已取消。",
+                    AuthStatus.RateLimited => "服务器暂时限制登录尝试。请等待一段时间，不要连续重试。",
                     AuthStatus.AccountAlreadySignedIn => "该账户已登录，请从账户菜单切换。",
                     AuthStatus.AccountLimitReached => "最多可同时登录 5 个账户，请先退出其中一个。",
                     AuthStatus.Failed when deviceVerificationRequired && !needsToken => "新设备验证码无效或已过期。请重新输入或重新发送。",
@@ -574,6 +656,8 @@ public sealed partial class MainWindow : Window
             {
                 FinishRequest();
                 if (authenticated) dialog.Hide();
+                else if (!closingRequested && tokenBox.Visibility == Visibility.Visible && !unsupportedTwoFactor)
+                    tokenBox.Focus(FocusState.Programmatic);
             }
         };
 
@@ -604,20 +688,20 @@ public sealed partial class MainWindow : Window
     private static bool IsCoreUnavailable(Exception error) =>
         error is DllNotFoundException or EntryPointNotFoundException or BadImageFormatException;
 
-    private static void PopulateTwoFactorMethods(ComboBox providerBox, uint methodMask)
+    private static void PopulateTwoFactorMethods(ComboBox providerBox, uint advertised, bool manualAuthenticator)
     {
         providerBox.Items.Clear();
-        if ((methodMask & (1 << 0)) != 0)
+        if (manualAuthenticator || TwoFactorMethods.IsAdvertised(advertised, TwoFactorMethods.Authenticator))
         {
-            providerBox.Items.Add(new ComboBoxItem { Content = "身份验证器", Tag = 0u });
+            providerBox.Items.Add(new ComboBoxItem { Content = manualAuthenticator ? "身份验证器（手动输入）" : "身份验证器", Tag = TwoFactorMethods.Authenticator });
         }
-        if ((methodMask & (1 << 1)) != 0)
+        if (TwoFactorMethods.IsAdvertised(advertised, TwoFactorMethods.Email))
         {
-            providerBox.Items.Add(new ComboBoxItem { Content = "邮箱验证码", Tag = 1u });
+            providerBox.Items.Add(new ComboBoxItem { Content = "邮箱验证码", Tag = TwoFactorMethods.Email });
         }
-        if ((methodMask & (1 << 3)) != 0)
+        if (TwoFactorMethods.IsAdvertised(advertised, TwoFactorMethods.YubiKey))
         {
-            providerBox.Items.Add(new ComboBoxItem { Content = "YubiKey", Tag = 3u });
+            providerBox.Items.Add(new ComboBoxItem { Content = "YubiKey", Tag = TwoFactorMethods.YubiKey });
         }
         if (providerBox.Items.Count > 0)
         {

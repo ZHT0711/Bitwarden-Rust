@@ -44,6 +44,7 @@ PUBLIC_WRAPPED_USER_KEY = (
 OUT_OF_DATE = "The item cannot be saved because it is out of date."
 MAX_BODY_BYTES = 2 * 1024 * 1024
 ATTACHMENT_PATH = re.compile(r"/api/ciphers/([0-9a-fA-F-]{36})/attachment/([a-zA-Z0-9_-]+)")
+SEND_UPLOAD_PATH = re.compile(r"/api/sends/([0-9a-f-]{36})/file/([a-zA-Z0-9_-]+)")
 UTC = dt.timezone.utc
 
 
@@ -231,6 +232,24 @@ class FixtureState:
             self.sync_requests = 0
             self.require_new_device_verification = False
             self.require_authenticator = False
+            self.remembered_two_factor = {}
+            self.remember_attempts = 0
+            self.remember_accepted = 0
+            self.remember_invalid_code = False
+            self.pause_next_token = False
+            self.omit_next_remember_token = False
+            self.sends = {}
+            self.drop_next_send_response = False
+            self.send_blobs = {}
+            self.send_upload_started = 0
+            self.azure_next_send = False
+            self.fail_next_send_upload = False
+            self.pause_next_send_upload = False
+            self.fail_next_send_delete = False
+            self.send_renewals = 0
+            self.drop_next_import_response = False
+            self.ignore_next_import = False
+            self.import_requests = 0
             self.challenged_device_identifier: str | None = None
 
     def revision(self) -> str:
@@ -258,6 +277,38 @@ class FixtureState:
         result = copy.deepcopy(self.sync_template)
         result["ciphers"] = copy.deepcopy(list(self.ciphers.values()))
         result["folders"] = copy.deepcopy(list(self.folders.values()))
+        return result
+
+    def full_send_write(self, payload: dict, previous: dict | None = None) -> dict:
+        kind = payload.get("type")
+        content, field = (payload.get("file"), "fileName") if kind == 1 else (payload.get("text"), "text")
+        if (kind not in (0, 1) or not isinstance(content, dict)
+                or not all(isinstance(value, str) and value.startswith("2.")
+                           for value in (payload.get("name"), payload.get("key"), content.get(field)))
+                or (previous is not None and previous["type"] != kind)):
+            raise ValueError("Send must contain encrypted name, key and content metadata.")
+        if payload.get("password"):
+            digest = base64.b64decode(payload["password"], validate=True)
+            if len(digest) != 32:
+                raise ValueError("Send password must be SDK-derived.")
+        send_id = uuid.UUID(previous["id"]) if previous else uuid.uuid4()
+        result = copy.deepcopy(payload)
+        result.update(id=str(send_id), object="send", accessId=base64.urlsafe_b64encode(send_id.bytes).decode().rstrip("="),
+                      revisionDate=self.revision(), accessCount=(previous or {}).get("accessCount", 0))
+        if kind == 1:
+            if previous is None:
+                size = result.pop("fileLength", None)
+                if not isinstance(size, int) or not 65 <= size <= MAX_BODY_BYTES:
+                    raise ValueError("Invalid encrypted Send size.")
+                result["file"].update(id=uuid.uuid4().hex, size=str(size), sizeName=f"{size} B")
+            elif any(result["file"].get(key) != previous["file"][key] for key in ("id", "size", "sizeName")):
+                raise ValueError("Send file cannot be replaced.")
+        if previous:
+            for field in ("notes", "maxAccessCount", "expirationDate"):
+                result.setdefault(field, previous.get(field))
+            if result.get("authType") == previous.get("authType"):
+                for field in ("password", "emails"):
+                    result.setdefault(field, previous.get(field))
         return result
 
     def full_folder_write(self, payload: dict, folder_id: str | None = None) -> dict:
@@ -394,11 +445,27 @@ class FixtureHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(icon)
             return
+        if path == "/control/send-transfers":
+            with state.lock:
+                self.reply({"started": state.send_upload_started, "renewals": state.send_renewals})
+            return
+        fixture_send = re.fullmatch(r"/fixture-send/([0-9a-f-]{36})", path)
+        if fixture_send:
+            with state.lock:
+                data = state.send_blobs.get(fixture_send[1])
+            if data is None:
+                self.fail("Synthetic Send file not found.", 404)
+            else:
+                self.reply({"ciphertext": base64.b64encode(data).decode()})
+            return
         if path == "/control/snapshot":
             with state.lock:
                 self.reply({"cipherCount": len(state.ciphers), "ids": sorted(state.ciphers),
                             "attachmentDownloads": state.attachment_downloads,
-                            "attachmentUploads": state.attachment_uploads, "syncRequests": state.sync_requests})
+                            "attachmentUploads": state.attachment_uploads, "syncRequests": state.sync_requests,
+                            "importRequests": state.import_requests,
+                            "rememberAttempts": state.remember_attempts,
+                            "rememberAccepted": state.remember_accepted})
             return
         blob_match = re.fullmatch(r"/fixture-attachments/([a-zA-Z0-9_-]+)", path)
         if blob_match:
@@ -442,6 +509,23 @@ class FixtureHandler(BaseHTTPRequestHandler):
             self.reply(response)
             return
         with state.lock:
+            if path == "/api/sends":
+                self.reply({"data": list(state.sends.values()), "object": "list"})
+                return
+            renew = SEND_UPLOAD_PATH.fullmatch(path)
+            if renew:
+                entry = state.sends.get(renew[1])
+                if not entry or (entry.get("file") or {}).get("id") != renew[2]:
+                    self.fail("Invalid synthetic renewal.", 404)
+                else:
+                    state.send_renewals += 1
+                    self.reply(self.send_slot(entry, azure=True))
+                return
+            send_match = re.fullmatch(r"/api/sends/([0-9a-f-]{36})", path)
+            if send_match:
+                entry = state.sends.get(send_match[1])
+                self.reply(entry) if entry else self.fail("Synthetic Send not found.", 404)
+                return
             match = re.fullmatch(r"/api/ciphers/([0-9a-fA-F-]{36})", path)
             if match and match.group(1).lower() in state.ciphers:
                 self.reply(copy.deepcopy(state.ciphers[match.group(1).lower()]))
@@ -498,14 +582,44 @@ class FixtureHandler(BaseHTTPRequestHandler):
                                     "ErrorModel": {"Message": "invalid new device otp", "Object": "error"}}, 400)
                         return
                     state.require_new_device_verification = False
+                issued_remember = None
                 if grant == "password" and state.require_authenticator:
                     provider = form.get("twoFactorProvider", [""])[0]
                     token = form.get("twoFactorToken", [""])[0]
-                    if provider != "0" or token != "287349":
-                        self.reply({"error": "invalid_grant", "error_description": "Two factor required.",
-                                    "TwoFactorProviders2": {"0": None}}, 400)
+                    saved = state.remembered_two_factor.get(device_identifier)
+                    valid_remember = provider == "5" and saved is not None and token == saved[0]
+                    if provider == "5":
+                        state.remember_attempts += 1
+                        if valid_remember and saved is not None and form.get("password", [""])[0] != saved[1]:
+                            self.fail("Username or password is incorrect. Try again.")
+                            return
+                        if valid_remember:
+                            state.remember_accepted += 1
+                    if (not provider or not token) or (provider == "5" and not valid_remember and not state.remember_invalid_code):
+                        # Legacy self-hosted shape: list and provider data nested in the error.
+                        self.reply({"Error": "invalid_grant", "ErrorDescription": "Two factor required.",
+                                    "CustomResponse": {"TwoFactorProviders": ["0"], "TwoFactorProviders2": {"0": None}},
+                                    "ErrorModel": {"Message": "Two factor required.", "Object": "error"}}, 400)
                         return
-                self.reply(state.identity)
+                    if not valid_remember and (provider != "0" or token != "087349"):
+                        message = "Two-step token is invalid. Try again."
+                        self.reply({"error": "invalid_grant", "error_description": message,
+                                    "ErrorModel": {"Message": message, "Object": "error"}}, 400)
+                        return
+                    if provider == "0" and form.get("twoFactorRemember", [""])[0].lower() in ("true", "1"):
+                        if state.omit_next_remember_token:
+                            state.omit_next_remember_token = False
+                        else:
+                            issued_remember = "synthetic-remember-" + uuid.uuid4().hex
+                            state.remembered_two_factor[device_identifier] = (issued_remember, form.get("password", [""])[0])
+                result = copy.deepcopy(state.identity)
+                if issued_remember:
+                    # Exercise both legacy and modern spellings, as NodeWarden emits aliases.
+                    result["twoFactorToken"] = result["TwoFactorToken"] = issued_remember
+                if state.pause_next_token:
+                    state.pause_next_token = False
+                    time.sleep(3)
+                self.reply(result)
             else:
                 self.fail("Only the public synthetic account is accepted.", 403)
             return
@@ -538,10 +652,25 @@ class FixtureHandler(BaseHTTPRequestHandler):
             "/control/pause-next-sync": "pause_next_sync",
             "/control/duplicate-next-sync-cipher": "duplicate_next_sync_cipher",
             "/control/require-authenticator": "require_authenticator",
+            "/control/remember-invalid-code": "remember_invalid_code",
+            "/control/pause-next-token": "pause_next_token",
+            "/control/omit-next-remember-token": "omit_next_remember_token",
+            "/control/drop-next-send-response": "drop_next_send_response",
+            "/control/azure-next-send": "azure_next_send",
+            "/control/fail-next-send-upload": "fail_next_send_upload",
+            "/control/pause-next-send-upload": "pause_next_send_upload",
+            "/control/fail-next-send-delete": "fail_next_send_delete",
+            "/control/drop-next-import-response": "drop_next_import_response",
+            "/control/ignore-next-import": "ignore_next_import",
         }
         if path in controls:
             with state.lock:
                 setattr(state, controls[path], True)
+            self.reply({"ok": True})
+            return
+        if path == "/control/revoke-remembered-two-factor":
+            with state.lock:
+                state.remembered_two_factor.clear()
             self.reply({"ok": True})
             return
         if path == "/control/require-new-device-verification":
@@ -558,6 +687,17 @@ class FixtureHandler(BaseHTTPRequestHandler):
                 state.sync_template["UserDecryption"]["MasterPasswordUnlock"]["MasterKeyEncryptedUserKey"] = wrapper
             self.reply({"ok": True})
             return
+        if path in ("/control/deny-vault-export", "/control/restrict-login-export", "/control/clear-export-policy"):
+            with state.lock:
+                organization = "00000000-0000-0000-0000-000000000101"
+                rows = []
+                if path.endswith("deny-vault-export"):
+                    rows.append({"type": 10, "enabled": True, "organizationId": organization})
+                if path.endswith("restrict-login-export"):
+                    rows.append({"type": 15, "enabled": True, "organizationId": organization, "data": [1]})
+                state.sync_template["policiesNew"] = rows
+            self.reply({"ok": True})
+            return
         if path in ("/control/disable-premium", "/control/enable-premium"):
             with state.lock:
                 state.sync_template["profile"]["premium"] = path == "/control/enable-premium"
@@ -572,6 +712,24 @@ class FixtureHandler(BaseHTTPRequestHandler):
             threading.Thread(target=self.fixture.shutdown, daemon=True).start()
             return
         if not self.authorized():
+            return
+        send_upload = SEND_UPLOAD_PATH.fullmatch(path)
+        if send_upload:
+            content_type = self.headers.get("Content-Type", "")
+            if not content_type.startswith("multipart/form-data;"):
+                self.fail("Expected a multipart Send upload.")
+                return
+            message = BytesParser().parsebytes(b"Content-Type: " + content_type.encode() + b"\r\n\r\n" + body)
+            parts = message.get_payload()
+            if (not isinstance(parts, list) or len(parts) != 1 or not isinstance(parts[0], Message)
+                    or parts[0].get_param("name", header="content-disposition") != "data"):
+                self.fail("Expected one encrypted data part.")
+                return
+            data, filename = parts[0].get_payload(decode=True), parts[0].get_filename()
+            if not isinstance(data, bytes) or not isinstance(filename, str):
+                self.fail("Expected encrypted Send file bytes and filename.")
+                return
+            self.upload_send_file(send_upload[1], send_upload[2], data, filename)
             return
         attachment = ATTACHMENT_PATH.fullmatch(path)
         if attachment and attachment[2] != "v2":
@@ -629,6 +787,31 @@ class FixtureHandler(BaseHTTPRequestHandler):
                 self.reply({"attachmentId": attachment_id, "url": target,
                             "fileUploadType": 1 if azure else 0, "cipherResponse": cipher})
             return
+        if path in ("/api/sends", "/api/sends/file/v2"):
+            is_file = path.endswith("/file/v2")
+            with state.lock:
+                try:
+                    if value.get("type") != int(is_file):
+                        raise ValueError("Wrong Send creation route.")
+                    send = state.full_send_write(value)
+                except (ValueError, TypeError):
+                    self.fail("Invalid synthetic Send request.")
+                    return
+                state.sends[send["id"]] = send
+                result = self.send_slot(send, state.azure_next_send, expired=True) if is_file else send
+                if is_file:
+                    state.azure_next_send = False
+                drop = state.drop_next_send_response
+                state.drop_next_send_response = False
+            if drop:
+                self.close_connection = True
+                try:
+                    self.connection.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                return
+            self.reply(result)
+            return
         if path == "/api/folders":
             with state.lock:
                 try:
@@ -638,6 +821,9 @@ class FixtureHandler(BaseHTTPRequestHandler):
                     return
                 state.folders[folder["id"]] = folder
             self.reply(folder)
+            return
+        if path == "/api/ciphers/import":
+            self.import_ciphers(value)
             return
         if path != "/api/ciphers":
             self.fail("Fixture route not found.", 404)
@@ -666,6 +852,77 @@ class FixtureHandler(BaseHTTPRequestHandler):
             return
         self.reply(cipher)
 
+    def import_ciphers(self, value: dict):
+        state = self.fixture.state
+        with state.lock:
+            state.import_requests += 1
+            try:
+                folder_rows, item_rows, links = (value[key] for key in ("folders", "ciphers", "folderRelationships"))
+                if not all(isinstance(rows, list) for rows in (folder_rows, item_rows, links)):
+                    raise ValueError("Expected import arrays.")
+                if any(not isinstance(row.get("name"), str) or not row["name"].startswith("2.") or row.get("id")
+                       for row in folder_rows):
+                    raise ValueError("Import must only contain new encrypted folders.")
+                if any(not isinstance(row.get("name"), str) or not row["name"].startswith("2.")
+                       or row.get("organizationId") or row.get("folderId") or row.get("attachments2")
+                       or row.get("encryptedFor") != PUBLIC_USER_ID for row in item_rows):
+                    raise ValueError("Import must only contain new encrypted personal items.")
+                folders = [state.full_folder_write(row) for row in folder_rows]
+                items = [state.full_write(row) for row in item_rows]
+                for pair in links:
+                    item_index, folder_index = pair["key"], pair["value"]
+                    if not 0 <= item_index < len(items) or not 0 <= folder_index < len(folders) or items[item_index]["folderId"]:
+                        raise ValueError("Invalid import folder relationship.")
+                    items[item_index]["folderId"] = folders[folder_index]["id"]
+            except (KeyError, ValueError, TypeError, AttributeError):
+                self.fail("Invalid synthetic import.")
+                return
+            if state.ignore_next_import:
+                state.ignore_next_import = False
+            else:
+                state.folders.update((folder["id"], folder) for folder in folders)
+                state.ciphers.update((item["id"], item) for item in items)
+            drop = state.drop_next_import_response
+            state.drop_next_import_response = False
+        if drop:
+            self.close_connection = True
+            try:
+                self.connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            return
+        self.reply(None, 204)
+
+    def send_slot(self, send: dict, azure: bool, expired: bool = False) -> dict:
+        path = f"/api/sends/{send['id']}/file/{send['file']['id']}"
+        expiry = "2000-01-01T00:00:00Z" if expired else "2099-01-01T00:00:00Z"
+        url = f"{self.loopback_origin()}{path}?token=fixture-signed&sv=2024-11-04&se={expiry}" if azure else path
+        return {"sendResponse": send, "fileUploadType": int(azure), "url": url}
+
+    def upload_send_file(self, send_id: str, file_id: str, data: bytes, filename: str | None):
+        state = self.fixture.state
+        with state.lock:
+            entry = state.sends.get(send_id, {}).get("file") or {}
+            if (entry.get("id") != file_id or (filename is not None and entry.get("fileName") != filename)
+                    or not isinstance(data, bytes) or str(len(data)) != entry.get("size") or not data.startswith(b"\x02")):
+                self.fail("Invalid encrypted Send upload.")
+                return
+            state.send_upload_started += 1
+            if state.fail_next_send_upload:
+                state.fail_next_send_upload = False
+                self.fail("Synthetic Send upload failure.", 503)
+                return
+            pause = state.pause_next_send_upload
+            state.pause_next_send_upload = False
+        if pause:
+            time.sleep(3)
+        with state.lock:
+            if send_id not in state.sends:
+                self.fail("Send upload was rolled back.", 404)
+                return
+            state.send_blobs[send_id] = data
+        self.reply(None, 201)
+
     def do_PUT(self):
         body = self.body()
         if body is None:
@@ -673,6 +930,18 @@ class FixtureHandler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         azure_attachment = re.fullmatch(r"/fixture-upload/([a-zA-Z0-9_-]+)", path)
         state = self.fixture.state
+        send_upload = SEND_UPLOAD_PATH.fullmatch(path)
+        if send_upload:
+            query = parse_qs(urlsplit(self.path).query)
+            if (query.get("token") != ["fixture-signed"] or query.get("se") != ["2099-01-01T00:00:00Z"]
+                    or self.headers.get("Authorization") or self.headers.get("Device-Identifier")
+                    or self.headers.get("x-ms-blob-type") != "BlockBlob"
+                    or self.headers.get("x-ms-version") != "2024-11-04"
+                    or self.headers.get("Content-Type") != "application/octet-stream"):
+                self.fail("Invalid presigned Send upload.")
+                return
+            self.upload_send_file(send_upload[1], send_upload[2], body, None)
+            return
         if azure_attachment:
             with state.lock:
                 cipher_id = state.azure_slots.get(azure_attachment[1])
@@ -687,6 +956,26 @@ class FixtureHandler(BaseHTTPRequestHandler):
             return
         value = self.json_body(body)
         if value is None:
+            return
+        send_match = re.fullmatch(r"/api/sends/([0-9a-f-]{36})(/remove-password)?", path)
+        if send_match:
+            with state.lock:
+                send_id, action = send_match.groups()
+                previous = state.sends.get(send_id)
+                if previous is None:
+                    self.fail("Synthetic Send not found.", 404)
+                    return
+                try:
+                    if action:
+                        updated = copy.deepcopy(previous)
+                        updated.update(password=None, emails=None, authType=2, revisionDate=state.revision())
+                    else:
+                        updated = state.full_send_write(value, previous)
+                except (ValueError, TypeError):
+                    self.fail("Invalid synthetic Send edit.")
+                    return
+                state.sends[send_id] = updated
+            self.reply(updated)
             return
         if path == "/api/ciphers/move":
             ids = value.get("ids")
@@ -782,6 +1071,17 @@ class FixtureHandler(BaseHTTPRequestHandler):
             return
         state = self.fixture.state
         path = urlsplit(self.path).path
+        send_match = re.fullmatch(r"/api/sends/([0-9a-f-]{36})", path)
+        if send_match:
+            with state.lock:
+                if state.fail_next_send_delete:
+                    state.fail_next_send_delete = False
+                    self.fail("Synthetic Send delete failed.", 503)
+                    return
+                removed = state.sends.pop(send_match[1], None)
+                state.send_blobs.pop(send_match[1], None)
+            self.reply(None, 204) if removed else self.fail("Synthetic Send not found.", 404)
+            return
         attachment = ATTACHMENT_PATH.fullmatch(path)
         if attachment:
             cipher_id, attachment_id = attachment[1].lower(), attachment[2]

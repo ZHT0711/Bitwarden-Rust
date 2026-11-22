@@ -108,12 +108,7 @@ impl VaultCache {
     ) -> Result<Vec<CipherView>, VaultError> {
         self.ensure_synced()?;
         let mut views = Vec::new();
-        for cipher in self
-            .ciphers
-            .snapshot()
-            .map_err(|_| VaultError::Internal)?
-            .into_values()
-        {
+        for cipher in self.ciphers.snapshot().map_err(|_| VaultError::Internal)? {
             if cipher.r#type as u8 != 1
                 || cipher.deleted_date.is_some()
                 || cipher.archived_date.is_some()

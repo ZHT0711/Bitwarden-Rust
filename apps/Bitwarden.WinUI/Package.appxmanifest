@@ -4,7 +4,8 @@
   xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
   xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
   xmlns:com="http://schemas.microsoft.com/appx/manifest/com/windows10"
-  IgnorableNamespaces="uap rescap com">
+  xmlns:desktop="http://schemas.microsoft.com/appx/manifest/desktop/windows10"
+  IgnorableNamespaces="uap rescap com desktop">
   <Identity
     Name="ZHT0711.BitwardenRustLocalPreview"
     Publisher="CN=ZHT0711 Bitwarden Rust Local Preview"
@@ -32,6 +33,9 @@
         <uap:SplashScreen Image="Assets\SplashScreen.scale-200.png" />
       </uap:VisualElements>
       <Extensions>
+        <desktop:Extension Category="windows.startupTask" Executable="Bitwarden.WinUI.exe" EntryPoint="Windows.FullTrustApplication">
+          <desktop:StartupTask TaskId="BitwardenRustStartup" Enabled="false" DisplayName="Bitwarden Rust (Preview)" />
+        </desktop:Extension>
         <com:Extension Category="windows.comServer">
           <com:ComServer>
             <com:ExeServer Executable="Bitwarden.WinUI.exe" Arguments="--passkey-provider" DisplayName="Bitwarden Rust Passkey Provider">

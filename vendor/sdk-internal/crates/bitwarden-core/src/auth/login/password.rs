@@ -84,7 +84,10 @@ pub(crate) async fn login_password(
         }
     }
 
-    Ok((PasswordLoginResponse::process_response(response), unlock_data))
+    Ok((
+        PasswordLoginResponse::process_response(response),
+        unlock_data,
+    ))
 }
 
 /// Server-wrapped account keys from a successful password login, for in-process unlock.
@@ -93,7 +96,8 @@ pub struct PasswordLoginUnlockData {
     /// KDF parameters and master-password-wrapped user key used during login.
     pub master_password: crate::key_management::MasterPasswordUnlockData,
     /// The encrypted account keys used during login.
-    pub account: crate::key_management::account_cryptographic_state::WrappedAccountCryptographicState,
+    pub account:
+        crate::key_management::account_cryptographic_state::WrappedAccountCryptographicState,
 }
 
 #[cfg(feature = "internal")]
@@ -104,12 +108,14 @@ impl PasswordLoginUnlockData {
         client: &Client,
         password: &str,
     ) -> Result<(), crate::client::encryption_settings::EncryptionSettingsError> {
-        client.internal.initialize_user_crypto_master_password_unlock(
-            password,
-            self.master_password.clone(),
-            self.account.clone(),
-            &None,
-        )
+        client
+            .internal
+            .initialize_user_crypto_master_password_unlock(
+                password,
+                self.master_password.clone(),
+                self.account.clone(),
+                &None,
+            )
     }
 }
 
@@ -147,10 +153,13 @@ pub struct PasswordLoginRequest {
 }
 
 #[allow(missing_docs)]
-#[derive(Serialize, Deserialize, Debug, JsonSchema)]
+#[derive(Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PasswordLoginResponse {
     pub authenticated: bool,
+    /// Server-issued remembered two-factor token. Never expose this to the UI.
+    #[serde(skip)]
+    pub two_factor_token: Option<String>,
     /// TODO: What does this do?
     pub reset_master_password: bool,
     /// Whether or not the user is required to update their master password
@@ -160,23 +169,37 @@ pub struct PasswordLoginResponse {
     pub two_factor: Option<TwoFactorProviders>,
 }
 
+impl std::fmt::Debug for PasswordLoginResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PasswordLoginResponse")
+            .field("authenticated", &self.authenticated)
+            .field("reset_master_password", &self.reset_master_password)
+            .field("force_password_reset", &self.force_password_reset)
+            .field("two_factor", &self.two_factor)
+            .finish_non_exhaustive()
+    }
+}
+
 impl PasswordLoginResponse {
     pub(crate) fn process_response(response: IdentityTokenResponse) -> PasswordLoginResponse {
         match response {
             IdentityTokenResponse::Authenticated(success) => PasswordLoginResponse {
                 authenticated: true,
+                two_factor_token: success.two_factor_token,
                 reset_master_password: success.reset_master_password,
                 force_password_reset: success.force_password_reset,
                 two_factor: None,
             },
             IdentityTokenResponse::Payload(_) => PasswordLoginResponse {
                 authenticated: true,
+                two_factor_token: None,
                 reset_master_password: false,
                 force_password_reset: false,
                 two_factor: None,
             },
             IdentityTokenResponse::TwoFactorRequired(two_factor) => PasswordLoginResponse {
                 authenticated: false,
+                two_factor_token: None,
                 reset_master_password: false,
                 force_password_reset: false,
                 two_factor: Some(two_factor.two_factor_providers.into()),

@@ -9,6 +9,7 @@ internal static class ClipboardCleaner
     private const string OwnershipFormat = "BitwardenRust.ClipboardOwner";
     private static string? _owner;
     private static DispatcherQueueTimer? _timer;
+    internal static event Action? Copied;
     [DllImport("user32.dll")]
     private static extern uint GetClipboardSequenceNumber();
 
@@ -22,11 +23,17 @@ internal static class ClipboardCleaner
             throw new InvalidOperationException("Clipboard could not be set.");
         _owner = owner;
         _timer?.Stop();
-        _timer = DispatcherQueue.GetForCurrentThread().CreateTimer();
-        _timer.Interval = TimeSpan.FromSeconds(30);
-        _timer.IsRepeating = false;
-        _timer.Tick += (_, _) => ClearOwned(owner);
-        _timer.Start();
+        _timer = null;
+        var seconds = DesktopPreferences.ReadClipboardDelay();
+        if (seconds > 0)
+        {
+            _timer = DispatcherQueue.GetForCurrentThread().CreateTimer();
+            _timer.Interval = TimeSpan.FromSeconds(seconds);
+            _timer.IsRepeating = false;
+            _timer.Tick += (_, _) => ClearOwned(owner);
+            _timer.Start();
+        }
+        Copied?.Invoke();
     }
 
     internal static async void ClearOwned(string? expectedOwner = null)

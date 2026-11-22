@@ -11,7 +11,7 @@
         <MicaBackdrop />
     </Window.SystemBackdrop>
 
-    <Grid RowDefinitions="48,*">
+    <Grid x:Name="WindowRoot" RowDefinitions="48,*">
         <TitleBar
             x:Name="AppTitleBar"
             Title="Bitwarden Rust"
@@ -99,6 +99,9 @@
             </NavigationView.MenuItems>
 
             <NavigationView.FooterMenuItems>
+                <NavigationViewItem Content="Send" Tag="sends" AutomationProperties.AutomationId="SendNavigationItem">
+                    <NavigationViewItem.Icon><SymbolIcon Symbol="Send" /></NavigationViewItem.Icon>
+                </NavigationViewItem>
                 <NavigationViewItem Content="密码生成器" Tag="generator">
                     <NavigationViewItem.Icon><SymbolIcon Symbol="Permissions" /></NavigationViewItem.Icon>
                 </NavigationViewItem>

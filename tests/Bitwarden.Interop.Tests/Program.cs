@@ -7,6 +7,13 @@ static void UseNativeLibrary(string libraryPath) =>
     NativeLibrary.SetDllImportResolver(typeof(RustCore).Assembly, (name, _, _) =>
         name == "bitwarden_core.dll" ? NativeLibrary.Load(libraryPath) : IntPtr.Zero);
 
+if (args is ["--remember-child", _, _, _, _, _])
+{
+    UseNativeLibrary(Path.GetFullPath(args[1]));
+    await RememberedTwoFactorChecks.ChildAsync(args);
+    return;
+}
+
 if (args is ["--cache-child", _, _, _, _, _])
 {
     UseNativeLibrary(Path.GetFullPath(args[1]));
@@ -25,6 +32,7 @@ void Check(bool result, string name)
 VaultTimeoutChecks.Run(Check);
 GeneratorSettingsChecks.Run(Check);
 PasskeyChecks.Run(Check);
+RustCore.CheckJsonContracts(Check);
 
 var items = Enumerable.Range(1, 8).Select(type => new VaultItem(type.ToString(), $"Type {type}", "user@example.invalid", type,
     type == 1, type == 2 ? "folder" : null, null, false, false, false, false)).ToArray();
@@ -60,7 +68,10 @@ if (args.Length > 0)
     var login = Task.Run(() => RustCore.Login("fixture@example.invalid", "synthetic-password", 0, "", "", 2, $"http://127.0.0.1:{port}", Guid.NewGuid().ToString("D"), cancellation.Token));
     try
     {
-        using var connection = await listener.AcceptTcpClientAsync().WaitAsync(TimeSpan.FromSeconds(10));
+        var accepted = listener.AcceptTcpClientAsync();
+        if (await Task.WhenAny(accepted, login).WaitAsync(TimeSpan.FromSeconds(10)) == login)
+            throw new InvalidOperationException($"Synthetic login ended before reaching the cancellation listener: {(await login).Status}.");
+        using var connection = await accepted;
         cancellation.Cancel();
         var result = await login.WaitAsync(TimeSpan.FromSeconds(5));
         Check(result.Status == AuthStatus.Cancelled, "cancellation interrupts a hanging server through the actual ABI");
@@ -70,6 +81,7 @@ if (args.Length > 0)
     if (args.Length > 1)
     {
         await NativeLifecycle.RunAsync(args[1], Check);
+        await RememberedTwoFactorChecks.RunAsync(libraryPath, args[1], Check);
         await LocalCacheChecks.RunAsync(libraryPath, args[1], Check);
     }
 }

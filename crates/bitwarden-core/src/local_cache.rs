@@ -279,8 +279,22 @@ fn load_at(root: &Path, identity: &str) -> Result<Option<Zeroizing<Vec<u8>>>, ()
 }
 
 fn load_protected_at(path: &Path, digest: &[u8; 32]) -> Result<Option<Zeroizing<Vec<u8>>>, ()> {
+    load_protected_bounded(
+        path,
+        digest,
+        &path.with_extension("revoked"),
+        MAX_STATE_BYTES,
+    )
+}
+
+fn load_protected_bounded(
+    path: &Path,
+    digest: &[u8; 32],
+    marker: &Path,
+    limit: u64,
+) -> Result<Option<Zeroizing<Vec<u8>>>, ()> {
     // Fail closed if the marker exists or its status cannot be checked.
-    match fs::symlink_metadata(path.with_extension("revoked")) {
+    match fs::symlink_metadata(marker) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         _ => return Ok(None),
     }
@@ -289,17 +303,16 @@ fn load_protected_at(path: &Path, digest: &[u8; 32]) -> Result<Option<Zeroizing<
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err(()),
     };
-    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > MAX_STATE_BYTES
-    {
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > limit {
         let _ = fs::remove_file(path);
         return Ok(None);
     }
     let file = OpenOptions::new().read(true).open(path).map_err(|_| ())?;
     let mut encrypted = Vec::with_capacity(metadata.len() as usize);
-    file.take(MAX_STATE_BYTES + 1)
+    file.take(limit + 1)
         .read_to_end(&mut encrypted)
         .map_err(|_| ())?;
-    if encrypted.len() as u64 > MAX_STATE_BYTES {
+    if encrypted.len() as u64 > limit {
         let _ = fs::remove_file(path);
         return Ok(None);
     }
@@ -346,7 +359,96 @@ pub(crate) fn entries() -> impl Iterator<Item = ([u8; 32], Zeroizing<Vec<u8>>)> 
 }
 
 pub(crate) fn remove(identity: &str) -> bool {
-    configured_root().is_none_or(|root| revoke_at(&root, &account_digest(identity)))
+    configured_root().is_none_or(|root| {
+        let snapshot_revoked = revoke_at(&root, &account_digest(identity));
+        remove_hello_at(&root, identity) && snapshot_revoked
+    })
+}
+
+fn two_factor_paths(root: &Path, identity: &str) -> (PathBuf, PathBuf, [u8; 32]) {
+    let digest = account_digest(&format!("RememberedTwoFactor/v1\n{identity}"));
+    let path = cache_path(root, &digest);
+    (
+        path.with_extension("two-factor"),
+        path.with_extension("two-factor-revoked"),
+        digest,
+    )
+}
+
+// Independent of the vault snapshot: logout removes keys/Hello, not the user's
+// explicit remembered-2FA choice. These records are not restored as accounts.
+pub(crate) fn load_two_factor(identity: &str) -> Option<Zeroizing<Vec<u8>>> {
+    let root = configured_root()?;
+    let (path, marker, digest) = two_factor_paths(&root, identity);
+    load_protected_bounded(&path, &digest, &marker, 16 * 1024)
+        .ok()
+        .flatten()
+}
+
+pub(crate) fn save_two_factor(identity: &str, record: &[u8]) -> bool {
+    configured_root().is_some_and(|root| {
+        let (path, marker, digest) = two_factor_paths(&root, identity);
+        save_protected_at(&path, &digest, record).is_ok() && remove_if_present(&marker).is_ok()
+    })
+}
+
+pub(crate) fn remove_two_factor(identity: &str) -> bool {
+    configured_root().is_none_or(|root| {
+        let (path, marker, digest) = two_factor_paths(&root, identity);
+        if remove_if_present(&path).is_ok() {
+            let _ = remove_if_present(&marker);
+            return true;
+        }
+        fs::symlink_metadata(&marker).is_ok()
+            || save_protected_at(&marker, &digest, b"BitwardenRust/revoked-two-factor/v1").is_ok()
+    })
+}
+
+fn hello_paths(root: &Path, identity: &str) -> (PathBuf, PathBuf, [u8; 32]) {
+    let digest = account_digest(&format!("WindowsHello/v1\n{identity}"));
+    let path = cache_path(root, &digest);
+    (
+        path.with_extension("hello"),
+        path.with_extension("hello-revoked"),
+        digest,
+    )
+}
+
+pub(crate) fn has_persisted_snapshot(identity: &str) -> bool {
+    configured_root().is_some_and(|root| {
+        let digest = account_digest(identity);
+        matches!(fs::symlink_metadata(revoked_path(&root, &digest)), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+            && fs::symlink_metadata(cache_path(&root, &digest)).is_ok_and(|data| data.is_file() && !data.file_type().is_symlink())
+    })
+}
+
+pub(crate) fn load_hello(identity: &str) -> Option<Zeroizing<Vec<u8>>> {
+    let root = configured_root()?;
+    let (path, marker, digest) = hello_paths(&root, identity);
+    load_protected_bounded(&path, &digest, &marker, 16 * 1024)
+        .ok()
+        .flatten()
+}
+
+pub(crate) fn save_hello(identity: &str, enrollment: &[u8]) -> bool {
+    configured_root().is_some_and(|root| {
+        let (path, marker, digest) = hello_paths(&root, identity);
+        save_protected_at(&path, &digest, enrollment).is_ok() && remove_if_present(&marker).is_ok()
+    })
+}
+
+fn remove_hello_at(root: &Path, identity: &str) -> bool {
+    let (path, marker, digest) = hello_paths(root, identity);
+    if remove_if_present(&path).is_ok() {
+        let _ = remove_if_present(&marker);
+        return true;
+    }
+    fs::symlink_metadata(&marker).is_ok()
+        || save_protected_at(&marker, &digest, b"BitwardenRust/revoked-hello/v1").is_ok()
+}
+
+pub(crate) fn remove_hello(identity: &str) -> bool {
+    configured_root().is_some_and(|root| remove_hello_at(&root, identity))
 }
 
 #[no_mangle]
@@ -445,6 +547,43 @@ mod tests {
             load_at(root, identity).unwrap().unwrap().as_slice(),
             b"fresh cache"
         );
+    }
+
+    #[test]
+    fn hello_revocation_is_independent_of_the_snapshot_and_fails_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let identity = "https://api.bitwarden.com\nuser@example.invalid";
+        save_at(root, identity, b"snapshot").unwrap();
+        let (path, marker, digest) = hello_paths(root, identity);
+        save_protected_at(&path, &digest, b"sealed key").unwrap();
+        assert_eq!(
+            load_protected_bounded(&path, &digest, &marker, 4096)
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            b"sealed key"
+        );
+        let other_id = "https://api.bitwarden.eu\nuser@example.invalid";
+        assert_ne!(hello_paths(root, other_id).2, digest);
+        assert_ne!(account_digest(identity), digest);
+        let held = OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&path)
+            .unwrap();
+        assert!(remove_hello_at(root, identity));
+        assert!(path.exists() && marker.is_file());
+        assert!(load_protected_bounded(&path, &digest, &marker, 4096)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            load_at(root, identity).unwrap().unwrap().as_slice(),
+            b"snapshot"
+        );
+        drop(held);
+        assert!(remove_hello_at(root, identity));
+        assert!(!path.exists() && !marker.exists());
     }
 
     #[test]

@@ -40,15 +40,17 @@ public sealed partial class MainWindow
         try
         {
             var request = await Task.Run(RustCore.PendingPasskey);
-            if (_closed || _accountTransition || string.IsNullOrEmpty(request.Id)) return;
+            if (_closed || _signInDialogOpen || _accountTransition || string.IsNullOrEmpty(request.Id)) return;
             var requestId = request.Id;
-            Activate();
+            ShowMainWindow();
+            if (request.BlockedReason == "ownVault") { await ShowPasskeyRefusalAsync(request); return; }
             if (request.SessionState == VaultSessionState.SignedOut) await ShowSignInDialogAsync();
             else if (request.SessionState == VaultSessionState.Locked) await ShowUnlockDialogAsync();
             if (_closed) return;
             if (RustCore.SessionState != VaultSessionState.Unlocked) { RustCore.CancelPasskey(requestId); return; }
             request = await Task.Run(RustCore.PendingPasskey);
             if (!request.IsFor(requestId)) return;
+            if (request.BlockedReason == "ownVault") { await ShowPasskeyRefusalAsync(request); return; }
             var ready = request.NeedsSync ? await SynchronizePasskeyVaultAsync(request) : request;
             if (!_closed && !_accountTransition && ready is not null && ready.IsReadyFor(requestId) &&
                 RustCore.SessionState == VaultSessionState.Unlocked && RustCore.IsPasskeyActive(requestId))
@@ -60,6 +62,35 @@ public sealed partial class MainWindow
             // A vault editor or sign-in dialog may already occupy this XamlRoot. Poll again later.
         }
         finally { _passkeyChecking = false; }
+    }
+
+    private async Task ShowPasskeyRefusalAsync(PasskeyPending request)
+    {
+        if (_closed || _accountTransition || !RustCore.IsPasskeyActive(request.Id)) return;
+        var dialog = new ContentDialog
+        {
+            XamlRoot = NavView.XamlRoot,
+            Title = "无法保存此保险库的登录通行密钥",
+            Content = new TextBlock
+            {
+                Text = "不能把登录当前保险库的通行密钥存回它自己：保险库锁定或退出后，你可能无法再登录。请在浏览器中重试，选择 Windows Hello、安全密钥或另一个独立的密码库。",
+                TextWrapping = TextWrapping.Wrap,
+                MaxWidth = 460,
+            },
+            CloseButtonText = "知道了",
+            DefaultButton = ContentDialogButton.Close,
+        };
+        AutomationProperties.SetAutomationId(dialog, "PasskeyOwnVaultDialog");
+        var timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(350) };
+        timer.Tick += (_, _) => { if (!RustCore.IsPasskeyActive(request.Id)) dialog.Hide(); };
+        dialog.Opened += (_, _) => timer.Start();
+        try
+        {
+            _passkeyDialog = dialog;
+            await dialog.ShowAsync();
+            await Task.Run(() => RustCore.DismissPasskeyRefusal(request.Id));
+        }
+        finally { timer.Stop(); _passkeyDialog = null; }
     }
 
     private async Task<PasskeyPending?> SynchronizePasskeyVaultAsync(PasskeyPending request)

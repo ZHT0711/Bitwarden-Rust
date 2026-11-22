@@ -11,6 +11,8 @@ mod from_client_part;
 mod gov_mode;
 #[allow(missing_docs)]
 pub mod internal;
+#[cfg(not(target_arch = "wasm32"))]
+mod loopback_http;
 pub use from_client_part::{FromClient, FromClientPart, FromClientShared};
 pub use internal::ApiConfigurations;
 #[allow(missing_docs)]

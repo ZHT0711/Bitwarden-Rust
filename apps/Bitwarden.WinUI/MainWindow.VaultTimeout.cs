@@ -163,6 +163,8 @@ public sealed partial class MainWindow
     private void OnWindowsVaultEvent(VaultTimeoutMode mode)
     {
         if (_closed || (_accounts.Length == 0 && !_signInDialogOpen)) return;
+        // A Windows lock/suspend must not leave an in-flight Hello prompt able to unlock afterward.
+        _unlockRequest?.Cancel();
         _pendingWindowsTimeout |= mode == VaultTimeoutMode.SystemLock
             ? PendingWindowsTimeout.Lock : PendingWindowsTimeout.Sleep;
         _ = ApplyPendingWindowsTimeoutAsync();

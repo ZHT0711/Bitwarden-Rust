@@ -11,7 +11,7 @@ internal static class NativeLifecycle
         if (!Uri.TryCreate(address, UriKind.Absolute, out var uri) || !uri.IsLoopback || uri.Scheme != "http")
             throw new ArgumentException("Native lifecycle tests only allow a loopback HTTP fixture server.");
         using var http = new HttpClient { BaseAddress = uri, Timeout = TimeSpan.FromSeconds(10) };
-        var health = await http.GetFromJsonAsync<JsonElement>("/health");
+        var health = await http.GetFromJsonAsync("/health", FixtureJsonContext.Default.JsonElement);
         if (!health.GetProperty("fixture").GetBoolean()) throw new Exception("Not a synthetic fixture server.");
         await Control("reset");
         RustCore.Logout();
@@ -32,22 +32,30 @@ internal static class NativeLifecycle
             check(invalidCode.Status == AuthStatus.InvalidNewDeviceVerificationCode, $"invalid new-device code remains distinct from invalid credentials ({invalidCode.Status})");
             await Control("require-authenticator");
             var secondFactor = RustCore.Login("test@bitwarden.com", FixturePassword, 0, string.Empty, "246810", 2, address, deviceIdentifier);
-            check(secondFactor.Status == AuthStatus.TwoFactorRequired && (secondFactor.AvailableTwoFactorMethods & 1) != 0,
-                "NodeWarden null authenticator challenge keeps its verification method");
-            var login = await Task.Run(() => RustCore.Login("test@bitwarden.com", FixturePassword, 0, "287349", "246810", 2, address, deviceIdentifier));
-            check(login.Status == AuthStatus.Authenticated, "real DLL handles equivalent NodeWarden casing aliases during prelogin and token exchange");
+            check(secondFactor.Status == AuthStatus.TwoFactorRequired && secondFactor.AvailableTwoFactorMethods == 1,
+                "nested self-hosted authenticator challenge preserves the actual provider");
+            var malformed = RustCore.Login("test@bitwarden.com", FixturePassword, 0, "abc", "", 2, address, deviceIdentifier);
+            check(malformed.Status == AuthStatus.InvalidTwoFactorCode && !RustCore.IsAuthenticated,
+                "malformed authenticator codes cannot authenticate");
+            var rejected = RustCore.Login("test@bitwarden.com", FixturePassword, 0, "123456", "", 2, address, deviceIdentifier);
+            check(rejected.Status == AuthStatus.InvalidTwoFactorCode && !RustCore.IsAuthenticated,
+                "a self-hosted server's invalid or replayed authenticator token is not reported as a bad master password");
+            var login = await Task.Run(() => RustCore.Login("test@bitwarden.com", FixturePassword, 0, "087 349", "", 2, address, deviceIdentifier));
+            check(login.Status == AuthStatus.Authenticated, "real DLL accepts a new authenticator code with whitespace and a leading zero after a rejected attempt");
             check(RustCore.Lock() && RustCore.SessionState == VaultSessionState.Locked, "account can lock before its first sync");
             RustCore.Unlock(FixturePassword, CancellationToken.None);
             ExpectCode(() => RustCore.GetVaultOverview(), "notFound", "unlock before first sync leaves the unsynced vault empty");
             var initial = RustCore.SyncVault(CancellationToken.None);
             check(initial.Items.Length == 2, "real DLL syncs a profile with wrapped account keys without a host state bridge");
+            await SendChecks.RunAsync(uri, check);
+            await VaultExportChecks.RunAsync(uri, check);
             var protectedItem = initial.Items.Single(item => item.Name == "Synthetic protected item");
             ExpectCode(() => RustCore.GetVaultDetail(protectedItem.Id, "", CancellationToken.None), "passwordRequired",
                 "an attachment detail lease requires the item's master-password reprompt");
             var protectedDetail = RustCore.GetVaultDetail(protectedItem.Id, FixturePassword, CancellationToken.None);
             var attachment = protectedDetail.AttachmentFiles!.Single();
             var attachmentRequest = protectedDetail.AttachmentRequestId!.Value;
-            var summary = JsonSerializer.Serialize(attachment, new JsonSerializerOptions(JsonSerializerDefaults.Web));
+            var summary = JsonSerializer.Serialize(attachment, FixtureJsonContext.Default.VaultAttachment);
             check(attachment.Name == "synthetic-attachment.txt" && attachment.Size > 0 &&
                 !summary.Contains("\"key\"", StringComparison.Ordinal) && !summary.Contains("\"url\"", StringComparison.Ordinal),
                 "attachment details expose the decrypted name and size without keys or download URLs");
@@ -179,14 +187,14 @@ internal static class NativeLifecycle
             var requestForTotp = detail.TotpRequestId ?? throw new Exception("TOTP access was not granted.");
             check(detail.Totp is { Status: "ready", Value: { Period: 17 } totp }
                 && totp.Code.Length == 8 && totp.ValidUntil - totp.ValidFrom == 17, "details contain the generated code and custom period");
-            check(!JsonSerializer.Serialize(detail).Contains(seed, StringComparison.Ordinal), "detail ABI keeps the TOTP seed in Rust");
+            check(!JsonSerializer.Serialize(detail, FixtureJsonContext.Default.VaultDetail).Contains(seed, StringComparison.Ordinal), "detail ABI keeps the TOTP seed in Rust");
             check(RustCore.RefreshTotp(requestForTotp).Code.Length == 8, "a verified item refreshes its code without another password");
             RustCore.CloseVaultDetail(requestForTotp);
             ExpectCode(() => RustCore.RefreshTotp(requestForTotp), "totpViewExpired", "closing details revokes code generation");
             ExpectCode(() => RustCore.GetVaultEditor(id, string.Empty, CancellationToken.None), "passwordRequired", "editor reprompt enforced through ABI");
             var editor = RustCore.GetVaultEditor(id, FixturePassword, CancellationToken.None);
             check(editor.Values["password"] == "synthetic-abi-secret" && editor.Uris.Single().Match == 3, "SDK-decrypted editor values and URI mode survive ABI");
-            var projection = JsonSerializer.Serialize(editor, new JsonSerializerOptions(JsonSerializerDefaults.Web));
+            var projection = RustCore.JsonForChecks(editor);
             check(!projection.Contains("\"key\":", StringComparison.Ordinal) && !projection.Contains("keyValue", StringComparison.Ordinal) &&
                 !projection.Contains("passwordHistory", StringComparison.Ordinal), "editor ABI excludes native keys, passkey material and password history");
             var changed = editor with { Name = "ABI edited login", Values = new(editor.Values) { ["password"] = "synthetic-abi-updated" } };
@@ -339,7 +347,7 @@ internal static class NativeLifecycle
             var passkeyDetail = RustCore.GetVaultDetail(passkeyId, string.Empty, CancellationToken.None);
             check(passkeyDetail.Passkeys is [{ RelyingParty: "example.com", UserName: "fixture-user" }],
                 "detail exposes the saved passkey's display metadata");
-            var passkeyDetailJson = JsonSerializer.Serialize(passkeyDetail);
+            var passkeyDetailJson = JsonSerializer.Serialize(passkeyDetail, FixtureJsonContext.Default.VaultDetail);
             check(!passkeyDetailJson.Contains("SYNTHETIC-PASSKEY-PRIVATE", StringComparison.Ordinal) &&
                 !passkeyDetailJson.Contains("SYNTHETIC-SITE-HANDLE", StringComparison.Ordinal) &&
                 !passkeyDetailJson.Contains("SYNTHETIC-CREDENTIAL", StringComparison.Ordinal),
@@ -376,7 +384,7 @@ internal static class NativeLifecycle
         async Task CheckAccountSwitching(Uri peer)
         {
             using var otherServer = new HttpClient { BaseAddress = peer, Timeout = TimeSpan.FromSeconds(10) };
-            var otherHealth = await otherServer.GetFromJsonAsync<JsonElement>("/health");
+            var otherHealth = await otherServer.GetFromJsonAsync("/health", FixtureJsonContext.Default.JsonElement);
             if (!otherHealth.GetProperty("fixture").GetBoolean()) throw new Exception("Second server must be a loopback fixture.");
             var otherAddress = peer.GetLeftPart(UriPartial.Authority);
             var device = Guid.NewGuid().ToString("D");
@@ -460,7 +468,7 @@ internal static class NativeLifecycle
         }
         Task<int> Count() => FixtureCount("cipherCount");
         async Task<int> FixtureCount(string property) =>
-            (await http.GetFromJsonAsync<JsonElement>("/control/snapshot")).GetProperty(property).GetInt32();
+            (await http.GetFromJsonAsync("/control/snapshot", FixtureJsonContext.Default.JsonElement)).GetProperty(property).GetInt32();
         async Task<bool> WaitForTransfer(string counter, int before, Task pending)
         {
             var deadline = DateTime.UtcNow.AddSeconds(2);

@@ -124,7 +124,11 @@ internal static class LocalCacheChecks
             case "seed":
                 Require(accounts.Length == 0, "starts with an empty disk cache");
                 Login(primary);
+                var fresh = RustCore.GetAccounts().Single(account => account.Active);
+                Expect("notSynced", () => RustCore.EnableHello(fresh.Id, Password, token));
                 RustCore.SyncVault(token);
+                Expect("wrongPassword", () => RustCore.EnableHello(fresh.Id, "wrong fixture password", token));
+                Require(!RustCore.GetAccounts().Single(account => account.Active).HelloEnabled, "Hello enrollment is opt-in and requires master password confirmation");
                 CreateNote(PrimaryNote);
                 Login(peer);
                 RustCore.SyncVault(token);
@@ -136,6 +140,10 @@ internal static class LocalCacheChecks
                 Require(accounts.Length == 2 && accounts.All(account => account is { State: VaultSessionState.Locked, NeedsSignIn: true }),
                     "both previously synced accounts restart locked and without server tokens");
                 var a = Select(primary);
+                Require(!a.HelloEnabled, "restarting does not implicitly enable Windows Hello");
+                Expect("helloNotEnabled", () => RustCore.UnlockHello(a.Id, token));
+                Expect("unlockUnavailable", () => RustCore.UnlockHello(accounts.Single(account => account.Id != a.Id).Id, token));
+                Require(RustCore.SessionState == VaultSessionState.Locked, "rejecting unenrolled or inactive Hello leaves the vault locked");
                 Expect("locked", () => RustCore.GetVaultOverview());
                 Expect("wrongPassword", () => RustCore.Unlock("wrong fixture password", token));
                 Require(RustCore.SessionState == VaultSessionState.Locked, "a wrong password never unlocks the cached vault");
@@ -256,7 +264,7 @@ internal static class LocalCacheChecks
         ? uri : throw new ArgumentException("Only a loopback fixture may be used.");
     private static async Task<JsonElement> Health(HttpClient http)
     {
-        var health = await http.GetFromJsonAsync<JsonElement>("/health");
+        var health = await http.GetFromJsonAsync("/health", FixtureJsonContext.Default.JsonElement);
         Require(health.GetProperty("fixture").GetBoolean(), "server identifies itself as a synthetic fixture");
         return health;
     }
@@ -265,8 +273,8 @@ internal static class LocalCacheChecks
         using var response = await http.PostAsync($"/control/{command}", null);
         response.EnsureSuccessStatusCode();
     }
-    private static async Task<int> CipherCount(HttpClient http) => (await http.GetFromJsonAsync<JsonElement>("/control/snapshot")).GetProperty("cipherCount").GetInt32();
-    private static async Task<int> SyncCount(HttpClient http) => (await http.GetFromJsonAsync<JsonElement>("/control/snapshot")).GetProperty("syncRequests").GetInt32();
+    private static async Task<int> CipherCount(HttpClient http) => (await http.GetFromJsonAsync("/control/snapshot", FixtureJsonContext.Default.JsonElement)).GetProperty("cipherCount").GetInt32();
+    private static async Task<int> SyncCount(HttpClient http) => (await http.GetFromJsonAsync("/control/snapshot", FixtureJsonContext.Default.JsonElement)).GetProperty("syncRequests").GetInt32();
     private static void Expect(string code, Action action)
     {
         try { action(); }

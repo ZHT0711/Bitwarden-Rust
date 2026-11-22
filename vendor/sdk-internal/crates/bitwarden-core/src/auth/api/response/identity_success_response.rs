@@ -17,8 +17,8 @@ pub(crate) struct IdentityTokenSuccessResponse {
     pub(crate) private_key: Option<String>,
     #[serde(alias = "Key")]
     pub(crate) key: Option<String>,
-    #[serde(rename = "twoFactorToken")]
-    two_factor_token: Option<String>,
+    #[serde(rename = "twoFactorToken", alias = "TwoFactorToken")]
+    pub(crate) two_factor_token: Option<String>,
     #[serde(alias = "Kdf")]
     kdf: KdfType,
     #[serde(rename = "kdfIterations", alias = "KdfIterations")]

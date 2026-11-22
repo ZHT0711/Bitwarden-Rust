@@ -52,20 +52,22 @@ pub extern "C" fn bw_passkey_pending() -> *mut c_char {
         let state = bw_auth_session_state();
         let mut choices = vec![];
         let mut needs_sync = false;
-        if state == SESSION_UNLOCKED {
+        if state != SESSION_SIGNED_OUT {
             let Ok(guard) = auth_client().try_lock() else {
                 return vault_error("busy");
             };
-            let Some(session) = guard
-                .active
-                .as_ref()
-                .filter(|_| bw_auth_session_state() == SESSION_UNLOCKED)
-            else {
-                return vault_access_error();
+            let Some(session) = guard.active.as_ref().filter(|session| session.state == state) else {
+                return vault_error("busy");
             };
             if is_vault_registration(&session.server, &request.operation) {
-                request.reject_before_approval(VaultError::NotFound);
-                return vault_success(&serde_json::json!({"id":""}));
+                // Explain the refusal in the provider UI before returning the typed result to
+                // Windows; otherwise Windows only shows a generic credential-save error.
+                return vault_success(&serde_json::json!({"id": request.id, "creating": true,
+                    "sessionState": state, "relyingParty": request.operation.rp_id, "blockedReason": "ownVault"}));
+            }
+            if state != SESSION_UNLOCKED {
+                return vault_success(&serde_json::json!({"id": request.id, "creating": request.operation.creating,
+                    "sessionState": state, "relyingParty": request.operation.rp_id}));
             }
             let Some(runtime) = runtime() else {
                 return vault_error("internal");
@@ -162,6 +164,28 @@ pub unsafe extern "C" fn bw_passkey_cancel(id: *const c_char) {
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn bw_passkey_dismiss_refusal(id: *const c_char) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let Some(id) = (unsafe { read_utf8(id) }) else {
+            return;
+        };
+        let Some(request) = passkey_provider::pending().filter(|request| request.id == id) else {
+            return;
+        };
+        let guard = auth_client()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard
+            .active
+            .as_ref()
+            .is_some_and(|session| is_vault_registration(&session.server, &request.operation))
+        {
+            request.reject_before_approval(VaultError::NotFound);
+        }
+    }));
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn bw_passkey_respond(
     json: *const c_char,
     password: *const c_char,
@@ -175,6 +199,11 @@ pub unsafe extern "C" fn bw_passkey_respond(
         let Some(request) = passkey_provider::pending().filter(|p| p.id == approval.id) else { return vault_error("cancelled"); };
         if let Err(e) = request.begin() { return vault_error(&e.to_string()); }
         let result = (|| -> Result<Vec<u8>, VaultError> {
+            {
+                let guard = auth_client().lock().map_err(|_| VaultError::Internal)?;
+                let session = guard.active.as_ref().filter(|session| session.state == SESSION_UNLOCKED).ok_or(VaultError::NotAuthenticated)?;
+                if is_vault_registration(&session.server, &request.operation) { return Err(VaultError::NotFound); }
+            }
             request.verify(window, request.operation.user_name.as_deref().unwrap_or(""))?;
             let mut guard = auth_client().lock().map_err(|_| VaultError::Internal)?;
             let session = guard.active.as_mut().filter(|_| bw_auth_session_state() == SESSION_UNLOCKED).ok_or(VaultError::NotAuthenticated)?;

@@ -6,11 +6,14 @@ use std::{
 };
 
 pub(crate) mod attachments;
+pub(crate) mod export;
 mod folder_repository;
+pub(crate) mod import;
 mod mutations;
 pub(crate) mod passkeys;
 mod repository;
 mod totp;
+mod transfer_csv;
 use folder_repository::FolderRepository;
 pub(crate) use mutations::{VaultEditorData, VaultMutationResult};
 use repository::CipherRepository;
@@ -76,6 +79,10 @@ pub(crate) enum VaultError {
     AttachmentTooLarge,
     #[error("fileAccess")]
     FileAccess,
+    #[error("importFormat")]
+    ImportFormat,
+    #[error("importPassword")]
+    ImportPassword,
     #[error("cancelled")]
     Cancelled,
     #[error("internal")]
@@ -130,8 +137,11 @@ pub(crate) struct VaultCache {
     last_sync: Option<String>,
     parse_failures: usize,
     base_failures: usize,
+    // Track per-cipher failures so a confirmed single-item write can repair its count.
+    decryption_failures: HashSet<String>,
     can_archive: bool,
     can_generate_totp: bool,
+    export_policy: export::ExportPolicy,
     write_uncertain: bool,
     write_started: bool,
     user_id: Option<Uuid>,
@@ -210,9 +220,7 @@ impl VaultCache {
             ciphers: self
                 .ciphers
                 .snapshot()
-                .map_err(|_| VaultError::LocalStorage)?
-                .into_values()
-                .collect(),
+                .map_err(|_| VaultError::LocalStorage)?,
             folders: self
                 .folders
                 .snapshot()
@@ -433,6 +441,7 @@ impl VaultCache {
             folders,
             encrypted_user_key: profile.key.clone(),
             can_archive: profile.premium.unwrap_or(false) || organization_premium,
+            export_policy: export::ExportPolicy::from_sync(&response),
             can_generate_totp: profile.premium.unwrap_or(false)
                 || profile
                     .premium_from_organization
@@ -445,6 +454,7 @@ impl VaultCache {
     }
 
     pub(crate) fn discard_overview(&mut self) {
+        self.decryption_failures.clear();
         if let Some(mut overview) = self.overview.take() {
             use zeroize::Zeroize;
             for item in &mut overview.items {
@@ -491,13 +501,19 @@ impl VaultCache {
         Ok(())
     }
 
-    async fn project_items(&self, client: &Client) -> Result<(Vec<VaultItem>, usize), VaultError> {
-        let ciphers = self
-            .ciphers
-            .snapshot()
-            .map_err(|_| VaultError::Internal)?
-            .into_values()
-            .collect::<Vec<_>>();
+    async fn project_items(
+        &self,
+        client: &Client,
+    ) -> Result<(Vec<VaultItem>, HashSet<String>), VaultError> {
+        let ciphers = self.ciphers.snapshot().map_err(|_| VaultError::Internal)?;
+        Self::project_ciphers(client, ciphers).await
+    }
+
+    /// Use the same strict SDK projection for full syncs and confirmed single-item writes.
+    async fn project_ciphers(
+        client: &Client,
+        ciphers: Vec<Cipher>,
+    ) -> Result<(Vec<VaultItem>, HashSet<String>), VaultError> {
         let types: HashMap<_, _> = ciphers
             .iter()
             .filter_map(|cipher| cipher.id.map(|id| (id, cipher.r#type as u8)))
@@ -508,8 +524,17 @@ impl VaultCache {
             .decrypt_list_with_failures(ciphers.into())
             .await
             .map_err(|_| VaultError::DecryptionFailed)?;
-        let failures = result.failures.len();
-        let mut items = Vec::new();
+        let failures = result
+            .failures
+            .iter()
+            .map(|cipher| {
+                cipher
+                    .id
+                    .map(|id| id.to_string())
+                    .ok_or(VaultError::InvalidResponse)
+            })
+            .collect::<Result<HashSet<_>, _>>()?;
+        let mut items = Vec::with_capacity(result.successes.len());
         let allow_legacy_icon_uris = client.internal.get_security_version()
             < bw_sdk_core::key_management::MINIMUM_ENFORCE_ICON_URI_HASH_VERSION;
         for view in result.successes {
@@ -581,10 +606,11 @@ impl VaultCache {
         self.overview = Some(VaultOverview {
             items,
             folders,
-            failures: failures + decryption_failures,
+            failures: failures + decryption_failures.len(),
             last_sync,
             read_only: self.local_read_only,
         });
+        self.decryption_failures = decryption_failures;
         Ok(())
     }
 

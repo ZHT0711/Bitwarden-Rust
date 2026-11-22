@@ -49,6 +49,8 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cargo fmt --all -- --check
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          rustfmt --edition 2024 --check --config skip_children=true vendor/sdk-internal/crates/bitwarden-core/src/client/builder.rs vendor/sdk-internal/crates/bitwarden-core/src/client/internal.rs vendor/sdk-internal/crates/bitwarden-core/src/client/mod.rs vendor/sdk-internal/crates/bitwarden-core/src/client/loopback_http.rs
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cargo test --locked -p bitwarden-core@0.2.0
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cargo clippy --locked -p bitwarden-core@0.2.0 --all-targets -- -D warnings
@@ -57,7 +59,14 @@ jobs:
           $env:BITWARDEN_FIXTURE_OUTPUT = Join-Path $env:GITHUB_WORKSPACE 'work/ci-fixture.json'
           cargo test --locked -p bitwarden-core@0.2.0 write_synthetic_ui_fixture -- --ignored
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-      - name: Managed filters and native HTTP lifecycle
+      - name: Release native behavior
+        shell: pwsh
+        run: |
+          . ./scripts/build-rust-core.ps1 -Profile Release
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo test --locked --release -p bitwarden-core@0.2.0
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Managed filters and release native HTTP lifecycle
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -101,7 +110,7 @@ jobs:
             if (-not $ready) { throw 'Fixture server readiness timed out after 30 seconds.' }
             $server.Refresh()
             if ($server.HasExited) { throw 'Fixture server exited before the native lifecycle checks.' }
-            dotnet run --project tests/Bitwarden.Interop.Tests -- target/debug/bitwarden_core.dll $baseUrl
+            dotnet run --project tests/Bitwarden.Interop.Tests -- target/release/bitwarden_core.dll $baseUrl
             if ($LASTEXITCODE) { throw "Managed/native lifecycle checks failed with exit code $LASTEXITCODE." }
           } catch {
             if (-not $ready) {
@@ -134,7 +143,7 @@ jobs:
             }
           }
       - name: Build unsigned x64 MSIX preview
-        run: dotnet build apps/Bitwarden.WinUI/Bitwarden.WinUI.csproj -p:Platform=x64 -p:GenerateAppxPackageOnBuild=true -p:AppxPackageSigningEnabled=false --nologo
+        run: dotnet build apps/Bitwarden.WinUI/Bitwarden.WinUI.csproj -c Release -p:Platform=x64 -p:GenerateAppxPackageOnBuild=true -p:AppxPackageSigningEnabled=false --nologo
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: Bitwarden-Rust-unsigned-msix-x64

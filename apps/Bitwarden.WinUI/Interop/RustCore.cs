@@ -28,7 +28,7 @@ internal static partial class RustCore
     [DllImport(LibraryName, EntryPoint = "bw_string_free", CallingConvention = CallingConvention.Cdecl)]
     private static extern void FreeStringNative(IntPtr value);
 
-    [DllImport(LibraryName, EntryPoint = "bw_auth_login", CallingConvention = CallingConvention.Cdecl)]
+    [DllImport(LibraryName, EntryPoint = "bw_auth_login_with_remember", CallingConvention = CallingConvention.Cdecl)]
     private static extern uint LoginNative(
         IntPtr email,
         IntPtr password,
@@ -38,6 +38,7 @@ internal static partial class RustCore
         IntPtr serverUrl,
         IntPtr deviceIdentifier,
         IntPtr deviceOtp,
+        byte remember,
         ulong requestId);
 
     [DllImport(LibraryName, EntryPoint = "bw_auth_send_two_factor_email", CallingConvention = CallingConvention.Cdecl)]
@@ -102,8 +103,6 @@ internal static partial class RustCore
     [DllImport(LibraryName, EntryPoint = "bw_vault_action", CallingConvention = CallingConvention.Cdecl)]
     private static extern IntPtr VaultActionNative(IntPtr id, IntPtr action, IntPtr revision, IntPtr password, ulong requestId);
 
-    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
-
     internal static VaultOverview GetVaultOverview() => ReadJson<VaultOverview>(VaultOverviewNative());
 
     internal static VaultOverview SyncVault(CancellationToken token) =>
@@ -129,13 +128,13 @@ internal static partial class RustCore
 
     internal static VaultMutationResult CreateVaultItem(VaultEditorData data, CancellationToken token)
     {
-        using var json = new Utf8Buffer(JsonSerializer.Serialize(data, JsonOptions));
+        using var json = new Utf8Buffer(JsonSerializer.Serialize(data, JsonInfo<VaultEditorData>()));
         return RunVaultRequest<VaultMutationResult>(requestId => VaultCreateNative(json.Pointer, requestId), token, acknowledgedWrite: true);
     }
 
     internal static VaultMutationResult UpdateVaultItem(VaultEditorData data, string password, CancellationToken token)
     {
-        using var json = new Utf8Buffer(JsonSerializer.Serialize(data, JsonOptions));
+        using var json = new Utf8Buffer(JsonSerializer.Serialize(data, JsonInfo<VaultEditorData>()));
         using var passwordBuffer = new Utf8Buffer(password);
         return RunVaultRequest<VaultMutationResult>(requestId => VaultUpdateNative(json.Pointer, passwordBuffer.Pointer, requestId), token, acknowledgedWrite: true);
     }
@@ -165,7 +164,7 @@ internal static partial class RustCore
         try
         {
             var json = Marshal.PtrToStringUTF8(pointer) ?? throw new VaultException("internal");
-            var response = JsonSerializer.Deserialize<NativeResponse<T>>(json, JsonOptions);
+            var response = JsonSerializer.Deserialize(json, JsonInfo<NativeResponse<T>>());
             if (response is null) throw new VaultException("internal");
             if (!response.Ok)
             {
@@ -199,7 +198,8 @@ internal static partial class RustCore
         uint serverMode,
         string serverUrl,
         string deviceIdentifier,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        bool rememberTwoFactor = false)
     {
         cancellationToken.ThrowIfCancellationRequested();
         using var emailBuffer = new Utf8Buffer(email);
@@ -212,7 +212,8 @@ internal static partial class RustCore
         using var cancellation = cancellationToken.Register(() => CancelAuthRequestNative(requestId));
 
         var result = LoginNative(emailBuffer.Pointer, passwordBuffer.Pointer, provider, tokenBuffer.Pointer,
-            serverMode, serverBuffer.Pointer, deviceIdentifierBuffer.Pointer, deviceOtpBuffer.Pointer, requestId);
+            serverMode, serverBuffer.Pointer, deviceIdentifierBuffer.Pointer, deviceOtpBuffer.Pointer,
+            rememberTwoFactor ? (byte)1 : (byte)0, requestId);
         if (cancellationToken.IsCancellationRequested && (result & 0xff) != (uint)AuthStatus.Authenticated)
         {
             return new AuthResult(AuthStatus.Cancelled, 0);
@@ -408,6 +409,8 @@ internal enum AuthStatus : uint
     InvalidNewDeviceVerificationCode = 6,
     AccountAlreadySignedIn = 7,
     AccountLimitReached = 8,
+    InvalidTwoFactorCode = 9,
+    RateLimited = 10,
 }
 
 internal readonly record struct AuthResult(AuthStatus Status, uint AvailableTwoFactorMethods);

@@ -1,4 +1,49 @@
 //! Writes use real SDK encryption and API mocks. No production account or endpoint is used.
+
+#[path = "projection_tests.rs"]
+mod projection_tests;
+
+/// Measures the local post-acknowledgement projection, including the returned overview clone.
+/// Run explicitly with `cargo test --release measure_confirmed_write_projection -- --ignored --nocapture`.
+#[tokio::test]
+#[ignore = "local performance measurement; no timing assertion on shared CI hosts"]
+async fn measure_confirmed_write_projection() {
+    use std::{hint::black_box, time::Instant};
+
+    for size in [100, 1_000, 10_000] {
+        let client = Client::init_test_account_with_api_client(
+            test_bitwarden_com_account(),
+            ApiClient::new_mocked(|_| {}),
+        )
+        .await;
+        let views = (0..size)
+            .map(|index| {
+                let mut view = seed_view();
+                view.name = format!("Synthetic benchmark {index:05}");
+                view
+            })
+            .collect();
+        let mut cache = seeded_cache(&client, views, false).await;
+        let id = cache.overview().unwrap().items[size / 2].id.clone();
+        for _ in 0..3 {
+            black_box(cache.finish_write(&client, Some(id.clone())).await.unwrap());
+        }
+        let mut samples = Vec::new();
+        for _ in 0..25 {
+            let start = Instant::now();
+            black_box(cache.finish_write(&client, Some(id.clone())).await.unwrap());
+            samples.push(start.elapsed().as_secs_f64() * 1_000.0);
+        }
+        samples.sort_by(f64::total_cmp);
+        println!(
+            "write_projection items={size} iterations={} median_ms={:.4} p95_ms={:.4}",
+            samples.len(),
+            samples[samples.len() / 2],
+            samples[23]
+        );
+    }
+}
+
 use std::sync::{Arc, Mutex};
 
 use bitwarden_api_api::{

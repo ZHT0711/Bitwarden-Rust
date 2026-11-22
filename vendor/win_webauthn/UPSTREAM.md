@@ -7,3 +7,5 @@ apps/desktop/desktop_native/win_webauthn.
 Copyright Bitwarden Inc. Licensed under GPL-3.0, see the repository LICENSE.
 Cargo metadata is adapted for a standalone path dependency. Windows operation
 signature verification and transaction-bound user verification are retained.
+The host also returns typed HRESULTs for excluded credentials, missing credentials,
+and explicitly canceled verification, rather than turning them into generic failures.

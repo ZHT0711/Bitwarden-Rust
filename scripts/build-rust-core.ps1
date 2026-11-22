@@ -45,6 +45,17 @@ $env:LIB = @(
     (Join-Path $sdkVersionRoot "um/x64"),
     (Join-Path $sdkVersionRoot "ucrt/x64")
 ) -join ";"
+# Native dependencies such as ring and SQLite compile C sources on a clean build.
+# Configure their headers as well as the Rust linker's libraries, even outside a VS shell.
+$sdkIncludeRoot = Join-Path $sdkRoot "Include/$($sdkVersion.Name)"
+$env:INCLUDE = @(
+    (Join-Path $msvcRoot "include"),
+    (Join-Path $sdkIncludeRoot "ucrt"),
+    (Join-Path $sdkIncludeRoot "shared"),
+    (Join-Path $sdkIncludeRoot "um"),
+    (Join-Path $sdkIncludeRoot "winrt"),
+    (Join-Path $sdkIncludeRoot "cppwinrt")
+) -join ";"
 
 $workspaceManifest = Join-Path $PSScriptRoot "../Cargo.toml"
 $cargoArgs = @("build", "--locked", "-p", "bitwarden-core@0.2.0", "--manifest-path", $workspaceManifest)

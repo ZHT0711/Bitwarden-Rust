@@ -105,7 +105,13 @@ impl Pending {
                 },
                 &self.hash,
             )
-            .map_err(|_| VaultError::PermissionDenied)
+            .map_err(|error| {
+                if error.is_user_cancelled() {
+                    VaultError::Cancelled
+                } else {
+                    VaultError::PermissionDenied
+                }
+            })
     }
 }
 
@@ -298,6 +304,7 @@ fn request(
                 Box::new(win_webauthn::plugin::PluginError::ExcludedCredentialMatched)
             }
             "notFound" => Box::new(win_webauthn::plugin::PluginError::CredentialNotFound),
+            "cancelled" => Box::new(win_webauthn::plugin::PluginError::UserCancelled),
             _ => code.into(),
         }
     })

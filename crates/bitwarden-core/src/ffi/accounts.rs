@@ -34,6 +34,8 @@ struct AccountSummary<'a> {
     state: u8,
     active: bool,
     needs_sign_in: bool,
+    #[cfg(windows)]
+    hello_enabled: bool,
 }
 
 impl AuthAccounts {
@@ -54,6 +56,9 @@ impl AuthAccounts {
                     state: session.state,
                     active: Some(session.account_id) == active,
                     needs_sign_in: session.offline_only,
+                    #[cfg(windows)]
+                    hello_enabled: session.unlock_data.is_some()
+                        && super::hello::is_enabled(session),
                 })
                 .collect::<Vec<_>>(),
         )

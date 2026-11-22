@@ -8,22 +8,22 @@ namespace Bitwarden_WinUI.Interop;
 internal sealed record GeneratorSettings
 {
     private const string KeyPrefix = "GeneratorOptionsV1.";
-    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
-    public int Version { get; init; } = 1;
-    public int SelectedType { get; init; }
-    public int PasswordLength { get; init; } = 14;
-    public bool Uppercase { get; init; } = true;
-    public bool Lowercase { get; init; } = true;
-    public bool Numbers { get; init; } = true;
-    public bool Special { get; init; }
-    public bool AvoidAmbiguous { get; init; }
-    public int MinimumNumbers { get; init; } = 1;
-    public int MinimumSpecial { get; init; }
-    public int PassphraseWords { get; init; } = 6;
-    public string WordSeparator { get; init; } = "-";
-    public bool CapitalizeWords { get; init; }
-    public bool IncludeNumber { get; init; }
+    // Ordinary setters allow generated JSON deserialization to preserve defaults for missing fields.
+    public int Version { get; set; } = 1;
+    public int SelectedType { get; set; }
+    public int PasswordLength { get; set; } = 14;
+    public bool Uppercase { get; set; } = true;
+    public bool Lowercase { get; set; } = true;
+    public bool Numbers { get; set; } = true;
+    public bool Special { get; set; }
+    public bool AvoidAmbiguous { get; set; }
+    public int MinimumNumbers { get; set; } = 1;
+    public int MinimumSpecial { get; set; }
+    public int PassphraseWords { get; set; } = 6;
+    public string WordSeparator { get; set; } = "-";
+    public bool CapitalizeWords { get; set; }
+    public bool IncludeNumber { get; set; }
 
     internal GeneratorSettings Normalize()
     {
@@ -57,13 +57,13 @@ internal sealed record GeneratorSettings
         if (string.IsNullOrEmpty(json) || json.Length > 4096) return new();
         try
         {
-            var settings = JsonSerializer.Deserialize<GeneratorSettings>(json, JsonOptions);
+            var settings = JsonSerializer.Deserialize(json, GeneratorJsonContext.Default.GeneratorSettings);
             return settings?.Version == 1 ? settings.Normalize() : new();
         }
         catch (JsonException) { return new(); }
     }
 
-    internal string ToJson() => JsonSerializer.Serialize(Normalize(), JsonOptions);
+    internal string ToJson() => JsonSerializer.Serialize(Normalize(), GeneratorJsonContext.Default.GeneratorSettings);
 
     internal static GeneratorSettings Load(IDictionary<string, object> values, string? scope) =>
         values.TryGetValue(KeyPrefix + (scope ?? "anonymous"), out var stored) && stored is string json

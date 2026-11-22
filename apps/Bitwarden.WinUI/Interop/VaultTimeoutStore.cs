@@ -10,7 +10,7 @@ internal static class VaultTimeoutStore
     {
         try {
             if (ApplicationData.Current.LocalSettings.Values.TryGetValue(key, out var stored) && stored is string json) {
-                var settings = JsonSerializer.Deserialize<VaultTimeoutSettings>(json);
+                var settings = JsonSerializer.Deserialize(json, TimeoutJsonContext.Default.VaultTimeoutSettings);
                 if (settings.IsValid) return settings;
             }
         }
@@ -22,7 +22,7 @@ internal static class VaultTimeoutStore
     {
         if (!settings.IsValid) return false;
         try {
-            ApplicationData.Current.LocalSettings.Values[key] = JsonSerializer.Serialize(settings);
+            ApplicationData.Current.LocalSettings.Values[key] = JsonSerializer.Serialize(settings, TimeoutJsonContext.Default.VaultTimeoutSettings);
             return true;
         }
         catch (Exception error) when (error is COMException or InvalidOperationException) { return false; }

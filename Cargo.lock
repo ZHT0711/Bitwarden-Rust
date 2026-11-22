@@ -360,10 +360,13 @@ dependencies = [
  "bitwarden-crypto-sync-handler",
  "bitwarden-fido",
  "bitwarden-generators",
+ "bitwarden-send",
+ "bitwarden-sensitive-value",
  "bitwarden-state",
  "bitwarden-vault",
  "bytes",
  "chrono",
+ "csv",
  "hmac 0.13.0",
  "http",
  "p256 0.13.2",
@@ -381,6 +384,8 @@ dependencies = [
  "uuid",
  "win_webauthn",
  "windows",
+ "windows-future",
+ "wiremock",
  "zeroize",
 ]
 
@@ -676,6 +681,37 @@ dependencies = [
  "rand 0.10.4",
  "thiserror",
  "uuid",
+]
+
+[[package]]
+name = "bitwarden-send"
+version = "4.0.0"
+source = "git+https://github.com/bitwarden/sdk-internal?rev=56c7617b23501af70221094cdee59e10b2a9d8d2#56c7617b23501af70221094cdee59e10b2a9d8d2"
+dependencies = [
+ "async-trait",
+ "bitwarden-api-api",
+ "bitwarden-api-base",
+ "bitwarden-auth",
+ "bitwarden-core 4.0.0",
+ "bitwarden-crypto",
+ "bitwarden-encoding",
+ "bitwarden-error",
+ "bitwarden-ffi",
+ "bitwarden-state",
+ "bitwarden-sync",
+ "bitwarden-uuid",
+ "bitwarden-vault",
+ "chrono",
+ "reqwest",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "serde_repr",
+ "sha2 0.11.1",
+ "thiserror",
+ "tracing",
+ "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -1234,6 +1270,27 @@ checksum = "3633a51a39c69ebbaa4feaa694bd83d241e4093901c84a0963b19d9bb3f0cf8f"
 dependencies = [
  "crypto-bigint 0.7.11",
  "rand_core 0.10.1",
+]
+
+[[package]]
+name = "csv"
+version = "1.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52cd9d68cf7efc6ddfaaee42e7288d3a99d613d4b50f76ce9827ae0c6e14f938"
+dependencies = [
+ "csv-core",
+ "itoa",
+ "ryu",
+ "serde_core",
+]
+
+[[package]]
+name = "csv-core"
+version = "0.1.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "704a3c26996a80471189265814dbc2c257598b96b8a7feae2d31ace646bb9782"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]

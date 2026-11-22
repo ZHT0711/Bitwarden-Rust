@@ -306,7 +306,7 @@ public sealed partial class HomePage : Page
             Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(copy, $"复制{field.Label}");
             copy.Click += (_, _) =>
             {
-                try { ClipboardCleaner.Copy(field.Value); copy.Content = "已复制，30 秒后清除"; }
+                try { ClipboardCleaner.Copy(field.Value); copy.Content = "已复制"; }
                 catch (Exception error) when (error is System.Runtime.InteropServices.COMException or InvalidOperationException)
                 { copy.Content = "剪贴板暂时不可用"; }
             };

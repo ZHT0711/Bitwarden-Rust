@@ -32,8 +32,15 @@ impl CipherRepository {
             .cloned())
     }
 
-    pub(super) fn snapshot(&self) -> Result<HashMap<String, Cipher>, RepositoryError> {
-        Ok(self.ciphers.read().map_err(|_| unavailable())?.clone())
+    pub(super) fn snapshot(&self) -> Result<Vec<Cipher>, RepositoryError> {
+        // Callers need owned ciphertexts, not a second hash table and duplicate string keys.
+        Ok(self
+            .ciphers
+            .read()
+            .map_err(|_| unavailable())?
+            .values()
+            .cloned()
+            .collect())
     }
 
     pub(super) fn clear_folders(&self, deleted: &HashSet<FolderId>) -> Result<(), RepositoryError> {
@@ -89,13 +96,7 @@ impl Repository<Cipher> for CipherRepository {
     }
 
     async fn list(&self) -> Result<Vec<Cipher>, RepositoryError> {
-        Ok(self
-            .ciphers
-            .read()
-            .map_err(|_| unavailable())?
-            .values()
-            .cloned()
-            .collect())
+        self.snapshot()
     }
 
     async fn set(&self, key: CipherId, value: Cipher) -> Result<(), RepositoryError> {

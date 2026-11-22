@@ -6,6 +6,9 @@ use bitwarden_managed_settings_types::ManagementProfile;
 use bitwarden_state::registry::StateRegistry;
 use reqwest::header::{self, HeaderValue};
 
+#[cfg(not(target_arch = "wasm32"))]
+use super::loopback_http::LoopbackHttp;
+
 #[cfg(feature = "internal")]
 use crate::key_management::{CryptoSettings, state_bridge::StateBridge};
 use crate::{
@@ -24,6 +27,8 @@ pub struct ClientBuilder {
     state_registry: Option<StateRegistry>,
     middleware: Vec<Arc<dyn reqwest_middleware::Middleware>>,
     identity_middleware: Vec<Arc<dyn reqwest_middleware::Middleware>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    loopback_http: bool,
     managed_profile: Option<Arc<RwLock<Option<ManagementProfile>>>>,
     #[cfg(feature = "test-fixtures")]
     api_configurations: Option<Arc<ApiConfigurations>>,
@@ -38,6 +43,8 @@ impl ClientBuilder {
             state_registry: None,
             middleware: Vec::new(),
             identity_middleware: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            loopback_http: false,
             managed_profile: None,
             #[cfg(feature = "test-fixtures")]
             api_configurations: None,
@@ -83,6 +90,15 @@ impl ClientBuilder {
         self
     }
 
+    /// Allows HTTP only for configured loopback service origins on native hosts.
+    /// Requests stay bound to each service origin, bypass proxies, and do not follow redirects.
+    /// External HTTP clients and non-loopback service URLs retain the SDK's TLS policy.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn with_loopback_http(mut self) -> Self {
+        self.loopback_http = true;
+        self
+    }
+
     /// Sets a custom [`StateRegistry`] for the client being built.
     /// If not set, defaults to [`StateRegistry::new_with_memory_db`].
     pub fn with_state(mut self, state_registry: StateRegistry) -> Self {
@@ -116,20 +132,30 @@ impl ClientBuilder {
             .unwrap_or_else(StateRegistry::new_with_memory_db);
 
         // Create the HTTP client for the Identity service, without authentication middleware.
-        let identity_http_client = new_http_client_builder()
-            .default_headers(headers.clone())
+        #[cfg(not(target_arch = "wasm32"))]
+        let identity_loopback = if self.loopback_http {
+            LoopbackHttp::for_service(&settings.identity_url)
+        } else {
+            None
+        };
+        let identity_http_client = new_http_client_builder().default_headers(headers.clone());
+        #[cfg(not(target_arch = "wasm32"))]
+        let identity_http_client = match &identity_loopback {
+            Some(loopback) => loopback.configure(identity_http_client),
+            None => identity_http_client,
+        };
+        let identity_http_client = identity_http_client
             .build()
             .expect("Bw HTTP Client build should not fail");
-        let identity_http_client = if self.identity_middleware.is_empty() {
-            identity_http_client.into()
-        } else {
-            let mut middleware_builder =
-                reqwest_middleware::ClientBuilder::new(identity_http_client);
-            for middleware in self.identity_middleware {
-                middleware_builder = middleware_builder.with_arc(middleware);
-            }
-            middleware_builder.build()
-        };
+        let mut middleware_builder = reqwest_middleware::ClientBuilder::new(identity_http_client);
+        for middleware in self.identity_middleware {
+            middleware_builder = middleware_builder.with_arc(middleware);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(loopback) = identity_loopback {
+            middleware_builder = middleware_builder.with(loopback);
+        }
+        let identity_http_client = middleware_builder.build();
         let identity = bitwarden_api_identity::Configuration {
             base_path: settings.identity_url,
             client: identity_http_client,
@@ -147,7 +173,18 @@ impl ClientBuilder {
         // reqwest::redirect is not available on wasm32 targets; on WASM the middleware uses
         // a proactive cookie strategy instead of reactive 302/307 detection.
         #[cfg(not(target_arch = "wasm32"))]
-        let api_http_client = if self.middleware.is_empty() {
+        let api_loopback = if self.loopback_http {
+            LoopbackHttp::for_service(&settings.api_url)
+        } else {
+            None
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let api_http_client = if let Some(loopback) = &api_loopback {
+            loopback
+                .configure(new_http_client_builder().default_headers(headers))
+                .build()
+                .expect("Loopback HTTP Client build should not fail")
+        } else if self.middleware.is_empty() {
             new_http_client_builder()
                 .default_headers(headers)
                 .build()
@@ -171,7 +208,13 @@ impl ClientBuilder {
         for mw in self.middleware {
             middleware_builder = middleware_builder.with_arc(mw);
         }
-        let bw_http_client = middleware_builder.with_arc(auth_middleware).build();
+        let middleware_builder = middleware_builder.with_arc(auth_middleware);
+        #[cfg(not(target_arch = "wasm32"))]
+        let middleware_builder = match api_loopback {
+            Some(loopback) => middleware_builder.with(loopback),
+            None => middleware_builder,
+        };
+        let bw_http_client = middleware_builder.build();
         let api = bitwarden_api_api::Configuration {
             base_path: settings.api_url,
             client: bw_http_client,

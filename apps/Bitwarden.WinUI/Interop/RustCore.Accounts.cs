@@ -4,7 +4,7 @@ using System.Text.Json;
 namespace Bitwarden_WinUI.Interop;
 
 internal sealed record VaultAccount(string Id, string Email, uint ServerMode, string ServerUrl,
-    VaultSessionState State, bool Active, bool NeedsSignIn = false)
+    VaultSessionState State, bool Active, bool NeedsSignIn = false, bool HelloEnabled = false)
 {
     internal string ServerLabel => ServerMode switch
     {
@@ -43,7 +43,7 @@ internal static partial class RustCore
 
     internal static VaultAccount[] ApplyAccountTimeouts(VaultAccountTimeout[] targets, bool interrupt)
     {
-        using var buffer = new Utf8Buffer(JsonSerializer.Serialize(targets, JsonOptions));
+        using var buffer = new Utf8Buffer(JsonSerializer.Serialize(targets, JsonInfo<VaultAccountTimeout[]>()));
         return ReadJson<VaultAccount[]>(ApplyTimeoutsNative(buffer.Pointer, interrupt ? (byte)1 : (byte)0));
     }
 

@@ -16,7 +16,7 @@ pub use types::*;
 use windows::{
     core::{GUID, HRESULT, PCWSTR},
     Win32::{
-        Foundation::{LPARAM, NTE_EXISTS, NTE_NOT_FOUND, WPARAM},
+        Foundation::{LPARAM, NTE_EXISTS, NTE_NOT_FOUND, NTE_USER_CANCELLED, WPARAM},
         Security::Cryptography::BCRYPT_KEY_BLOB,
         System::Com::CLSIDFromString,
         UI::WindowsAndMessaging::{DispatchMessageA, GetMessageA, PostThreadMessageA, WM_QUIT},
@@ -116,6 +116,9 @@ pub enum PluginError {
     /// Reported as `NTE_NOT_FOUND`, which `webauthn.h` maps to
     /// `NotAllowedError` for platform errors.
     CredentialNotFound,
+
+    /// User verification was explicitly canceled or the request expired.
+    UserCancelled,
 }
 
 impl PluginError {
@@ -123,6 +126,7 @@ impl PluginError {
         match self {
             Self::ExcludedCredentialMatched => NTE_EXISTS,
             Self::CredentialNotFound => NTE_NOT_FOUND,
+            Self::UserCancelled => NTE_USER_CANCELLED,
         }
     }
 }
@@ -139,6 +143,7 @@ impl Display for PluginError {
                     "The authenticator holds none of the requested credentials"
                 )
             }
+            Self::UserCancelled => write!(f, "User verification was cancelled"),
         }
     }
 }

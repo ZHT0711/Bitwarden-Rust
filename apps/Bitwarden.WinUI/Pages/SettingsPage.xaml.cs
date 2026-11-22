@@ -51,6 +51,7 @@ public sealed partial class SettingsPage : Page
     {
         InitializeComponent();
         InitializeTimeoutControls();
+        InitializeDesktopOptions();
         Loaded += (_, _) => RefreshPasskeyStatus();
         WebsiteIconsToggle.IsOn = WebsiteIcons.Enabled;
         WebsiteIconsToggle.Toggled += (_, _) => WebsiteIcons.SetEnabled(WebsiteIconsToggle.IsOn);

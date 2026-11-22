@@ -16,6 +16,7 @@ bitwarden-auth.workspace = true
 bitwarden-api-api.workspace = true
 bitwarden-api-base.workspace = true
 bitwarden-vault.workspace = true
+bitwarden-send.workspace = true
 bitwarden-state.workspace = true
 bitwarden-crypto.workspace = true
 bitwarden-crypto-sync-handler.workspace = true
@@ -24,6 +25,7 @@ bitwarden-fido.workspace = true
 bw-sdk-core = { workspace = true, features = ["internal"] }
 bytes.workspace = true
 chrono.workspace = true
+csv.workspace = true
 hmac.workspace = true
 http.workspace = true
 rand.workspace = true
@@ -41,10 +43,13 @@ uuid.workspace = true
 zeroize.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+bitwarden-sensitive-value.workspace = true
 win_webauthn = { path = "../../vendor/win_webauthn" }
-windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.62.2", features = ["Security_Credentials", "Security_Cryptography", "Storage_Streams", "Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_WinRT", "Win32_UI_WindowsAndMessaging"] }
+windows-future = "0.3.2"
 
 [dev-dependencies]
+wiremock = "0.6.5"
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
 bw-sdk-core = { workspace = true, features = ["internal", "test-fixtures"] }
 bitwarden-api-api = { workspace = true, features = ["mockall"] }

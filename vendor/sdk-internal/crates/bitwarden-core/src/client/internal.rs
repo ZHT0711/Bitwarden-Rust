@@ -1,8 +1,14 @@
 use std::sync::{Arc, OnceLock, RwLock};
 
 use bitwarden_crypto::KeyStore;
+#[cfg(feature = "internal")]
+use bitwarden_crypto::KeyStoreContext;
 #[cfg(any(feature = "internal", feature = "secrets"))]
 use bitwarden_crypto::SymmetricCryptoKey;
+#[cfg(all(feature = "internal", windows))]
+use bitwarden_crypto::safe::{
+    HighEntropySecret, SecretProtectedKeyEnvelope, SecretProtectedKeyEnvelopeNamespace,
+};
 #[cfg(feature = "internal")]
 use bitwarden_crypto::{
     EncString, Kdf, MasterKey, PinKey, UnsignedSharedKey, safe::PasswordProtectedKeyEnvelope,
@@ -308,6 +314,57 @@ impl InternalClient {
             _ => user_key_id,
         };
 
+        self.initialize_account_crypto_from_slot(user_key_id, account_crypto_state, ctx)
+    }
+
+    /// Verify that the supplied master password unwraps the active desktop user key.
+    #[cfg(feature = "internal")]
+    pub fn verify_desktop_user_key(
+        &self,
+        password: &str,
+        unlock: &MasterPasswordUnlockData,
+    ) -> bool {
+        let mut ctx = self.key_store.context();
+        let Ok(candidate) = unlock.unwrap_to_context(password, &mut ctx) else {
+            return false;
+        };
+        // Compare inside the SDK rather than exporting or serializing either key to the caller.
+        #[allow(deprecated)]
+        match (
+            ctx.dangerous_get_symmetric_key(candidate),
+            ctx.dangerous_get_symmetric_key(SymmetricKeySlotId::User),
+        ) {
+            (Ok(candidate), Ok(active)) => candidate == active,
+            _ => false,
+        }
+    }
+
+    /// Restore the desktop account state from a Windows Hello protected user key.
+    #[cfg(all(feature = "internal", windows))]
+    pub fn initialize_user_crypto_from_desktop_envelope(
+        &self,
+        envelope: &SecretProtectedKeyEnvelope,
+        secret: &HighEntropySecret,
+        account_crypto_state: WrappedAccountCryptographicState,
+    ) -> Result<(), EncryptionSettingsError> {
+        let mut ctx = self.key_store.context_mut();
+        let user_key_id = envelope
+            .unseal(
+                secret,
+                SecretProtectedKeyEnvelopeNamespace::DesktopBiometricUnlock,
+                &mut ctx,
+            )
+            .map_err(|_| EncryptionSettingsError::CryptoInitialization)?;
+        self.initialize_account_crypto_from_slot(user_key_id, account_crypto_state, ctx)
+    }
+
+    #[cfg(feature = "internal")]
+    fn initialize_account_crypto_from_slot(
+        &self,
+        user_key_id: SymmetricKeySlotId,
+        account_crypto_state: WrappedAccountCryptographicState,
+        ctx: KeyStoreContext<KeySlotIds>,
+    ) -> Result<(), EncryptionSettingsError> {
         // Note: The actual key does not get logged unless the crypto crate has the
         // dangerous-crypto-debug feature enabled, so this is safe
         info!(

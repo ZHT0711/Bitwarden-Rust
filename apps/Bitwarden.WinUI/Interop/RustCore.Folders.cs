@@ -29,13 +29,13 @@ internal static partial class RustCore
 
     internal static VaultMutationResult DeleteFolders(string[] ids, CancellationToken token)
     {
-        using var idsBuffer = new Utf8Buffer(JsonSerializer.Serialize(ids));
+        using var idsBuffer = new Utf8Buffer(JsonSerializer.Serialize(ids, JsonInfo<string[]>()));
         return RunVaultRequest<VaultMutationResult>(requestId => FoldersDeleteNative(idsBuffer.Pointer, requestId), token, acknowledgedWrite: true);
     }
 
     internal static VaultMutationResult MoveVaultItems(string[] ids, string? folderId, CancellationToken token)
     {
-        using var data = new Utf8Buffer(JsonSerializer.Serialize(new { ids, folderId }));
+        using var data = new Utf8Buffer(JsonSerializer.Serialize(new VaultMoveRequest(ids, folderId), JsonInfo<VaultMoveRequest>()));
         return RunVaultRequest<VaultMutationResult>(requestId => VaultMoveItemsNative(data.Pointer, requestId), token, acknowledgedWrite: true);
     }
 }

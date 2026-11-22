@@ -52,6 +52,12 @@ public sealed partial class MainWindow
         AutomationProperties.SetName(SignInButton, account is null
             ? "登录" : $"账户 {account.Email} · {account.ServerLabel}");
         ToolTipService.SetToolTip(SignInButton, account is null ? null : $"{account.Email}\n{account.ServerLabel}");
+        if (NavFrame.Content is SettingsPage settings)
+        {
+            var busy = _signInDialogOpen || _accountTransition;
+            settings.ShowHelloUnlock(account, busy);
+            settings.ShowVaultExport(account, busy);
+        }
         UpdateVaultTimeoutMonitor();
     }
 
@@ -80,6 +86,7 @@ public sealed partial class MainWindow
         NavFrame.ForwardStack.Clear();
         if (NavFrame.Content is HomePage vault) vault.ClearSensitiveState();
         if (NavFrame.Content is FolderManagementPage folders) folders.ClearSensitiveState();
+        if (NavFrame.Content is SendsPage sends) sends.ClearSensitiveState();
         if (NavFrame.Content is GeneratorPage generator) generator.ClearSensitiveState();
         WebsiteIcons.ClearCache();
         ClipboardCleaner.ClearOwned();
@@ -140,6 +147,10 @@ public sealed partial class MainWindow
         else if (NavFrame.Content is FolderManagementPage folders)
         {
             await folders.RefreshAsync(forceSync);
+        }
+        else if (NavFrame.Content is SendsPage sends)
+        {
+            await sends.ShowAccountAsync(ActiveAccount, SearchBox.Text);
         }
     }
 
@@ -206,6 +217,7 @@ public sealed partial class MainWindow
         _signInDialogOpen = true;
         UpdateSessionControls(VaultSessionState.Locked);
 
+        var helloAccount = ActiveAccount is { HelloEnabled: true } account ? account.Id : null;
         var password = new PasswordBox { Header = "主密码", MinWidth = 300 };
         var status = new TextBlock { TextWrapping = TextWrapping.Wrap, MaxWidth = 360 };
         var panel = new StackPanel { Spacing = 8 };
@@ -217,14 +229,19 @@ public sealed partial class MainWindow
             Title = "解锁保险库",
             Content = panel,
             PrimaryButtonText = "解锁",
+            SecondaryButtonText = helloAccount is null ? string.Empty : "Windows Hello",
             CloseButtonText = "取消",
-            DefaultButton = ContentDialogButton.Primary,
+            DefaultButton = helloAccount is null ? ContentDialogButton.Primary : ContentDialogButton.Secondary,
             IsPrimaryButtonEnabled = false,
         };
 
         password.PasswordChanged += (_, _) =>
+        {
             dialog.IsPrimaryButtonEnabled = _unlockRequest is null && password.Password.Length != 0;
-        dialog.Opened += (_, _) => password.Focus(FocusState.Programmatic);
+            dialog.DefaultButton = password.Password.Length != 0 || helloAccount is null
+                ? ContentDialogButton.Primary : ContentDialogButton.Secondary;
+        };
+        dialog.Opened += (_, _) => { if (helloAccount is null) password.Focus(FocusState.Programmatic); };
         dialog.Closing += (_, args) =>
         {
             if (_unlockRequest is null) return;
@@ -234,17 +251,30 @@ public sealed partial class MainWindow
         dialog.PrimaryButtonClick += async (_, args) =>
         {
             args.Cancel = true;
-            if (_unlockRequest is not null || password.Password.Length == 0) return;
-            var entered = password.Password;
+            await UnlockAsync(false);
+        };
+        dialog.SecondaryButtonClick += async (_, args) =>
+        {
+            args.Cancel = true;
+            await UnlockAsync(true);
+        };
+        async Task UnlockAsync(bool hello)
+        {
+            if (_unlockRequest is not null || (hello ? helloAccount is null : password.Password.Length == 0)) return;
+            var entered = hello ? string.Empty : password.Password;
             using var request = _unlockRequest = new CancellationTokenSource();
             password.Password = string.Empty;
-            password.IsEnabled = dialog.IsPrimaryButtonEnabled = false;
+            password.IsEnabled = dialog.IsPrimaryButtonEnabled = dialog.IsSecondaryButtonEnabled = false;
             dialog.CloseButtonText = "取消解锁";
-            status.Text = "正在本机解锁…";
+            status.Text = hello ? "请按照 Windows Hello 提示验证…" : "正在本机解锁…";
             var unlocked = false;
             try
             {
-                await Task.Run(() => RustCore.Unlock(entered, request.Token));
+                await Task.Run(() =>
+                {
+                    if (hello && helloAccount is not null) RustCore.UnlockHello(helloAccount, request.Token);
+                    else RustCore.Unlock(entered, request.Token);
+                });
                 unlocked = true;
             }
             catch (OperationCanceledException) { status.Text = "解锁已取消。"; }
@@ -261,12 +291,13 @@ public sealed partial class MainWindow
                     else
                     {
                         password.IsEnabled = true;
+                        dialog.IsSecondaryButtonEnabled = helloAccount is not null;
                         dialog.CloseButtonText = "取消";
                         password.Focus(FocusState.Programmatic);
                     }
                 }
             }
-        };
+        }
 
         try { await dialog.ShowAsync(); }
         finally

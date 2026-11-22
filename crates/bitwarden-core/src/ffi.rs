@@ -28,8 +28,15 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 use zeroize::{Zeroize, Zeroizing};
 
+mod export;
+#[cfg(windows)]
+mod hello;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod http_tests;
 #[cfg(windows)]
 mod passkeys;
+mod remembered_two_factor;
+mod sends;
 
 use crate::auth_request::{self, RequestError};
 use crate::protocol_compat::{self, ResponseKind, SyncCompatibility};
@@ -48,10 +55,13 @@ const DEVICE_VERIFICATION_REQUIRED: u32 = 5;
 const DEVICE_VERIFICATION_INVALID: u32 = 6;
 const ACCOUNT_ALREADY_SIGNED_IN: u32 = 7;
 const ACCOUNT_LIMIT_REACHED: u32 = 8;
+const INVALID_TWO_FACTOR_CODE: u32 = 9;
+const AUTH_RATE_LIMITED: u32 = 10;
 const TWO_FACTOR_MASK_SHIFT: u32 = 8;
 const TWO_FACTOR_AUTHENTICATOR: u32 = 1 << 0;
 const TWO_FACTOR_EMAIL: u32 = 1 << 1;
 const TWO_FACTOR_YUBIKEY: u32 = 1 << 3;
+const TWO_FACTOR_WEBAUTHN: u32 = 1 << 7;
 
 const SESSION_SIGNED_OUT: u8 = 0;
 const SESSION_UNLOCKED: u8 = 1;
@@ -82,6 +92,7 @@ pub(super) struct AuthSession {
     vault: VaultCache,
     open_detail: Option<OpenDetail>,
     offline_only: bool,
+    send_write_uncertain: bool,
 }
 
 struct OpenDetail {
@@ -236,6 +247,7 @@ pub(super) fn restore_persisted_sessions(limit: usize) -> Vec<AuthSession> {
                 vault,
                 open_detail: None,
                 offline_only: true,
+                send_write_uncertain: false,
             })
         })
         .take(limit)
@@ -344,14 +356,28 @@ impl DeviceLoginMiddleware {
         *pending = (!otp.is_empty()).then(|| Zeroizing::new(otp.to_owned()));
     }
 
-    fn rewrite_login_request(&self, request: &mut reqwest::Request, new_device_otp: Option<&str>) {
+    fn rewrite_login_request(&self, request: &mut reqwest::Request) {
         let Some(body) = request.body().and_then(reqwest::Body::as_bytes) else {
             return;
         };
-        let mut fields: Vec<(String, String)> =
-            url::form_urlencoded::parse(body).into_owned().collect();
+        let fields = Zeroizing::new(
+            url::form_urlencoded::parse(body)
+                .into_owned()
+                .collect::<Vec<_>>(),
+        );
+        if !fields
+            .iter()
+            .any(|(key, value)| key == "grant_type" && value == "password")
+        {
+            return;
+        }
+        let otp = self
+            .pending_otp
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         let mut form = url::form_urlencoded::Serializer::new(String::new());
-        for (key, value) in &fields {
+        for (key, value) in fields.iter() {
             if matches!(
                 key.as_str(),
                 "deviceType" | "deviceIdentifier" | "deviceName" | "newDeviceOtp"
@@ -363,16 +389,10 @@ impl DeviceLoginMiddleware {
         form.append_pair("deviceType", "6");
         form.append_pair("deviceIdentifier", &self.device_identifier);
         form.append_pair("deviceName", "BitwardenWinUI");
-        if let Some(otp) = new_device_otp {
+        if let Some(otp) = otp.as_ref() {
             form.append_pair("newDeviceOtp", otp);
         }
-        let encoded = form.finish();
-        for (key, value) in &mut fields {
-            if key == "password" {
-                value.zeroize();
-            }
-        }
-        *request.body_mut() = Some(reqwest::Body::from(encoded));
+        *request.body_mut() = Some(reqwest::Body::from(form.finish()));
     }
 }
 
@@ -388,12 +408,7 @@ impl reqwest_middleware::Middleware for DeviceLoginMiddleware {
         let is_token = path.ends_with("/connect/token");
         let is_prelogin = path.ends_with("/accounts/prelogin/password");
         if is_token && request.method() == reqwest::Method::POST {
-            let otp = self
-                .pending_otp
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
-            self.rewrite_login_request(&mut request, otp.as_deref().map(String::as_str));
+            self.rewrite_login_request(&mut request);
         }
         let response = next.run(request, extensions).await?;
         if is_token {
@@ -514,11 +529,18 @@ fn build_auth_client(server: &AuthServer, middleware: Arc<DeviceLoginMiddleware>
         .with_token_handler(std::sync::Arc::new(PasswordManagerTokenHandler::default()))
         .with_identity_middleware(vec![middleware]);
     if server.self_hosted {
+        #[cfg(not(target_arch = "wasm32"))]
+        let builder = builder.with_loopback_http();
         builder
-            .with_middleware(vec![Arc::new(SyncCompatibility)])
+            .with_middleware(vec![
+                Arc::new(SyncCompatibility),
+                Arc::new(sends::SendUpdateCompatibility),
+            ])
             .build()
     } else {
-        builder.build()
+        builder
+            .with_middleware(vec![Arc::new(sends::SendUpdateCompatibility)])
+            .build()
     }
 }
 
@@ -556,6 +578,7 @@ fn auth_client_for_server<'a>(
             vault: VaultCache::default(),
             open_detail: None,
             offline_only: false,
+            send_write_uncertain: false,
         });
     }
 
@@ -582,7 +605,7 @@ fn two_factor_provider(value: u32) -> Option<TwoFactorProvider> {
     }
 }
 
-fn supported_two_factor_methods(
+fn advertised_two_factor_methods(
     response: &bw_sdk_core::auth::login::response::two_factor::TwoFactorProviders,
 ) -> u32 {
     let mut methods = 0;
@@ -594,6 +617,9 @@ fn supported_two_factor_methods(
     }
     if response.yubi_key.is_some() {
         methods |= TWO_FACTOR_YUBIKEY;
+    }
+    if response.web_authn.is_some() {
+        methods |= TWO_FACTOR_WEBAUTHN;
     }
     methods
 }
@@ -610,7 +636,7 @@ fn login_status(
             let Some(providers) = response.two_factor else {
                 return AUTH_FAILED;
             };
-            let methods = supported_two_factor_methods(&providers);
+            let methods = advertised_two_factor_methods(&providers);
             TWO_FACTOR_REQUIRED | (methods << TWO_FACTOR_MASK_SHIFT)
         }
         Err(LoginError::IdentityFail(error))
@@ -623,8 +649,40 @@ fn login_status(
         {
             DEVICE_VERIFICATION_INVALID
         }
+        Err(LoginError::IdentityFail(error))
+            if error.error.eq_ignore_ascii_case("TooManyRequests") =>
+        {
+            AUTH_RATE_LIMITED
+        }
+        Err(LoginError::Api(bw_sdk_core::ApiError::Response(error)))
+            if error.status.as_u16() == 429 =>
+        {
+            AUTH_RATE_LIMITED
+        }
+        Err(LoginError::IdentityFail(error))
+            if is_invalid_two_factor_message(&error.error_model.message)
+                || is_invalid_two_factor_message(&error.error_description) =>
+        {
+            INVALID_TWO_FACTOR_CODE
+        }
         Err(_) => AUTH_FAILED,
     }
+}
+
+fn login_status_ref_is_invalid_code(error: &LoginError) -> bool {
+    matches!(error, LoginError::IdentityFail(error)
+        if is_invalid_two_factor_message(&error.error_model.message)
+            || is_invalid_two_factor_message(&error.error_description))
+}
+
+fn is_invalid_two_factor_message(message: &str) -> bool {
+    let message = message.trim().trim_end_matches('.');
+    [
+        "Two-step token is invalid. Try again",
+        "Two factor token is invalid",
+    ]
+    .iter()
+    .any(|expected| message.eq_ignore_ascii_case(expected))
 }
 
 fn generate_password(
@@ -755,6 +813,37 @@ pub unsafe extern "C" fn bw_auth_login(
     device_otp: *const c_char,
     request_id: u64,
 ) -> u32 {
+    // Preserve the original ABI for clients that do not request remembered 2FA.
+    unsafe {
+        bw_auth_login_with_remember(
+            email,
+            password,
+            provider,
+            token,
+            server_mode,
+            server_url,
+            device_identifier,
+            device_otp,
+            0,
+            request_id,
+        )
+    }
+}
+
+/// Password login with an explicit 30-day remembered two-factor choice.
+#[no_mangle]
+pub unsafe extern "C" fn bw_auth_login_with_remember(
+    email: *const c_char,
+    password: *const c_char,
+    provider: u32,
+    token: *const c_char,
+    server_mode: u32,
+    server_url: *const c_char,
+    device_identifier: *const c_char,
+    device_otp: *const c_char,
+    remember: u8,
+    request_id: u64,
+) -> u32 {
     catch_unwind(AssertUnwindSafe(|| {
         let Some(email) = (unsafe { read_utf8(email) }) else {
             return AUTH_FAILED;
@@ -785,20 +874,48 @@ pub unsafe extern "C" fn bw_auth_login(
         if email.is_empty() || password.is_empty() {
             return AUTH_FAILED;
         }
+        // Use the same canonical device identity for token binding and SDK transport.
+        let device_identifier = uuid::Uuid::parse_str(&device_identifier)
+            .map(|id| id.to_string())
+            .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
+        let remember_identity =
+            remembered_two_factor::identity(&server, &email, &device_identifier);
+        let remembered = token
+            .is_empty()
+            .then(|| remembered_two_factor::load(&remember_identity))
+            .flatten();
+        let using_remembered = remembered.is_some();
         let two_factor = if token.is_empty() {
-            None
+            remembered.map(|token| TwoFactorRequest {
+                token: token.to_string(),
+                provider: TwoFactorProvider::Remember,
+                remember: false,
+            })
         } else {
             let Some(provider) = two_factor_provider(provider) else {
                 return AUTH_FAILED;
             };
             Some(TwoFactorRequest {
-                token: token.to_string(),
+                token: if provider == TwoFactorProvider::Authenticator {
+                    let normalized = Zeroizing::new(
+                        token
+                            .chars()
+                            .filter(|c| !c.is_whitespace())
+                            .collect::<String>(),
+                    );
+                    if normalized.len() != 6 || !normalized.bytes().all(|b| b.is_ascii_digit()) {
+                        return INVALID_TWO_FACTOR_CODE;
+                    }
+                    normalized.to_string()
+                } else {
+                    token.to_string()
+                },
                 provider,
-                remember: false,
+                remember: remember != 0,
             })
         };
 
-        let request = SensitiveLoginRequest(PasswordLoginRequest {
+        let mut request = SensitiveLoginRequest(PasswordLoginRequest {
             email,
             password: password.to_string(),
             two_factor,
@@ -822,19 +939,50 @@ pub unsafe extern "C" fn bw_auth_login(
                 &device_identifier,
             );
             pending.device_login_middleware.arm(&device_otp);
-            let response = runtime.block_on(auth_request::run(
+            let mut response = runtime.block_on(auth_request::run(
                 request_id,
                 pending
                     .client
                     .auth()
                     .login_password_with_unlock_data(&request.0),
             ));
+            // Some self-hosted hosts reject provider 5 as an invalid code rather than
+            // returning a challenge. Retry once without that credential to obtain the
+            // real advertised methods; never retry a bad password/network/rate limit.
+            if using_remembered
+                && matches!(&response, Ok(Err(error)) if login_status_ref_is_invalid_code(error))
+            {
+                remembered_two_factor::clear(&remember_identity);
+                if let Some(mut factor) = request.0.two_factor.take() {
+                    factor.token.zeroize();
+                }
+                pending.device_login_middleware.arm(&device_otp);
+                response = runtime.block_on(auth_request::run(
+                    request_id,
+                    pending
+                        .client
+                        .auth()
+                        .login_password_with_unlock_data(&request.0),
+                ));
+            }
             pending.device_login_middleware.arm("");
             match response {
-                Ok(Ok((response, unlock_data))) if auth_request::is_current(request_id) => {
+                Ok(Ok((mut response, unlock_data))) if auth_request::is_current(request_id) => {
+                    let issued_token = response.two_factor_token.take().map(Zeroizing::new);
                     if response.authenticated {
                         if unlock_data.is_none() {
                             return AUTH_FAILED;
+                        }
+                        if !using_remembered && !token.is_empty() {
+                            // Only an explicitly selected, successfully verified 2FA
+                            // method may create/renew this grant. Normal reuse does not
+                            // slide its local expiry another thirty days.
+                            remembered_two_factor::clear(&remember_identity);
+                            if remember != 0 {
+                                if let Some(issued_token) = issued_token.as_deref() {
+                                    remembered_two_factor::save(&remember_identity, issued_token);
+                                }
+                            }
                         }
                         let mut authenticated = session
                             .pending
@@ -845,6 +993,8 @@ pub unsafe extern "C" fn bw_auth_login(
                         #[cfg(windows)]
                         authenticated.restore_local_vault(runtime);
                         session.activate(authenticated);
+                    } else if response.two_factor.is_some() {
+                        remembered_two_factor::clear(&remember_identity);
                     }
                     login_status(Ok(response))
                 }
@@ -1054,64 +1204,78 @@ pub unsafe extern "C" fn bw_auth_unlock(password: *const c_char, request_id: u64
             return vault_error("wrongPassword");
         };
         let password = Zeroizing::new(password);
-        let Some(runtime) = runtime() else {
-            return vault_error("internal");
-        };
-        let mut guard = auth_client()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(session) = guard
-            .active
-            .as_mut()
-            .filter(|_| bw_auth_session_state() == SESSION_LOCKED)
-        else {
-            return vault_error("unlockUnavailable");
-        };
-        let Some(keys) = session.unlock_data.as_ref() else {
-            return vault_error("unlockUnavailable");
-        };
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            runtime.block_on(auth_request::run(request_id, async {
-                keys.unlock(&session.client, &password)
-                    .map_err(|_| VaultError::WrongPassword)?;
-                if session.offline_only {
-                    #[cfg(windows)]
-                    session
-                        .client
-                        .platform()
-                        .state()
-                        .value::<bw_sdk_core::client::persisted_state::USER_LOGIN_METHOD>()
-                        .set(
-                            bw_sdk_core::client::login_method::UserLoginMethod::Username {
-                                client_id: "web".to_owned(), // Mirrors the SDK password flow.
-                                email: keys.master_password.salt.clone(),
-                                kdf: keys.master_password.kdf.clone(),
-                            },
-                        )
-                        .await
-                        .map_err(|_| VaultError::Internal)?;
-                }
-                session.vault.restore_overview(&session.client).await
-            }))
-        }));
-        let code = match result {
-            Ok(Ok(Ok(()))) if auth_request::is_current(request_id) => {
-                session.state = SESSION_UNLOCKED;
-                guard.publish_state();
-                return vault_success(&true);
-            }
-            Ok(Ok(Ok(()))) | Ok(Err(RequestError::Cancelled)) => "cancelled".to_owned(),
-            Ok(Err(RequestError::TimedOut)) => "timedOut".to_owned(),
-            Ok(Ok(Err(error))) => error.to_string(),
-            Err(_) => "internal".to_owned(),
-        };
-        if !session.clear_vault_keys() {
-            guard.remove_active();
-            return vault_error("internal");
-        }
-        vault_error(&code)
+        complete_vault_unlock(request_id, |session, keys| {
+            keys.unlock(&session.client, &password)
+                .map_err(|_| "wrongPassword".to_owned())
+        })
     }))
     .unwrap_or_else(|_| vault_error("internal"))
+}
+
+fn complete_vault_unlock(
+    request_id: u64,
+    initialize: impl FnOnce(&AuthSession, &PasswordLoginUnlockData) -> Result<(), String>,
+) -> *mut c_char {
+    let Some(runtime) = runtime() else {
+        return vault_error("internal");
+    };
+    let mut guard = auth_client()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(session) = guard
+        .active
+        .as_mut()
+        .filter(|_| bw_auth_session_state() == SESSION_LOCKED)
+    else {
+        return vault_error("unlockUnavailable");
+    };
+    if session.unlock_data.is_none() {
+        return vault_error("unlockUnavailable");
+    }
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        runtime.block_on(auth_request::run(request_id, async {
+            let keys = session.unlock_data.as_ref().ok_or("unlockUnavailable")?;
+            initialize(session, keys)?;
+            if session.offline_only {
+                #[cfg(windows)]
+                session
+                    .client
+                    .platform()
+                    .state()
+                    .value::<bw_sdk_core::client::persisted_state::USER_LOGIN_METHOD>()
+                    .set(
+                        bw_sdk_core::client::login_method::UserLoginMethod::Username {
+                            client_id: "web".to_owned(), // Mirrors the SDK password flow.
+                            email: keys.master_password.salt.clone(),
+                            kdf: keys.master_password.kdf.clone(),
+                        },
+                    )
+                    .await
+                    .map_err(|_| "internal".to_owned())?;
+            }
+            session
+                .vault
+                .restore_overview(&session.client)
+                .await
+                .map_err(|error| error.to_string())
+        }))
+    }));
+    let code = match result {
+        Ok(Ok(Ok(()))) if auth_request::is_current(request_id) => {
+            session.state = SESSION_UNLOCKED;
+            guard.publish_state();
+            return vault_success(&true);
+        }
+        Ok(Ok(Ok(()))) | Ok(Err(RequestError::Cancelled)) => "cancelled".to_owned(),
+        Ok(Err(RequestError::TimedOut)) => "timedOut".to_owned(),
+        Ok(Ok(Err(error))) => error.to_string(),
+        Err(_) => "internal".to_owned(),
+    };
+    if !session.clear_vault_keys() {
+        guard.remove_active();
+        return vault_error("internal");
+    }
+    vault_error(&code)
 }
 
 fn vault_access_error() -> *mut c_char {
@@ -1435,6 +1599,11 @@ enum VaultWriteCommand {
     MoveItems(VaultItemMove),
     UploadAttachment(String),
     DeleteAttachment(String),
+    Import {
+        account_id: uuid::Uuid,
+        source: String,
+        password: Zeroizing<String>,
+    },
     Action {
         id: String,
         action: String,
@@ -1461,6 +1630,12 @@ fn perform_vault_write(command: VaultWriteCommand, request_id: u64) -> *mut c_ch
         if let Err(error) = session.vault.ensure_synced() {
             return vault_error(&error.to_string());
         }
+        if let VaultWriteCommand::Import { account_id, .. } = &command {
+            if session.account_id != *account_id {
+                return vault_error("cancelled");
+            }
+        }
+        let importing = matches!(&command, VaultWriteCommand::Import { .. });
         session.vault.reset_write_attempt();
         #[cfg(windows)]
         let cache_write = match CacheWrite::begin(session) {
@@ -1474,6 +1649,7 @@ fn perform_vault_write(command: VaultWriteCommand, request_id: u64) -> *mut c_ch
             &command,
             VaultWriteCommand::Create(..)
                 | VaultWriteCommand::Update(..)
+                | VaultWriteCommand::Import { .. }
                 | VaultWriteCommand::Action { .. }
         );
         // Catch inside the session guard: a panic after sending a write must force reconciliation.
@@ -1536,6 +1712,9 @@ fn perform_vault_write(command: VaultWriteCommand, request_id: u64) -> *mut c_ch
                         ))
                         .await
                     }
+                    VaultWriteCommand::Import {
+                        source, password, ..
+                    } => Box::pin(export::import(session, &source, &password, request_id)).await,
                     VaultWriteCommand::Action {
                         id,
                         action,
@@ -1549,7 +1728,7 @@ fn perform_vault_write(command: VaultWriteCommand, request_id: u64) -> *mut c_ch
                     }
                 }
             };
-            if upload {
+            if upload || importing {
                 runtime.block_on(auth_request::run_transfer(request_id, Box::pin(write)))
             } else {
                 runtime.block_on(auth_request::run(request_id, write))
@@ -1574,6 +1753,10 @@ fn perform_vault_write(command: VaultWriteCommand, request_id: u64) -> *mut c_ch
         let interrupted = matches!(result, Ok(Err(_)) | Err(_)) && session.vault.write_in_flight();
         if interrupted {
             session.vault.mark_write_uncertain();
+        }
+        #[cfg(windows)]
+        if importing && session.unlock_data.is_none() && !remove_cached_vault(session) {
+            return vault_error("cacheRevocationFailed");
         }
         #[cfg(windows)]
         cache_write.finish(
@@ -1869,6 +2052,31 @@ mod tests {
             )
         };
         assert_eq!(result, super::AUTH_FAILED);
+    }
+
+    #[test]
+    fn refresh_never_consumes_or_transmits_the_armed_new_device_otp() {
+        let middleware = super::DeviceLoginMiddleware::new("synthetic-device".to_owned());
+        middleware.arm("246810");
+        let endpoint = "https://identity.example.invalid/connect/token"
+            .parse()
+            .unwrap();
+        let mut request = reqwest::Request::new(reqwest::Method::POST, endpoint);
+        let refresh = "grant_type=refresh_token&refresh_token=synthetic";
+        *request.body_mut() = Some(refresh.into());
+        middleware.rewrite_login_request(&mut request);
+        assert_eq!(
+            request.body().unwrap().as_bytes().unwrap(),
+            refresh.as_bytes()
+        );
+        *request.body_mut() =
+            Some("grant_type=password&twoFactorProvider=0&twoFactorToken=012345".into());
+        middleware.rewrite_login_request(&mut request);
+        let body = request.body().unwrap().as_bytes().unwrap();
+        let fields: std::collections::HashMap<_, _> = url::form_urlencoded::parse(body).collect();
+        assert_eq!(fields["deviceIdentifier"], "synthetic-device");
+        assert_eq!(fields["newDeviceOtp"], "246810");
+        assert_eq!(fields["twoFactorToken"], "012345");
     }
 
     #[test]

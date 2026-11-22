@@ -743,15 +743,11 @@ impl VaultCache {
             }
             _ => unreachable!(),
         }
-        self.finish_write(
-            client,
-            if action == "delete" {
-                None
-            } else {
-                Some(id.to_owned())
-            },
-        )
-        .await
+        if action == "delete" {
+            self.finish_removal(id)
+        } else {
+            self.finish_write(client, Some(id.to_owned())).await
+        }
     }
 
     pub(super) fn uncertain(&mut self) -> VaultError {
@@ -889,22 +885,62 @@ impl VaultCache {
         client: &Client,
         id: Option<String>,
     ) -> Result<VaultMutationResult, VaultError> {
-        let (items, failures) = self
-            .project_items(client)
+        let id = id.ok_or_else(|| self.uncertain())?;
+        let cipher = self.find_cipher(&id).map_err(|_| self.uncertain())?;
+        let (mut items, failures) = Self::project_ciphers(client, vec![cipher])
             .await
             .map_err(|_| self.uncertain())?;
-        if id
-            .as_ref()
-            .is_some_and(|id| !items.iter().any(|item| &item.id == id))
+        if !failures.is_empty() || items.len() != 1 || items[0].id != id {
+            return Err(self.uncertain());
+        }
+        // Verify the acknowledged ciphertext before touching any displayed metadata.
+        let item = items.pop().ok_or_else(|| self.uncertain())?;
+        if self.overview.is_none() {
+            return Err(self.uncertain());
+        }
+        let overview = self.overview.as_mut().ok_or(VaultError::NotSynced)?;
+        let previous = overview.items.iter().position(|item| item.id == id);
+        match previous {
+            Some(index) if overview.items[index].name == item.name => overview.items[index] = item,
+            previous => {
+                if let Some(index) = previous {
+                    overview.items.remove(index);
+                }
+                let name = item.name.to_lowercase();
+                let index = overview
+                    .items
+                    .partition_point(|item| item.name.to_lowercase() <= name);
+                overview.items.insert(index, item);
+            }
+        }
+        self.decryption_failures.remove(&id);
+        overview.failures = self.base_failures + self.decryption_failures.len();
+        let overview = overview.clone();
+        self.write_started = false;
+        Ok(VaultMutationResult {
+            overview,
+            id: Some(id),
+        })
+    }
+
+    fn finish_removal(&mut self, id: &str) -> Result<VaultMutationResult, VaultError> {
+        // A successful response alone must not hide an entry still present in SDK storage.
+        if self
+            .ciphers
+            .find(id)
+            .map_err(|_| self.uncertain())?
+            .is_some()
+            || self.overview.is_none()
         {
             return Err(self.uncertain());
         }
         let overview = self.overview.as_mut().ok_or(VaultError::NotSynced)?;
-        overview.items = items;
-        overview.failures = self.base_failures + failures;
+        overview.items.retain(|item| item.id != id);
+        self.decryption_failures.remove(id);
+        overview.failures = self.base_failures + self.decryption_failures.len();
         let overview = overview.clone();
         self.write_started = false;
-        Ok(VaultMutationResult { overview, id })
+        Ok(VaultMutationResult { overview, id: None })
     }
 }
 

@@ -183,7 +183,7 @@ impl VaultCache {
             .and_then(|name| name.to_str())
             .filter(|_| source.is_absolute())
             .ok_or(VaultError::AttachmentFileRead)?;
-        let contents = read_upload_file(source).await?;
+        let contents = read_upload_file(source, MAX_FILE_BYTES).await?;
         self.activate(client);
         let attachments = client.vault().attachments();
         let encrypted = attachments
@@ -310,7 +310,10 @@ impl VaultCache {
     }
 }
 
-async fn read_upload_file(path: &Path) -> Result<Zeroizing<Vec<u8>>, VaultError> {
+pub(crate) async fn read_upload_file(
+    path: &Path,
+    limit: usize,
+) -> Result<Zeroizing<Vec<u8>>, VaultError> {
     let file = tokio::fs::File::open(path)
         .await
         .map_err(|_| VaultError::AttachmentFileRead)?;
@@ -321,18 +324,18 @@ async fn read_upload_file(path: &Path) -> Result<Zeroizing<Vec<u8>>, VaultError>
     if !meta.is_file() {
         return Err(VaultError::AttachmentFileRead);
     }
-    if meta.len() > MAX_FILE_BYTES as u64 {
+    if meta.len() > limit as u64 {
         return Err(VaultError::AttachmentTooLarge);
     }
     let mut contents = Zeroizing::new(Vec::new());
     contents
         .try_reserve_exact(meta.len() as usize)
         .map_err(|_| VaultError::AttachmentTooLarge)?;
-    file.take(MAX_FILE_BYTES as u64 + 1)
+    file.take(limit as u64 + 1)
         .read_to_end(&mut contents)
         .await
         .map_err(|_| VaultError::AttachmentFileRead)?;
-    if contents.len() > MAX_FILE_BYTES {
+    if contents.len() > limit {
         return Err(VaultError::AttachmentTooLarge);
     }
     Ok(contents)
@@ -483,7 +486,7 @@ async fn put_blob(url: Url, contents: Bytes, single: bool) -> Result<(), VaultEr
     Ok(())
 }
 
-fn allowed_url(url: &Url, origin: &Url) -> bool {
+pub(crate) fn allowed_url(url: &Url, origin: &Url) -> bool {
     url.host().is_some()
         && url.username().is_empty()
         && url.password().is_none()
