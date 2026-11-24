@@ -9,6 +9,7 @@ internal static class DesktopPreferences
     internal const string KeepInTray = "Desktop.KeepInTray";
     internal const string StartHidden = "Desktop.StartHidden";
     private const string Theme = "Desktop.Theme";
+    private const string VaultSort = "Desktop.VaultSort";
     private const string ClipboardDelay = "Desktop.ClipboardSeconds";
     internal const string MinimizeOnCopy = "Desktop.MinimizeOnCopy";
     internal static readonly IReadOnlyList<int> ClipboardChoices = Array.AsReadOnly(new[] { 0, 10, 20, 30, 60, 120, 300 });
@@ -24,6 +25,14 @@ internal static class DesktopPreferences
     }
 
     internal static bool TrySaveTheme(int theme) => theme is >= 0 and <= 2 && TrySaveValue(Theme, theme);
+
+    internal static int ReadVaultSort()
+    {
+        var stored = ReadValue(VaultSort, 0);
+        return stored is >= 0 and <= 3 ? stored : 0;
+    }
+
+    internal static bool TrySaveVaultSort(int sort) => sort is >= 0 and <= 3 && TrySaveValue(VaultSort, sort);
 
     internal static int ReadClipboardDelay()
     {

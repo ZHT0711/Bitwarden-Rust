@@ -9,16 +9,18 @@ public sealed partial class FolderManagementPage : Page
     public event EventHandler? SignInRequested;
     internal event EventHandler<string>? OpenFolderRequested;
 
-    private FolderRow[]? _folders;
+    private FolderHierarchy? _hierarchy;
     private CancellationTokenSource? _operation;
     private ContentDialog? _activeDialog;
+    private TextBox? _folderNameInput;
     private string _query = string.Empty;
     private string _emptyStateMessage = "登录以查看文件夹";
     private bool _loaded;
     private bool _busy;
     private bool _requiresSync;
 
-    private bool CanWrite => _loaded && _folders is not null && !_busy && !_requiresSync && _activeDialog is null;
+    private bool CanBrowse => _loaded && _hierarchy is not null && !_busy && _activeDialog is null;
+    private bool CanWrite => CanBrowse && !_requiresSync;
 
     public FolderManagementPage()
     {
@@ -37,7 +39,9 @@ public sealed partial class FolderManagementPage : Page
 
     public void SetSearch(string query)
     {
-        _query = query.Trim();
+        query = query.Trim();
+        if (_query == query) return;
+        _query = query;
         RenderFolders();
     }
 
@@ -48,8 +52,10 @@ public sealed partial class FolderManagementPage : Page
         var dialog = _activeDialog;
         _activeDialog = null;
         if (dialog?.Content is TextBox input) input.Text = string.Empty;
+        if (_folderNameInput is { } nameInput) nameInput.Text = string.Empty;
+        _folderNameInput = null;
         dialog?.Hide();
-        _folders = null;
+        _hierarchy = null;
         _query = string.Empty;
         _requiresSync = false;
         _emptyStateMessage = "登录以查看文件夹";
@@ -59,7 +65,7 @@ public sealed partial class FolderManagementPage : Page
         RenderFolders();
     }
 
-    public async Task RefreshAsync(bool forceSync)
+    public async Task RefreshAsync(bool forceSync, bool allowSyncFallback = true)
     {
         if (!_loaded || _busy || _activeDialog is not null) return;
         using var operation = _operation = new CancellationTokenSource();
@@ -69,7 +75,7 @@ public sealed partial class FolderManagementPage : Page
             var session = RustCore.SessionState;
             if (session != VaultSessionState.Unlocked)
             {
-                _folders = null;
+                _hierarchy = null;
                 var locked = session == VaultSessionState.Locked;
                 _emptyStateMessage = locked ? "保险库已锁定" : "登录以查看文件夹";
                 ConnectButton.Content = locked ? "解锁保险库" : "连接账户";
@@ -89,7 +95,7 @@ public sealed partial class FolderManagementPage : Page
                 overview = forceSync ? await Task.Run(() => RustCore.SyncVault(token), token)
                     : await Task.Run(RustCore.GetVaultOverview, token);
             }
-            catch (VaultException error) when (!forceSync && (error.Code is "notFound" or "notSynced"))
+            catch (VaultException error) when (allowSyncFallback && !forceSync && (error.Code is "notFound" or "notSynced"))
             {
                 _requiresSync = true;
                 overview = await Task.Run(() => RustCore.SyncVault(token), token);
@@ -123,27 +129,23 @@ public sealed partial class FolderManagementPage : Page
     private void ApplyOverview(VaultOverview overview)
     {
         _requiresSync = overview.ReadOnly;
-        var counts = new Dictionary<string, int>();
-        foreach (var item in overview.Items)
-        {
-            if (item.FolderId is { } id && !item.Deleted)
-                counts[id] = counts.GetValueOrDefault(id) + 1;
-        }
-        _folders = overview.Folders
-            .Select(folder => new FolderRow(folder.Id, folder.Name, counts.GetValueOrDefault(folder.Id)))
-            .ToArray();
+        _hierarchy = FolderHierarchy.Build(overview.Folders, overview.Items);
         RenderFolders();
     }
 
     private void RenderFolders()
     {
-        var rows = _folders is null ? [] : _folders
-            .Where(folder => folder.Name.Contains(_query, StringComparison.OrdinalIgnoreCase))
-            .ToArray();
+        var selected = FolderList.SelectedItems.OfType<FolderRow>().Select(row => row.Id).ToHashSet(StringComparer.Ordinal);
+        // Root browsing mirrors the official My folders table; searching still finds a child by its full name.
+        var nodes = _hierarchy is null ? [] : _query.Length == 0 ? _hierarchy.Roots : _hierarchy.All
+            .Where(folder => folder.Name.Contains(_query, StringComparison.OrdinalIgnoreCase)).ToArray();
+        var rows = nodes.Select(node => node.Row(!_requiresSync, fullName: _query.Length > 0)).ToArray();
         FolderList.ItemsSource = rows;
-        FolderCount.Text = $"{rows.Length} 个文件夹";
+        foreach (var row in rows) if (selected.Contains(row.Id)) FolderList.SelectedItems.Add(row);
+        FolderCount.Text = _query.Length > 0 ? $"{rows.Length} 个匹配文件夹"
+            : $"{rows.Length} 个顶层文件夹，共 {_hierarchy?.All.Length ?? 0} 个文件夹";
         EmptyState.Visibility = rows.Length == 0 ? Visibility.Visible : Visibility.Collapsed;
-        EmptyMessage.Text = _folders is null ? _emptyStateMessage : _query.Length > 0 ? "没有匹配的文件夹" : "还没有文件夹";
+        EmptyMessage.Text = _hierarchy is null ? _emptyStateMessage : _query.Length > 0 ? "没有匹配的文件夹" : "还没有文件夹";
         UpdateCommands();
     }
 
@@ -198,7 +200,7 @@ public sealed partial class FolderManagementPage : Page
             Content = new TextBlock
             {
                 Text = (folders.Length == 1 ? $"删除“{folders[0].Name}”？\n" : string.Empty)
-                    + "文件夹中的条目会保留，并移至“无文件夹”。",
+                    + "只删除所选文件夹，不删除其中的条目。仅这些文件夹内的条目移至“无文件夹”；未选中的嵌套子文件夹及其条目会保留。",
                 TextWrapping = TextWrapping.Wrap,
             },
             PrimaryButtonText = "删除",
@@ -259,12 +261,22 @@ public sealed partial class FolderManagementPage : Page
     private async Task<string?> ShowFolderNameDialogAsync(string title, string initialValue)
     {
         if (!CanWrite) return null;
-        var input = new TextBox { Header = "文件夹名称", Text = initialValue, MinWidth = 240 };
+        var input = new TextBox { Name = "FolderNameInput", Header = "文件夹名称", Text = initialValue, MinWidth = 240,
+            PlaceholderText = "例如：工作/项目（父文件夹须存在）" };
+        _folderNameInput = input;
+        var content = new StackPanel { Spacing = 12 };
+        content.Children.Add(input);
+        content.Children.Add(new TextBlock
+        {
+            Text = "用 / 表示层级，例如“工作/项目”。父文件夹须真实存在，否则显示完整名称。重命名父文件夹不会自动修改子文件夹名称。",
+            TextWrapping = TextWrapping.Wrap,
+            MaxWidth = 400,
+        });
         var dialog = new ContentDialog
         {
             XamlRoot = XamlRoot,
             Title = title,
-            Content = input,
+            Content = content,
             PrimaryButtonText = "保存",
             CloseButtonText = "取消",
             DefaultButton = ContentDialogButton.Primary,
@@ -273,7 +285,11 @@ public sealed partial class FolderManagementPage : Page
         input.TextChanged += (_, _) => dialog.IsPrimaryButtonEnabled = !string.IsNullOrWhiteSpace(input.Text);
         dialog.Opened += (_, _) => input.Focus(FocusState.Programmatic);
         try { return await ConfirmAsync(dialog) ? input.Text.Trim() : null; }
-        finally { input.Text = string.Empty; }
+        finally
+        {
+            input.Text = string.Empty;
+            if (ReferenceEquals(_folderNameInput, input)) _folderNameInput = null;
+        }
     }
 
     private async Task<bool> ConfirmAsync(ContentDialog dialog)
@@ -290,11 +306,14 @@ public sealed partial class FolderManagementPage : Page
         }
     }
 
+    private void FolderLayout_SizeChanged(object sender, SizeChangedEventArgs e) =>
+        VisualStateManager.GoToState(this, e.NewSize.Width < 720 ? "CompactFolders" : "WideFolders", false);
+
     private void FolderList_SelectionChanged(object sender, SelectionChangedEventArgs e) => UpdateCommands();
 
     private void OpenFolder_Click(object sender, RoutedEventArgs e)
     {
-        if (CanWrite && sender is HyperlinkButton { Tag: FolderRow folder })
+        if (CanBrowse && sender is HyperlinkButton { Tag: FolderRow folder })
             OpenFolderRequested?.Invoke(this, folder.Id);
     }
 
@@ -306,7 +325,7 @@ public sealed partial class FolderManagementPage : Page
         CreateFolderButton.IsEnabled = CanWrite;
         RenameFolderButton.IsEnabled = CanWrite && selected == 1;
         DeleteFoldersButton.IsEnabled = CanWrite && selected > 0;
-        FolderList.IsEnabled = !_busy && !_requiresSync;
+        FolderList.IsEnabled = CanBrowse;
     }
 
     private void UpdateSyncRequirement(VaultException error)
@@ -325,7 +344,7 @@ public sealed partial class FolderManagementPage : Page
     {
         _busy = busy;
         LoadingRing.IsActive = busy;
-        UpdateCommands();
+        RenderFolders();
     }
 
     private void SetNotice(string title, string message, InfoBarSeverity severity)
@@ -341,10 +360,4 @@ public sealed partial class FolderManagementPage : Page
 
     private static bool IsCoreUnavailable(Exception error) =>
         error is DllNotFoundException or EntryPointNotFoundException or BadImageFormatException;
-
-    private sealed record FolderRow(string Id, string Name, int ItemCount)
-    {
-        public string ItemCountLabel => $"{ItemCount} 个条目";
-        public override string ToString() => Name;
-    }
 }

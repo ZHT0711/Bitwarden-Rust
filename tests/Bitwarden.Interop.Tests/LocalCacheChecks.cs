@@ -38,6 +38,7 @@ internal static class LocalCacheChecks
                 "the Windows cache exposes neither fixture identity nor vault names or password on disk");
 
             await RunChild("offline");
+            await RunChild("reconnect");
             await RunChild("journal");
             var before = await CipherCount(http);
             await Control(http, "pause-next-write-response");
@@ -148,6 +149,7 @@ internal static class LocalCacheChecks
                 Expect("wrongPassword", () => RustCore.Unlock("wrong fixture password", token));
                 Require(RustCore.SessionState == VaultSessionState.Locked, "a wrong password never unlocks the cached vault");
                 var syncs = await SyncCount(http);
+                var logins = await PasswordCount(http);
                 RustCore.Unlock(Password, token);
                 Require(ReadOnlySnapshotContains(PrimaryNote, SecondaryNote), "primary restart restores the latest local snapshot read-only");
                 var view = RustCore.GetVaultOverview();
@@ -161,12 +163,53 @@ internal static class LocalCacheChecks
                 Require(RustCore.GetVaultDetail(item.Id, "", token).Totp is { Status: "ready" }, "local cache supports TOTP generation");
                 Expect("notSynced", () => CreateNote("This must not be sent"));
                 Expect("signInRequired", () => RustCore.SyncVault(token));
-                Require(await SyncCount(http) == syncs, "local unlock, reprompt and sync refusal make no API sync request");
+                Require(await SyncCount(http) == syncs && await PasswordCount(http) == logins,
+                    "offline unlock, reprompt and sync refusal make no login or API sync request");
                 Select(peer);
                 RustCore.Unlock(Password, token);
                 Require(ReadOnlySnapshotContains(SecondaryNote, PrimaryNote), "same email on another server unlocks a different cache");
                 Require(RustCore.GetAccounts().Single(account => account.ServerUrl == primary).Id == a.Id,
                     "account switch retains the first identity");
+                RustCore.Shutdown();
+                break;
+            case "reconnect":
+                var restored = Select(primary);
+                var primaryPasswords = await PasswordCount(http);
+                var primarySyncs = await SyncCount(http);
+                var peerPasswords = await PasswordCount(other);
+                Require(restored is { State: VaultSessionState.Locked, NeedsSignIn: true }, "reconnect starts directly from the locked restart account");
+                Login(primary); // No preceding local unlock.
+                Require(RustCore.GetAccounts().Single(account => account.Active) is { State: VaultSessionState.Unlocked, NeedsSignIn: false } current && current.Id == restored.Id,
+                    "one password login unlocks and reconnects the same account");
+                await Control(http, "fail-next-sync");
+                Expect("network", () => RustCore.SyncVault(token));
+                Require(ReadOnlySnapshotContains(PrimaryNote, SecondaryNote), "failed first sync keeps the old snapshot read-only");
+                Expect("notSynced", () => CreateNote("This must not be sent before reconnect sync"));
+                Require(!RustCore.SyncVault(token).ReadOnly, "retrying sync restores write access without asking for the password again");
+                Require(await PasswordCount(http) == primaryPasswords + 1 && await SyncCount(http) == primarySyncs + 2 && await PasswordCount(other) == peerPasswords,
+                    "reconnect and sync only contacted the selected server and used one password grant");
+
+                var restoredPeer = Select(peer);
+                await Control(other, "require-authenticator");
+                Require(RustCore.Login(Email, Password, 0, "", "", 2, peer, Device).Status == AuthStatus.TwoFactorRequired,
+                    "a locked restart account still requires the self-hosted server's second factor");
+                Require(RustCore.SessionState == VaultSessionState.Locked && !RustCore.IsAuthenticated, "a challenge does not unlock the local vault");
+                await Control(other, "pause-next-token");
+                using (var cancel = new CancellationTokenSource())
+                {
+                    var pending = Task.Run(() => RustCore.Login(Email, Password, 0, "087349", "", 2, peer, Device, cancel.Token));
+                    using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                    while (await PasswordCount(other) < peerPasswords + 2 && !pending.IsCompleted)
+                        await Task.Delay(20, deadline.Token);
+                    Require(!pending.IsCompleted, "cancellation interrupts a real reconnect request");
+                    cancel.Cancel();
+                    Require((await pending.WaitAsync(TimeSpan.FromSeconds(5))).Status == AuthStatus.Cancelled && RustCore.SessionState == VaultSessionState.Locked,
+                        "cancelled reconnect leaves the cached vault locked");
+                }
+                Require(RustCore.Login(Email, Password, 0, "087349", "", 2, peer, Device).Status == AuthStatus.Authenticated &&
+                    RustCore.GetAccounts().Single(account => account.Active).Id == restoredPeer.Id, "valid second factor unlocks and reconnects without a separate unlock step");
+                Require(!RustCore.SyncVault(token).ReadOnly, "2FA reconnect restores online vault access after sync");
+                await Control(other, "reset");
                 RustCore.Shutdown();
                 break;
             case "journal":
@@ -198,8 +241,7 @@ internal static class LocalCacheChecks
                 throw new Exception("Test client was not terminated during the pending write.");
             case "reconcile":
                 var id = Select(primary).Id;
-                RustCore.Unlock(Password, token);
-                Expect("notSynced", () => RustCore.GetVaultOverview());
+                Expect("locked", () => RustCore.GetVaultOverview());
                 Login(primary);
                 Require(RustCore.GetAccounts().Single(account => account.Active).Id == id, "server reauthentication keeps the local account id");
                 Expect("notSynced", () => RustCore.GetVaultOverview());
@@ -275,6 +317,7 @@ internal static class LocalCacheChecks
     }
     private static async Task<int> CipherCount(HttpClient http) => (await http.GetFromJsonAsync("/control/snapshot", FixtureJsonContext.Default.JsonElement)).GetProperty("cipherCount").GetInt32();
     private static async Task<int> SyncCount(HttpClient http) => (await http.GetFromJsonAsync("/control/snapshot", FixtureJsonContext.Default.JsonElement)).GetProperty("syncRequests").GetInt32();
+    private static async Task<int> PasswordCount(HttpClient http) => (await http.GetFromJsonAsync("/control/snapshot", FixtureJsonContext.Default.JsonElement)).GetProperty("passwordRequests").GetInt32();
     private static void Expect(string code, Action action)
     {
         try { action(); }

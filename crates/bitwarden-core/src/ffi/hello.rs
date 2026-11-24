@@ -17,16 +17,16 @@ use windows::{
         Cryptography::CryptographicBuffer,
     },
     Win32::{
-        Foundation::RPC_E_CHANGED_MODE,
+        Foundation::{ERROR_CANCELLED, E_ABORT, RPC_E_CHANGED_MODE},
         System::WinRT::{IBufferByteAccess, RoInitialize, RoUninitialize, RO_INIT_MULTITHREADED},
     },
 };
 use zeroize::{Zeroize, Zeroizing};
 
 use super::{
-    auth_client, auth_request, complete_vault_unlock, local_cache_identity, read_utf8, runtime,
-    vault_error, vault_success, AuthSession, PersistedUnlockData, RequestError, SESSION_LOCKED,
-    SESSION_UNLOCKED,
+    auth_client, auth_request, complete_vault_unlock, hello_window, local_cache_identity,
+    read_utf8, runtime, vault_error, vault_success, AuthSession, PersistedUnlockData, RequestError,
+    SESSION_LOCKED, SESSION_UNLOCKED,
 };
 use crate::local_cache;
 use std::{
@@ -123,7 +123,15 @@ impl<F: FnOnce()> Drop for CancelOnDrop<F> {
     }
 }
 
+fn prompt_error(error: windows::core::Error) -> &'static str {
+    match error.code() {
+        code if code == E_ABORT || code == ERROR_CANCELLED.to_hresult() => "helloCancelled",
+        _ => "helloFailed",
+    }
+}
+
 async fn sign(
+    window: u64,
     identity: &str,
     binding: &[u8; 32],
     challenge: &[u8; 32],
@@ -149,15 +157,12 @@ async fn sign(
         {
             return Err("helloUnavailable");
         }
-        let op = KeyCredentialManager::RequestCreateAsync(
-            &name,
-            KeyCredentialCreationOption::FailIfExists,
-        )
-        .map_err(|_| "helloFailed")?;
+        let op = hello_window::create(window, &name, KeyCredentialCreationOption::FailIfExists)
+            .map_err(prompt_error)?;
         let mut cancel = CancelOnDrop(Some(|| {
             let _ = op.Cancel();
         }));
-        opened = op.clone().await.map_err(|_| "helloFailed")?;
+        opened = op.clone().await.map_err(prompt_error)?;
         cancel.0 = None;
         if opened.Status().map_err(|_| "helloFailed")?
             == KeyCredentialStatus::CredentialAlreadyExists
@@ -172,13 +177,11 @@ async fn sign(
     let credential = opened.Credential().map_err(|_| "helloFailed")?;
     let message = CryptographicBuffer::CreateFromByteArray(&challenge_message(binding, challenge))
         .map_err(|_| "helloFailed")?;
-    let op = credential
-        .RequestSignAsync(&message)
-        .map_err(|_| "helloFailed")?;
+    let op = hello_window::sign(window, &credential, &message).map_err(prompt_error)?;
     let mut cancel = CancelOnDrop(Some(|| {
         let _ = op.Cancel();
     }));
-    let signed = op.clone().await.map_err(|_| "helloFailed")?;
+    let signed = op.clone().await.map_err(prompt_error)?;
     cancel.0 = None;
     status(signed.Status().map_err(|_| "helloFailed")?)?;
     let buffer = signed.Result().map_err(|_| "helloFailed")?;
@@ -199,6 +202,7 @@ async fn sign(
 }
 
 fn prompt(
+    window: u64,
     identity: &str,
     binding: &[u8; 32],
     challenge: &[u8; 32],
@@ -207,9 +211,9 @@ fn prompt(
 ) -> Result<HighEntropySecret, &'static str> {
     let _apartment = Apartment::initialize()?;
     let runtime = runtime().ok_or("internal")?;
-    match runtime.block_on(auth_request::run(
+    match runtime.block_on(auth_request::run_hello(
         request_id,
-        sign(identity, binding, challenge, enroll),
+        sign(window, identity, binding, challenge, enroll),
     )) {
         Ok(result) => result,
         Err(RequestError::Cancelled) => Err("cancelled"),
@@ -234,6 +238,16 @@ fn run_boolean(work: impl FnOnce() -> Result<(), &'static str>) -> *mut c_char {
 pub unsafe extern "C" fn bw_hello_enable(
     account: *const c_char,
     password: *const c_char,
+    request_id: u64,
+) -> *mut c_char {
+    unsafe { bw_hello_enable_for_window(account, password, 0, request_id) }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn bw_hello_enable_for_window(
+    account: *const c_char,
+    password: *const c_char,
+    window: u64,
     request_id: u64,
 ) -> *mut c_char {
     run_boolean(|| {
@@ -280,7 +294,7 @@ pub unsafe extern "C" fn bw_hello_enable(
         OsRng
             .try_fill_bytes(&mut challenge)
             .map_err(|_| "internal")?;
-        let secret = prompt(&identity, &expected, &challenge, true, request_id)?;
+        let secret = prompt(window, &identity, &expected, &challenge, true, request_id)?;
         let guard = auth_client()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -336,6 +350,15 @@ pub unsafe extern "C" fn bw_hello_disable(account: *const c_char) -> *mut c_char
 
 #[no_mangle]
 pub unsafe extern "C" fn bw_hello_unlock(account: *const c_char, request_id: u64) -> *mut c_char {
+    unsafe { bw_hello_unlock_for_window(account, 0, request_id) }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn bw_hello_unlock_for_window(
+    account: *const c_char,
+    window: u64,
+    request_id: u64,
+) -> *mut c_char {
     catch_unwind(AssertUnwindSafe(|| {
         let prepare = || {
             let id = unsafe { account_id(account) }?;
@@ -351,6 +374,7 @@ pub unsafe extern "C" fn bw_hello_unlock(account: *const c_char, request_id: u64
                 (local_cache_identity(session), load(session)?)
             };
             let secret = prompt(
+                window,
                 &identity,
                 &enrollment.binding,
                 &enrollment.challenge,
@@ -453,6 +477,11 @@ mod tests {
         assert_eq!(
             status(KeyCredentialStatus::NotFound),
             Err("helloUnavailable")
+        );
+        assert_eq!(prompt_error(E_ABORT.into()), "helloCancelled");
+        assert_eq!(
+            prompt_error(ERROR_CANCELLED.to_hresult().into()),
+            "helloCancelled"
         );
     }
 }

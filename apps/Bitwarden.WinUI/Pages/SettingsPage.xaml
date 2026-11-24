@@ -43,7 +43,7 @@
                 <StackPanel Spacing="8">
                     <TextBlock Style="{StaticResource BodyStrongTextBlockStyle}" Text="保险库数据" />
                     <Button x:Name="ExportVaultButton" Content="导出个人保险库" Click="ExportVault_Click" IsEnabled="False" />
-                    <Button x:Name="ImportVaultButton" Content="导入 Bitwarden JSON" Click="ImportVault_Click" IsEnabled="False" />
+                    <Button x:Name="ImportVaultButton" Content="导入 Bitwarden JSON / CSV" Click="ImportVault_Click" IsEnabled="False" />
                     <TextBlock x:Name="ExportVaultStatus" TextWrapping="Wrap" AutomationProperties.LiveSetting="Polite" />
                 </StackPanel>
             </Border>

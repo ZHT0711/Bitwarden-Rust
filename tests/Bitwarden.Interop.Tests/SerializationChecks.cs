@@ -40,6 +40,11 @@ internal static partial class RustCore
         CheckResponseMetadata<TotpCode>(check, "TOTP");
         CheckResponseMetadata<VaultEditorData>(check, "editor");
         CheckResponseMetadata<VaultMutationResult>(check, "mutation");
+        CheckResponseMetadata<VaultExportReport>(check, "export report");
+        check(ParseJsonForChecks<NativeResponse<VaultExportReport>>(
+            "{\"ok\":true,\"data\":{\"items\":2,\"folders\":1,\"skippedRestricted\":3,\"omittedAttachments\":4,\"omittedUnsupported\":5}}")
+            .Data is { Items: 2, Folders: 1, SkippedRestricted: 3, OmittedAttachments: 4, OmittedUnsupported: 5 },
+            "generated export metadata retains CSV omissions in trimmed builds");
     }
 
     private static void CheckResponseMetadata<T>(Action<bool, string> check, string label)

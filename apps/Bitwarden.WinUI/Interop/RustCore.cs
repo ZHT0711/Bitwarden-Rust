@@ -233,7 +233,7 @@ internal static partial class RustCore
     internal static void Unlock(string password, CancellationToken token)
     {
         using var buffer = new Utf8Buffer(password);
-        RunVaultRequest<bool>(requestId => UnlockNative(buffer.Pointer, requestId), token);
+        RunVaultRequest<bool>(requestId => UnlockNative(buffer.Pointer, requestId), token, acknowledgedWrite: true);
     }
 
     internal static AuthStatus SendTwoFactorEmail(

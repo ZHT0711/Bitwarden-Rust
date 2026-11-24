@@ -9,6 +9,7 @@ pub(crate) mod attachments;
 pub(crate) mod export;
 mod folder_repository;
 pub(crate) mod import;
+mod linked_fields;
 mod mutations;
 pub(crate) mod passkeys;
 mod repository;
@@ -22,7 +23,7 @@ pub(crate) use totp::{TotpCode, VaultTotp};
 use bitwarden_api_api::models::SyncResponseModel;
 use bitwarden_crypto::UnsignedSharedKey;
 use bitwarden_crypto_sync_handler::{CryptoSyncData, CryptoSyncHandlerClientExt};
-use bitwarden_vault::{Cipher, CipherListViewType, CipherView, Folder, VaultClientExt};
+use bitwarden_vault::{Cipher, CipherListViewType, CipherView, FieldType, Folder, VaultClientExt};
 use bw_sdk_core::{
     auth::login::PasswordLoginUnlockData,
     key_management::account_cryptographic_state::WrappedAccountCryptographicState, Client,
@@ -79,6 +80,8 @@ pub(crate) enum VaultError {
     AttachmentTooLarge,
     #[error("fileAccess")]
     FileAccess,
+    #[error("exportCsvField")]
+    ExportCsvField,
     #[error("importFormat")]
     ImportFormat,
     #[error("importPassword")]
@@ -846,12 +849,24 @@ fn display_detail(view: CipherView) -> VaultDetail {
     );
     add_field(&mut fields, "备注", view.notes.as_deref(), false);
     for field in view.fields.iter().flatten() {
-        add_field(
-            &mut fields,
-            field.name.as_deref().unwrap_or("自定义字段"),
-            field.value.as_deref(),
-            field.r#type as u8 == 1,
-        );
+        let label = field.name.as_deref().unwrap_or("自定义字段");
+        if field.r#type == FieldType::Linked {
+            if let Some(resolved) = linked_fields::resolve(&view, field) {
+                add_field(
+                    &mut fields,
+                    label,
+                    Some(&resolved.value),
+                    resolved.sensitive,
+                );
+            }
+        } else {
+            add_field(
+                &mut fields,
+                label,
+                field.value.as_deref(),
+                field.r#type == FieldType::Hidden,
+            );
+        }
     }
     if !view.view_password || view.partial {
         fields.retain(|field| !field.sensitive);
@@ -905,6 +920,10 @@ fn append_object<T: Serialize>(
 }
 
 #[cfg(test)]
+#[path = "vault/folder_fixture_tests.rs"]
+mod folder_fixture_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use bitwarden_api_api::{
@@ -916,7 +935,7 @@ mod tests {
     };
     use serde_json::json;
 
-    fn test_view() -> CipherView {
+    pub(super) fn test_view() -> CipherView {
         serde_json::from_value(json!({
             "id": uuid::Uuid::new_v4(), "collectionIds": [], "name": "Synthetic login", "notes": "Synthetic note",
             "type": 1, "login": { "username": "fixture-user", "password": "synthetic-password-DO-NOT-USE",
@@ -926,7 +945,7 @@ mod tests {
         })).unwrap()
     }
 
-    async fn response_for(client: &Client, view: CipherView) -> SyncResponseModel {
+    pub(super) async fn response_for(client: &Client, view: CipherView) -> SyncResponseModel {
         let encrypted = client.vault().ciphers().encrypt(view).await.unwrap().cipher;
         let raw: CipherDetailsResponseModel =
             serde_json::from_value(serde_json::to_value(encrypted).unwrap()).unwrap();

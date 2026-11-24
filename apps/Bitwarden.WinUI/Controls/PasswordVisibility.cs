@@ -7,10 +7,11 @@ namespace Bitwarden_WinUI.Controls;
 
 internal static class PasswordVisibility
 {
-    internal static Grid WithToggle(PasswordBox box)
+    internal static Grid WithToggle(PasswordBox box, string? fieldLabel = null)
     {
         box.PasswordRevealMode = PasswordRevealMode.Hidden;
-        var label = box.Header as string ?? "密码";
+        var label = fieldLabel ?? box.Header as string ?? "密码";
+        if (fieldLabel is not null) AutomationProperties.SetName(box, label);
         var icon = new SymbolIcon(Symbol.View);
         var toggle = new ToggleButton
         {

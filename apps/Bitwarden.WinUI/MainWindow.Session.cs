@@ -13,6 +13,8 @@ public sealed partial class MainWindow
     private bool _closed;
     private CancellationTokenSource? _unlockRequest;
     private VaultAccount[] _accounts = [];
+    private readonly Dictionary<string, string> _reconnectSyncErrors = new();
+    private const string ReconnectSyncWarning = "已登录，尚未同步保险库";
     private VaultAccount? ActiveAccount => _accounts.FirstOrDefault(account => account.Active);
 
     private void ApplyAccountSnapshot(VaultAccount[] accounts)
@@ -23,8 +25,15 @@ public sealed partial class MainWindow
         _accounts = accounts;
         var active = ActiveAccount;
         AccountSettingsScope.Use(active?.Scope);
-        foreach (var account in removed) AccountSettingsScope.NotifySignedOut(account.Scope);
+        foreach (var account in removed)
+        {
+            _reconnectSyncErrors.Remove(account.Id);
+            AccountSettingsScope.NotifySignedOut(account.Scope);
+        }
         if (previous?.Id == active?.Id) return;
+        if (AccountWarning.Title == ReconnectSyncWarning) AccountWarning.IsOpen = false;
+        if (active is not null && _reconnectSyncErrors.TryGetValue(active.Id, out var error))
+            WarnAboutAccountStorage(ReconnectSyncWarning, error);
         if (active is null) WebsiteIcons.ClearServer();
         else WebsiteIcons.SetServer(active.ServerMode, active.ServerUrl);
         if (NavFrame.Content is GeneratorPage generator) generator.RefreshSettingsScope();
@@ -35,7 +44,10 @@ public sealed partial class MainWindow
     {
         var unlocked = state == VaultSessionState.Unlocked;
         var signedIn = state != VaultSessionState.SignedOut;
-        SearchBox.IsEnabled = SyncButton.IsEnabled = unlocked && !_accountTransition && !_signInDialogOpen;
+        var available = !_accountTransition && !_signInDialogOpen;
+        SearchBox.IsEnabled = unlocked && available;
+        SyncButton.IsEnabled = unlocked && available;
+        SyncButton.Content = ActiveAccount is { NeedsSignIn: true } ? "联机同步" : "同步";
         LockButton.IsEnabled = SignInButton.IsEnabled = !_accountTransition && !_signInDialogOpen;
         LockButton.Visibility = signedIn ? Visibility.Visible : Visibility.Collapsed;
         LockButton.Content = unlocked ? "锁定" : "解锁";
@@ -129,7 +141,7 @@ public sealed partial class MainWindow
         }
     }
 
-    private async Task ShowActiveVaultAsync(VaultSessionState state, bool forceSync)
+    private async Task ShowActiveVaultAsync(VaultSessionState state, bool forceSync, bool allowSyncFallback = true)
     {
         var accountId = ActiveAccount?.Id;
         if (state == VaultSessionState.Unlocked)
@@ -142,15 +154,55 @@ public sealed partial class MainWindow
         {
             if (state == VaultSessionState.Locked) page.ShowLocked();
             else if (state == VaultSessionState.SignedOut) page.ShowLoggedOut();
-            else await page.RefreshAsync(forceSync);
+            else await page.RefreshAsync(forceSync, allowSyncFallback);
         }
         else if (NavFrame.Content is FolderManagementPage folders)
         {
-            await folders.RefreshAsync(forceSync);
+            await folders.RefreshAsync(forceSync, allowSyncFallback);
         }
         else if (NavFrame.Content is SendsPage sends)
         {
             await sends.ShowAccountAsync(ActiveAccount, SearchBox.Text);
+        }
+    }
+
+    private void ReportReconnectSyncError(string accountId, string error)
+    {
+        var message = error + " 点击「同步」重试，无需再次输入主密码。";
+        _reconnectSyncErrors[accountId] = message;
+        WarnAboutAccountStorage(ReconnectSyncWarning, message);
+    }
+
+    private async Task RetryReconnectSyncAsync(VaultAccount account)
+    {
+        if (_closed || _signInDialogOpen || _accountTransition) return;
+        using var request = _unlockRequest = new CancellationTokenSource();
+        _accountTransition = true;
+        NavView.IsEnabled = false;
+        UpdateSessionControls(VaultSessionState.Unlocked);
+        var synced = false;
+        try
+        {
+            await Task.Run(() => RustCore.SyncVault(request.Token));
+            _reconnectSyncErrors.Remove(account.Id);
+            if (!_closed && AccountWarning.Title == ReconnectSyncWarning) AccountWarning.IsOpen = false;
+            synced = true;
+        }
+        catch (OperationCanceledException) { }
+        catch (VaultException error) { if (!_closed) ReportReconnectSyncError(account.Id, error.UserMessage); }
+        catch (Exception error) when (IsCoreUnavailable(error)) { }
+        finally
+        {
+            _unlockRequest = null;
+            _accountTransition = false;
+            if (!_closed)
+            {
+                NavView.IsEnabled = true;
+                var state = RustCore.SessionState;
+                UpdateSessionControls(state);
+                if (!await ApplyPendingWindowsTimeoutAsync() && synced && account.Id == ActiveAccount?.Id)
+                    await ShowActiveVaultAsync(state, forceSync: false);
+            }
         }
     }
 
@@ -176,7 +228,7 @@ public sealed partial class MainWindow
         var add = new MenuFlyoutItem { Text = "添加账户", Icon = new SymbolIcon(Symbol.Add), IsEnabled = _accounts.Length < 5 };
         add.Click += async (_, _) => await ShowSignInDialogAsync();
         menu.Items.Add(add);
-        if (ActiveAccount is { NeedsSignIn: true } accountToReconnect)
+        if (ActiveAccount is { State: VaultSessionState.Unlocked, NeedsSignIn: true } accountToReconnect)
         {
             var reconnect = new MenuFlyoutItem { Text = "重新连接当前账户" };
             reconnect.Click += async (_, _) => await ShowSignInDialogAsync(accountToReconnect);
@@ -213,7 +265,12 @@ public sealed partial class MainWindow
 
     private async Task ShowUnlockDialogAsync()
     {
-        if (_signInDialogOpen || _accountTransition) return;
+        if (_closed || _signInDialogOpen || _accountTransition) return;
+        if (ActiveAccount is { NeedsSignIn: true } restored)
+        {
+            await ShowSignInDialogAsync(restored);
+            return;
+        }
         _signInDialogOpen = true;
         UpdateSessionControls(VaultSessionState.Locked);
 
@@ -270,11 +327,7 @@ public sealed partial class MainWindow
             var unlocked = false;
             try
             {
-                await Task.Run(() =>
-                {
-                    if (hello && helloAccount is not null) RustCore.UnlockHello(helloAccount, request.Token);
-                    else RustCore.Unlock(entered, request.Token);
-                });
+                await UnlockLocalVaultAsync(hello ? helloAccount : null, entered, request.Token);
                 unlocked = true;
             }
             catch (OperationCanceledException) { status.Text = "解锁已取消。"; }

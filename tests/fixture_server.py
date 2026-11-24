@@ -230,6 +230,7 @@ class FixtureState:
             self.pause_next_sync = False
             self.duplicate_next_sync_cipher = False
             self.sync_requests = 0
+            self.password_requests = 0
             self.require_new_device_verification = False
             self.require_authenticator = False
             self.remembered_two_factor = {}
@@ -463,7 +464,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
                 self.reply({"cipherCount": len(state.ciphers), "ids": sorted(state.ciphers),
                             "attachmentDownloads": state.attachment_downloads,
                             "attachmentUploads": state.attachment_uploads, "syncRequests": state.sync_requests,
-                            "importRequests": state.import_requests,
+                            "importRequests": state.import_requests, "passwordRequests": state.password_requests,
                             "rememberAttempts": state.remember_attempts,
                             "rememberAccepted": state.remember_accepted})
             return
@@ -567,6 +568,9 @@ class FixtureHandler(BaseHTTPRequestHandler):
             username = form.get("username", [""])[0].strip().lower()
             refresh = form.get("refresh_token", [""])[0]
             device_identifier = form.get("deviceIdentifier", [""])[0]
+            if grant == "password":
+                with state.lock:
+                    state.password_requests += 1
             if (grant == "password" and username == PUBLIC_EMAIL) or (
                 grant == "refresh_token" and refresh == state.identity["refresh_token"]
             ):

@@ -162,7 +162,11 @@ impl VaultCache {
         }
         let report = Report {
             items: items.len(),
-            folders: folders.len(),
+            folders: if csv {
+                transfer_csv::represented_folders(&folders, &items)
+            } else {
+                folders.len()
+            },
             skipped_restricted,
             omitted_attachments,
             omitted_unsupported,

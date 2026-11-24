@@ -8,6 +8,18 @@ namespace Bitwarden_WinUI;
 
 public sealed partial class MainWindow
 {
+    private ulong HelloWindowId => AppWindow.Id.Value;
+
+    private Task UnlockLocalVaultAsync(string? helloAccount, string password, CancellationToken token)
+    {
+        var windowId = HelloWindowId;
+        return Task.Run(() =>
+        {
+            if (helloAccount is not null) RustCore.UnlockHello(helloAccount, token, windowId);
+            else RustCore.Unlock(password, token);
+        });
+    }
+
     private async Task ChangeHelloUnlockAsync(SettingsPage page)
     {
         if (_closed || _signInDialogOpen || _accountTransition || ActiveAccount is not { State: VaultSessionState.Unlocked } account) return;
@@ -78,7 +90,8 @@ public sealed partial class MainWindow
             status.Text = "正在验证，请留意 Windows Hello 提示…";
             try
             {
-                await Task.Run(() => RustCore.EnableHello(account, entered, request.Token));
+                var windowId = HelloWindowId;
+                await Task.Run(() => RustCore.EnableHello(account, entered, request.Token, windowId));
                 enrolled = true;
             }
             catch (OperationCanceledException) { status.Text = "已取消设置。"; }

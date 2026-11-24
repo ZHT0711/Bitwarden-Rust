@@ -21,6 +21,8 @@
     <Compile Include="../../apps/Bitwarden.WinUI/Interop/GeneratorSettings.cs" Link="GeneratorSettings.cs" />
     <Compile Include="../../apps/Bitwarden.WinUI/Interop/VaultModels.cs" Link="VaultModels.cs" />
     <Compile Include="../../apps/Bitwarden.WinUI/Interop/VaultEditorModels.cs" Link="VaultEditorModels.cs" />
+    <Compile Include="../../apps/Bitwarden.WinUI/Interop/ClipboardClearTransaction.cs" Link="ClipboardClearTransaction.cs" />
+    <Compile Include="../../apps/Bitwarden.WinUI/Interop/FolderHierarchy.cs" Link="FolderHierarchy.cs" />
     <Compile Include="../../apps/Bitwarden.WinUI/Interop/VaultQuery.cs" Link="VaultQuery.cs" />
   </ItemGroup>
 </Project>

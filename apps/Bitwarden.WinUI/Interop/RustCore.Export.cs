@@ -3,7 +3,7 @@ using System.Text.Json;
 
 namespace Bitwarden_WinUI.Interop;
 
-internal sealed record VaultExportReport(int Items, int Folders, int SkippedRestricted, int OmittedAttachments);
+internal sealed record VaultExportReport(int Items, int Folders, int SkippedRestricted, int OmittedAttachments, int OmittedUnsupported = 0);
 
 internal static partial class RustCore
 {

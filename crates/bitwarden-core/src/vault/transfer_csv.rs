@@ -19,6 +19,19 @@ const HEADERS: [&str; 11] = [
     "login_totp",
 ];
 
+pub(super) fn represented_folders(folders: &[Value], items: &[Value]) -> usize {
+    let names = folders
+        .iter()
+        .filter_map(|row| Some((row.get("id")?.as_str()?, row.get("name")?.as_str()?)))
+        .collect::<HashMap<_, _>>();
+    items
+        .iter()
+        .filter_map(|item| names.get(item.get("folderId")?.as_str()?).copied())
+        .filter(|name| !name.is_empty())
+        .collect::<HashSet<_>>()
+        .len()
+}
+
 pub(super) fn emit(folders: Vec<Value>, items: Vec<Value>) -> Result<Vec<u8>, VaultError> {
     let folders = folders
         .iter()
@@ -41,18 +54,7 @@ pub(super) fn emit(folders: Vec<Value>, items: Vec<Value>) -> Result<Vec<u8>, Va
             Some(2) => "note",
             _ => return Err(VaultError::Internal),
         };
-        let fields = Zeroizing::new(
-            item.get("fields")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .map(|field| {
-                    let text = |name| field.get(name).and_then(Value::as_str).unwrap_or_default();
-                    format!("{}: {}", text("name"), text("value"))
-                })
-                .collect::<Vec<_>>()
-                .join("\n"),
-        );
+        let fields = encode_fields(item)?;
         // Bitwarden embeds a second CSV row in login_uri to represent multiple addresses.
         let uri = encode_uris(
             item.get("login")
@@ -85,6 +87,31 @@ pub(super) fn emit(folders: Vec<Value>, items: Vec<Value>) -> Result<Vec<u8>, Va
             .map_err(|_| VaultError::Internal)?;
     }
     writer.into_inner().map_err(|_| VaultError::Internal)
+}
+
+fn encode_fields(item: &Value) -> Result<Zeroizing<String>, VaultError> {
+    let mut encoded = Zeroizing::new(String::new());
+    for field in item
+        .get("fields")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let text = |key| field.get(key).and_then(Value::as_str).unwrap_or_default();
+        let (name, value) = (text("name"), text("value"));
+        // The official importer splits on line breaks and then the last ': '. Embedded
+        // newlines or separators in values would silently change a field on re-import.
+        if name.contains(['\r', '\n']) || value.contains(['\r', '\n']) || value.contains(": ") {
+            return Err(VaultError::ExportCsvField);
+        }
+        if !encoded.is_empty() {
+            encoded.push('\n');
+        }
+        encoded.push_str(name);
+        encoded.push_str(": ");
+        encoded.push_str(value);
+    }
+    Ok(encoded)
 }
 
 fn encode_uris(uris: Option<&Vec<Value>>) -> Result<Zeroizing<String>, VaultError> {
@@ -133,6 +160,19 @@ pub(super) fn parse(data: &[u8], max_rows: usize) -> Result<Value, VaultError> {
         let value = |key| field(&row, &fields, key).unwrap_or_default();
         let optional = |key| field(&row, &fields, key);
         let alias = |a, b| optional(a).or_else(|| optional(b));
+        // Accept the official legacy aliases, but never silently choose between conflicting data.
+        for (current, legacy) in [
+            ("login_uri", "uri"),
+            ("login_username", "username"),
+            ("login_password", "password"),
+            ("login_totp", "totp"),
+        ] {
+            if let (Some(a), Some(b)) = (optional(current), optional(legacy)) {
+                if a != b {
+                    return Err(VaultError::ImportFormat);
+                }
+            }
+        }
         if row.iter().all(str::is_empty) {
             continue;
         }
@@ -229,9 +269,77 @@ mod tests {
     }
 
     #[test]
-    fn unknown_or_ambiguous_csv_does_not_become_a_personal_import() {
-        assert!(parse(b"type,name,collections\nlogin,x,shared", 100).is_err());
-        assert!(parse(b"type,name,name\nlogin,x,y", 100).is_err());
-        assert!(parse(b"type,name\ncard,x", 100).is_err());
+    fn csv_legacy_aliases_and_notes_preserve_the_supported_data() {
+        let data = b"folder,favorite,type,name,notes,reprompt,uri,username,password,totp,archivedDate\r\nshared,1,LOGIN,a,,1,https://example.invalid,user,secret,key,2026-01-01T00:00:00Z\r\nshared,0,note,b,words,0,,,,,\r\n";
+        let doc = parse(data, 3).unwrap();
+        assert_eq!(doc["folders"].as_array().unwrap().len(), 1);
+        assert_eq!(doc["items"][0]["login"]["password"], "secret");
+        assert_eq!(doc["items"][0]["login"]["totp"], "key");
+        assert_eq!(doc["items"][0]["archivedDate"], "2026-01-01T00:00:00Z");
+        assert_eq!(doc["items"][1]["secureNote"]["type"], 0);
+        assert_eq!(doc["items"][0]["folderId"], doc["items"][1]["folderId"]);
+        assert!(parse(data, 2).is_err());
+        assert!(parse(b"type,name\nlogin,a\nnote,b", 2).is_ok());
+        assert!(parse(b"type,name\nlogin,a\nnote,b", 1).is_err());
+    }
+
+    #[test]
+    fn csv_report_counts_only_represented_distinct_folder_names() {
+        let folders = vec![
+            json!({"id":"a","name":"same"}),
+            json!({"id":"b","name":"same"}),
+            json!({"id":"c","name":"empty"}),
+        ];
+        let items = vec![
+            json!({"folderId":"a"}),
+            json!({"folderId":"b"}),
+            json!({"folderId":null}),
+        ];
+        assert_eq!(represented_folders(&folders, &items), 1);
+        assert_eq!(represented_folders(&folders, &[]), 0);
+        let bytes = emit(vec![], vec![]).unwrap();
+        assert!(String::from_utf8(bytes)
+            .unwrap()
+            .starts_with("folder,favorite,type,name,"));
+    }
+
+    #[test]
+    fn malformed_csv_never_silently_truncates_rows_or_chooses_conflicting_secrets() {
+        for data in [
+            &b"type,name,name\nlogin,x,y"[..],
+            &b"type,name,collections\nlogin,x,shared"[..],
+            &b"type,name\ncard,x"[..],
+            &b"type,name\nlogin,x,extra"[..],
+            &b"type,name\nlogin,\xff"[..],
+            &b"type,name,favorite\nlogin,x,true"[..],
+            &b"type,name,reprompt\nlogin,x,2"[..],
+            &b"type,name,login_password,password\nlogin,x,a,b"[..],
+        ] {
+            assert!(parse(data, 100).is_err());
+        }
+        assert!(parse(b"type,name,login_password,password\nlogin,x,same,same", 100).is_ok());
+        assert!(parse(b"type,name,login_password,password\nlogin,x,,legacy", 100).is_ok());
+    }
+
+    #[test]
+    fn csv_export_refuses_fields_that_the_official_importer_would_misparse() {
+        for (name, value) in [
+            ("a\nb", "value"),
+            ("a", "first\rsecond"),
+            ("a", "key: value"),
+        ] {
+            let item =
+                json!({"type": 2, "name":"secure note", "fields":[{"name":name, "value":value}]});
+            assert!(matches!(
+                emit(vec![], vec![item]),
+                Err(VaultError::ExportCsvField)
+            ));
+        }
+        let item = json!({"type": 2, "name":"secure note", "fields":[{"name":"key: label", "value":"value"}]});
+        let csv = emit(vec![], vec![item.clone()]).unwrap();
+        assert_eq!(
+            parse(&csv, 1).unwrap()["items"][0]["fields"][0]["name"],
+            item["fields"][0]["name"]
+        );
     }
 }

@@ -163,7 +163,7 @@ public sealed partial class HomePage
             {
                 var type = _category switch { "logins" => 1, "notes" => 2, "cards" => 3, "identities" => 4,
                     "ssh" => 5, "bankaccounts" => 6, "licenses" => 7, "passports" => 8, _ => 1 };
-                var folder = (FolderFilter.SelectedItem as ComboBoxItem)?.Tag as string;
+                var folder = (FolderFilter.SelectedItem as FolderChoice)?.Id;
                 data = new VaultEditorData(null, string.Empty, type, folder is "*" or "" ? null : folder,
                     false, false, null, null, [], [], [], true, false, false, false, false);
             }

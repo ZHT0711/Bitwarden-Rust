@@ -21,6 +21,18 @@ if (args is ["--cache-child", _, _, _, _, _])
     return;
 }
 
+if (args is ["--measure-search"])
+{
+    VaultQueryChecks.Measure();
+    return;
+}
+
+if (args is ["--measure-folders"])
+{
+    FolderHierarchyMeasurements.Run();
+    return;
+}
+
 var count = 0;
 void Check(bool result, string name)
 {
@@ -31,6 +43,9 @@ void Check(bool result, string name)
 
 VaultTimeoutChecks.Run(Check);
 GeneratorSettingsChecks.Run(Check);
+VaultQueryChecks.Run(Check);
+FolderHierarchyChecks.Run(Check);
+ClipboardClearChecks.Run(Check);
 PasskeyChecks.Run(Check);
 RustCore.CheckJsonContracts(Check);
 
@@ -50,6 +65,21 @@ Check(VaultQuery.Apply(mixed, "vault", "", "").Length == 7, "no-folder filter");
 Check(VaultQuery.Apply(mixed, "vault", "*", " TYPE 3 ").Single().Id == "3", "search trims whitespace and ignores case");
 Check(VaultQuery.Apply(mixed, "vault", "*", "EXAMPLE.INVALID").Length == 8, "search includes displayed usernames");
 Check(VaultQuery.Apply(mixed, "vault", "*", "no match").Length == 0, "unmatched search is empty");
+
+if (args is ["--linked-fields", _, _, _])
+{
+    UseNativeLibrary(Path.GetFullPath(args[1]));
+    await NativeLinkedFieldChecks.RunAsync(args[2], Path.GetFullPath(args[3]), Check);
+    Console.WriteLine($"{count} checks passed.");
+    return;
+}
+
+if (args is ["--clipboard-native"])
+{
+    NativeClipboardChecks.Run(Check);
+    Console.WriteLine($"{count} checks passed.");
+    return;
+}
 
 if (args.Length > 0)
 {

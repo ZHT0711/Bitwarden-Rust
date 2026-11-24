@@ -49,6 +49,8 @@ internal static class NativeLifecycle
             check(initial.Items.Length == 2, "real DLL syncs a profile with wrapped account keys without a host state bridge");
             await SendChecks.RunAsync(uri, check);
             await VaultExportChecks.RunAsync(uri, check);
+            await VaultCsvChecks.RunAsync(uri, check);
+            await NativeFolderHierarchyChecks.RunAsync(uri, check);
             var protectedItem = initial.Items.Single(item => item.Name == "Synthetic protected item");
             ExpectCode(() => RustCore.GetVaultDetail(protectedItem.Id, "", CancellationToken.None), "passwordRequired",
                 "an attachment detail lease requires the item's master-password reprompt");

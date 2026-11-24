@@ -17,6 +17,7 @@ public sealed partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
+        ClipboardCleaner.Initialize(WinRT.Interop.WindowNative.GetWindowHandle(this));
         ApplyDesktopTheme(DesktopPreferences.ReadTheme());
         ClipboardCleaner.Copied += MinimizeAfterCopy;
         try
@@ -63,29 +64,8 @@ public sealed partial class MainWindow : Window
         {
             _closed = true;
             DisposeTray();
-            AccountSettingsScope.SignedOut -= GeneratorPage.ResetSavedAlgorithm;
-            _passkeyTimer?.Stop();
-            ClearPasskeySensitiveState();
-            _vaultTimeoutTimer?.Stop();
-            _unlockRequest?.Cancel();
-            if (NavFrame.Content is HomePage page) page.ClearSensitiveState();
-            if (NavFrame.Content is FolderManagementPage folders) folders.ClearSensitiveState();
-            if (NavFrame.Content is SendsPage sends) sends.ClearSensitiveState();
-            if (NavFrame.Content is GeneratorPage generator) generator.ClearSensitiveState();
-            WebsiteIcons.ClearCache();
-            ClipboardCleaner.Copied -= MinimizeAfterCopy;
-            ClipboardCleaner.ClearOwned();
-            try
-            {
-                RustCore.CancelActiveRequest();
-                _ = ApplyRestartTimeouts(RustCore.GetAccounts());
-            }
-            catch (Exception error) when (error is VaultException || IsCoreUnavailable(error)) { }
-            finally
-            {
-                try { RustCore.Shutdown(); } catch (Exception error) when (IsCoreUnavailable(error)) { }
-                _windowsVaultEvents?.Dispose();
-            }
+            PrepareForExit();
+            ClipboardCleaner.Stop();
         };
     }
 
@@ -146,6 +126,12 @@ public sealed partial class MainWindow : Window
         NavView.SelectedItem = VaultNavigationItem;
     }
 
+    private void OpenFolderManager(object? sender, EventArgs e)
+    {
+        SearchBox.Text = string.Empty;
+        NavView.SelectedItem = FolderManagementNavigationItem;
+    }
+
     private void SearchBox_QuerySubmitted(AutoSuggestBox sender, AutoSuggestBoxQuerySubmittedEventArgs args)
     {
         if (NavFrame.Content is HomePage page)
@@ -176,6 +162,16 @@ public sealed partial class MainWindow : Window
 
     private async void Sync_Click(object sender, RoutedEventArgs e)
     {
+        if (ActiveAccount is { State: VaultSessionState.Unlocked, NeedsSignIn: true } offline)
+        {
+            await ShowSignInDialogAsync(offline);
+            return;
+        }
+        if (ActiveAccount is { State: VaultSessionState.Unlocked } account && _reconnectSyncErrors.ContainsKey(account.Id))
+        {
+            await RetryReconnectSyncAsync(account);
+            return;
+        }
         if (NavFrame.Content is HomePage page) await page.RefreshAsync(true);
         else if (NavFrame.Content is FolderManagementPage folderPage) await folderPage.RefreshAsync(true);
         else if (NavFrame.Content is SendsPage sends) await sends.RefreshAsync();
@@ -198,6 +194,8 @@ public sealed partial class MainWindow : Window
         {
             page.SignInRequested -= HomePage_SignInRequested;
             page.SignInRequested += HomePage_SignInRequested;
+            page.ManageFoldersRequested -= OpenFolderManager;
+            page.ManageFoldersRequested += OpenFolderManager;
             page.SetSearch(SearchBox.Text);
         }
         else if (e.Content is SettingsPage settings)
@@ -275,26 +273,26 @@ public sealed partial class MainWindow : Window
         _signInDialogOpen = true;
         UpdateSessionControls(RustCore.SessionState);
         var changed = false;
+        string? syncError = null;
         try
         {
-            var authenticated = await ShowSignInDialogCoreAsync(reconnect);
+            var result = await ShowSignInDialogCoreAsync(reconnect);
+            if (_closed) return;
+            RustCore.CancelPendingLogin();
+            if (!result.Opened) return;
+            syncError = result.SyncError;
+            var accounts = await Task.Run(RustCore.GetAccounts);
             if (!_closed)
             {
-                if (!authenticated)
-                {
-                    RustCore.CancelPendingLogin();
-                    return;
-                }
-                var accounts = await Task.Run(RustCore.GetAccounts);
-                if (!_closed)
-                {
-                    var current = accounts.FirstOrDefault(account => account.Active);
-                    changed = previous?.Id != current?.Id || previous?.NeedsSignIn != current?.NeedsSignIn;
-                    if (changed) ClearActiveAccountContents(cancelPasskeys: previous is not null);
-                    ApplyAccountSnapshot(accounts);
-                }
+                var current = accounts.FirstOrDefault(account => account.Active);
+                changed = previous?.Id != current?.Id || previous?.NeedsSignIn != current?.NeedsSignIn ||
+                    previous?.State != current?.State;
+                if (changed && (previous?.Id != current?.Id || previous?.NeedsSignIn != current?.NeedsSignIn))
+                    ClearActiveAccountContents(cancelPasskeys: previous is not null);
+                ApplyAccountSnapshot(accounts);
             }
         }
+        catch (Exception error) when (IsCoreUnavailable(error)) { }
         finally
         {
             _signInDialogOpen = false;
@@ -305,16 +303,23 @@ public sealed partial class MainWindow : Window
                     var state = RustCore.SessionState;
                     UpdateSessionControls(state);
                     if (!await ApplyPendingWindowsTimeoutAsync() && changed)
-                        await ShowActiveVaultAsync(state, forceSync: true);
+                    {
+                        if (syncError is not null && ActiveAccount is { } current)
+                            ReportReconnectSyncError(current.Id, syncError);
+                        await ShowActiveVaultAsync(state, forceSync: reconnect is null, allowSyncFallback: syncError is null);
+                    }
                 }
                 catch (Exception error) when (IsCoreUnavailable(error)) { SignInButton.IsEnabled = true; }
             }
         }
     }
 
-    private async Task<bool> ShowSignInDialogCoreAsync(VaultAccount? reconnect)
+    private async Task<(bool Opened, string? SyncError)> ShowSignInDialogCoreAsync(VaultAccount? reconnect)
     {
-        var added = false;
+        var opened = false;
+        string? syncError = null;
+        var allowLocalUnlock = reconnect is { State: VaultSessionState.Locked };
+        var allowHello = allowLocalUnlock && reconnect!.HelloEnabled;
         var environment = reconnect is null ? LoginEnvironment.Load() : new LoginEnvironment(reconnect.ServerMode, reconnect.ServerUrl);
         var serverBox = new ComboBox
         {
@@ -342,11 +347,19 @@ public sealed partial class MainWindow : Window
         {
             Text = "填写服务器根地址，无需添加 /api 或 /identity。HTTP 仅支持本机回环地址。",
             TextWrapping = TextWrapping.Wrap,
-            Visibility = serverUrlBox.Visibility,
+            Visibility = reconnect is null ? serverUrlBox.Visibility : Visibility.Collapsed,
         };
         var emailBox = new TextBox { Header = "电子邮箱", PlaceholderText = "name@example.com",
             Text = reconnect?.Email ?? string.Empty, IsReadOnly = reconnect is not null };
         var passwordBox = new PasswordBox { Header = "主密码", PlaceholderText = "输入 Bitwarden 主密码" };
+        var accessHelp = new TextBlock
+        {
+            Text = "输入一次主密码即可解锁并连接服务器。断网时可选择只读离线解锁。" +
+                (allowHello ? " Windows Hello 仅解锁本机缓存，不会登录服务器。" : ""),
+            TextWrapping = TextWrapping.Wrap,
+            Visibility = allowLocalUnlock ? Visibility.Visible : Visibility.Collapsed,
+        };
+        var helloButton = new Button { Content = "Windows Hello", Visibility = allowHello ? Visibility.Visible : Visibility.Collapsed };
         var providerBox = new ComboBox { Header = "二步验证方式", Visibility = Visibility.Collapsed, HorizontalAlignment = HorizontalAlignment.Stretch };
         var tokenBox = new TextBox { Header = "验证码", PlaceholderText = "输入一次性验证码", Visibility = Visibility.Collapsed };
         var sendEmailButton = new Button { Content = "发送邮箱验证码", Visibility = Visibility.Collapsed, HorizontalAlignment = HorizontalAlignment.Left };
@@ -367,9 +380,18 @@ public sealed partial class MainWindow : Window
         var resendDeviceOtpButton = new Button { Content = "重新发送新设备验证码", Visibility = Visibility.Collapsed, HorizontalAlignment = HorizontalAlignment.Left };
         var progress = new ProgressBar { IsIndeterminate = true, Visibility = Visibility.Collapsed };
         var statusText = new TextBlock { Name = "LoginStatus", TextWrapping = TextWrapping.Wrap };
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetLiveSetting(statusText, Microsoft.UI.Xaml.Automation.Peers.AutomationLiveSetting.Polite);
         var content = new StackPanel { Spacing = 12, MinWidth = 320, MaxWidth = 440 };
-        foreach (var element in new UIElement[] { serverBox, serverUrlBox, serverHelp, emailBox,
-            PasswordVisibility.WithToggle(passwordBox), deviceOtpBox, resendDeviceOtpButton, providerBox, tokenBox, sendEmailButton,
+        if (reconnect is null)
+        {
+            foreach (var element in new UIElement[] { serverBox, serverUrlBox, serverHelp, emailBox }) content.Children.Add(element);
+        }
+        else
+        {
+            content.Children.Add(new TextBlock { Text = $"{reconnect.Email} · {reconnect.ServerLabel}", TextWrapping = TextWrapping.Wrap });
+        }
+        foreach (var element in new UIElement[] { accessHelp, PasswordVisibility.WithToggle(passwordBox),
+            helloButton, deviceOtpBox, resendDeviceOtpButton, providerBox, tokenBox, sendEmailButton,
             rememberTwoFactorBox, rememberTwoFactorHelp, progress, statusText })
         {
             content.Children.Add(element);
@@ -377,9 +399,12 @@ public sealed partial class MainWindow : Window
 
         var dialog = new ContentDialog
         {
-            Title = reconnect is null ? "登录 Bitwarden" : "重新连接当前账户",
+            Title = allowLocalUnlock ? "解锁保险库" : reconnect is null ? "登录 Bitwarden" : "重新连接当前账户",
             Content = new ScrollViewer { Content = content, VerticalScrollBarVisibility = ScrollBarVisibility.Auto },
-            PrimaryButtonText = "登录",
+            PrimaryButtonText = allowLocalUnlock ? "解锁并同步" : "登录",
+            SecondaryButtonText = allowLocalUnlock ? "仅离线解锁" : string.Empty,
+            IsPrimaryButtonEnabled = !allowLocalUnlock,
+            IsSecondaryButtonEnabled = false,
             CloseButtonText = "取消",
             DefaultButton = ContentDialogButton.Primary,
             XamlRoot = AppTitleBar.XamlRoot,
@@ -409,8 +434,17 @@ public sealed partial class MainWindow : Window
             emailBox.IsEnabled = passwordBox.IsEnabled = !value;
             providerBox.IsEnabled = tokenBox.IsEnabled = rememberTwoFactorBox.IsEnabled = !value;
             deviceOtpBox.IsEnabled = sendEmailButton.IsEnabled = resendDeviceOtpButton.IsEnabled = !value;
-            dialog.IsPrimaryButtonEnabled = !value && !unsupportedTwoFactor;
+            helloButton.IsEnabled = !value;
+            dialog.IsPrimaryButtonEnabled = !value && !unsupportedTwoFactor && (!allowLocalUnlock || passwordBox.Password.Length != 0);
+            dialog.IsSecondaryButtonEnabled = allowLocalUnlock && !value && passwordBox.Password.Length != 0;
             dialog.CloseButtonText = value ? "取消请求" : "取消";
+        }
+
+        CancellationToken BeginRequest()
+        {
+            _unlockRequest = requestCancellation = new CancellationTokenSource();
+            SetBusy(true);
+            return requestCancellation.Token;
         }
 
         void ResetTwoFactor()
@@ -427,7 +461,7 @@ public sealed partial class MainWindow : Window
             deviceOtpBox.Text = string.Empty;
             tokenBox.Text = string.Empty;
             statusText.Text = string.Empty;
-            dialog.IsPrimaryButtonEnabled = true;
+            SetBusy(false);
         }
 
         void RequestClose()
@@ -440,10 +474,13 @@ public sealed partial class MainWindow : Window
 
         void FinishRequest()
         {
-            requestCancellation?.Dispose();
+            if (requestCancellation is null) return;
+            _unlockRequest = null;
+            requestCancellation.Dispose();
             requestCancellation = null;
+            if (_closed) return;
             SetBusy(false);
-            if (closingRequested) dialog.Hide();
+            if (closingRequested || opened) dialog.Hide();
         }
 
         bool Validate(string email, string password, uint serverMode, string serverUrl)
@@ -461,7 +498,7 @@ public sealed partial class MainWindow : Window
                 serverUrlBox.Focus(FocusState.Programmatic);
                 return false;
             }
-            new LoginEnvironment(serverMode, serverUrlBox.Text.Trim()).Save();
+            if (reconnect is null) new LoginEnvironment(serverMode, serverUrlBox.Text.Trim()).Save();
             return true;
         }
 
@@ -489,6 +526,37 @@ public sealed partial class MainWindow : Window
             if (busy) { args.Cancel = true; RequestClose(); }
         };
 
+        if (reconnect is not null) dialog.Opened += (_, _) => passwordBox.Focus(FocusState.Programmatic);
+
+        async Task TryUnlockLocalAsync(bool hello)
+        {
+            if (busy || !allowLocalUnlock || (hello ? !allowHello : passwordBox.Password.Length == 0)) return;
+            var password = hello ? string.Empty : passwordBox.Password;
+            var token = BeginRequest();
+            passwordBox.Password = string.Empty;
+            statusText.Text = hello ? "请按照 Windows Hello 提示验证…" : "正在本机解锁…";
+            try
+            {
+                await UnlockLocalVaultAsync(hello ? reconnect!.Id : null, password, token);
+                opened = true;
+            }
+            catch (OperationCanceledException) { statusText.Text = "解锁已取消。"; }
+            catch (VaultException error) { statusText.Text = error.UserMessage; }
+            catch (Exception error) when (IsCoreUnavailable(error)) { statusText.Text = "无法加载 Rust 核心，请修复应用安装。"; }
+            finally
+            {
+                FinishRequest();
+                if (!_closed && !opened && !closingRequested) passwordBox.Focus(FocusState.Programmatic);
+            }
+        }
+
+        dialog.SecondaryButtonClick += async (_, args) =>
+        {
+            args.Cancel = true;
+            await TryUnlockLocalAsync(hello: false);
+        };
+        helloButton.Click += async (_, _) => await TryUnlockLocalAsync(hello: true);
+
         sendEmailButton.Click += async (_, _) =>
         {
             if (busy) return;
@@ -498,9 +566,7 @@ public sealed partial class MainWindow : Window
                 var password = passwordBox.Password;
                 var (mode, url) = GetServerSelection();
                 if (!Validate(email, password, mode, url)) return;
-                requestCancellation = new CancellationTokenSource();
-                var cancellationToken = requestCancellation.Token;
-                SetBusy(true);
+                var cancellationToken = BeginRequest();
                 statusText.Text = "正在请求发送验证码…";
                 var result = await Task.Run(() => RustCore.SendTwoFactorEmail(email, password, mode, url, cancellationToken));
                 statusText.Text = result switch
@@ -525,9 +591,7 @@ public sealed partial class MainWindow : Window
                 var password = passwordBox.Password;
                 var (mode, url) = GetServerSelection();
                 if (!Validate(email, password, mode, url)) return;
-                requestCancellation = new CancellationTokenSource();
-                var cancellationToken = requestCancellation.Token;
-                SetBusy(true);
+                var cancellationToken = BeginRequest();
                 statusText.Text = "正在重新发送新设备验证码…";
                 var result = await Task.Run(() => RustCore.ResendNewDeviceVerification(
                     email, password, deviceIdentifier, mode, url, cancellationToken));
@@ -548,7 +612,6 @@ public sealed partial class MainWindow : Window
         {
             args.Cancel = true;
             if (busy) return;
-            var authenticated = false;
             try
             {
                 var email = emailBox.Text.Trim();
@@ -572,17 +635,24 @@ public sealed partial class MainWindow : Window
                 }
                 var provider = providerBox.SelectedItem is ComboBoxItem item && item.Tag is uint id ? id : 0;
                 var rememberTwoFactor = needsToken && rememberTwoFactorBox.IsChecked == true;
-                requestCancellation = new CancellationTokenSource();
-                var cancellationToken = requestCancellation.Token;
-                SetBusy(true);
+                var cancellationToken = BeginRequest();
                 statusText.Text = "正在验证账户…";
                 var result = await Task.Run(() => RustCore.Login(email, password, provider,
                     needsToken ? token : string.Empty, deviceOtp, mode, url, deviceIdentifier, cancellationToken, rememberTwoFactor));
                 if (result.Status == AuthStatus.Authenticated)
                 {
-                    added = authenticated = true;
+                    opened = true;
+                    passwordBox.Password = string.Empty;
+                    password = string.Empty;
                     deviceVerificationRequired = false;
                     pendingDeviceOtp = string.Empty;
+                    if (reconnect is not null && !_closed)
+                    {
+                        statusText.Text = "正在同步保险库…";
+                        try { await Task.Run(() => RustCore.SyncVault(cancellationToken)); }
+                        catch (VaultException error) { syncError = error.UserMessage; }
+                        catch (OperationCanceledException) { syncError = "同步已取消。"; }
+                    }
                     return;
                 }
                 if (result.Status is AuthStatus.NewDeviceVerificationRequired or AuthStatus.InvalidNewDeviceVerificationCode)
@@ -647,6 +717,7 @@ public sealed partial class MainWindow : Window
                     AuthStatus.AccountAlreadySignedIn => "该账户已登录，请从账户菜单切换。",
                     AuthStatus.AccountLimitReached => "最多可同时登录 5 个账户，请先退出其中一个。",
                     AuthStatus.Failed when deviceVerificationRequired && !needsToken => "新设备验证码无效或已过期。请重新输入或重新发送。",
+                    AuthStatus.Failed when allowLocalUnlock => "未能连接账户。请检查主密码或网络；也可选择仅离线解锁。",
                     _ => "登录失败。请检查账户、主密码、验证码和服务器地址后重试。",
                 };
             }
@@ -655,8 +726,7 @@ public sealed partial class MainWindow : Window
             finally
             {
                 FinishRequest();
-                if (authenticated) dialog.Hide();
-                else if (!closingRequested && tokenBox.Visibility == Visibility.Visible && !unsupportedTwoFactor)
+                if (!_closed && !opened && !closingRequested && tokenBox.Visibility == Visibility.Visible && !unsupportedTwoFactor)
                     tokenBox.Focus(FocusState.Programmatic);
             }
         };
@@ -667,8 +737,12 @@ public sealed partial class MainWindow : Window
         }
         finally
         {
-            requestCancellation?.Cancel();
-            requestCancellation?.Dispose();
+            if (requestCancellation is not null)
+            {
+                _unlockRequest = null;
+                requestCancellation.Cancel();
+                requestCancellation.Dispose();
+            }
             passwordBox.Password = string.Empty;
             deviceOtpBox.Text = string.Empty;
             pendingDeviceOtp = string.Empty;
@@ -677,12 +751,12 @@ public sealed partial class MainWindow : Window
             var (mode, url) = GetServerSelection();
             try
             {
-                if (mode != 2 || RustCore.IsValidServer(mode, url))
+                if (reconnect is null && (mode != 2 || RustCore.IsValidServer(mode, url)))
                     new LoginEnvironment(mode, serverUrlBox.Text.Trim()).Save();
             }
             catch (Exception error) when (IsCoreUnavailable(error)) { }
         }
-        return added;
+        return (opened, syncError);
     }
 
     private static bool IsCoreUnavailable(Exception error) =>

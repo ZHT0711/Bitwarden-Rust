@@ -79,6 +79,15 @@ pub(crate) async fn run<F: Future>(id: u64, request: F) -> Result<F::Output, Req
         .await
 }
 
+#[cfg(windows)]
+pub(crate) async fn run_hello<F: Future>(id: u64, request: F) -> Result<F::Output, RequestError> {
+    // Unlike a network request, the user needs time to interact with a secure system prompt.
+    CURRENT_REQUEST
+        .get_or_init(RequestGate::new)
+        .run(id, request, Duration::from_secs(120))
+        .await
+}
+
 pub(crate) async fn run_transfer<F: Future>(
     id: u64,
     request: F,

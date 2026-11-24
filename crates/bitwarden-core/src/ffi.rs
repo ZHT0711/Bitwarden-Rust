@@ -31,6 +31,8 @@ use zeroize::{Zeroize, Zeroizing};
 mod export;
 #[cfg(windows)]
 mod hello;
+#[cfg(windows)]
+mod hello_window;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod http_tests;
 #[cfg(windows)]
@@ -992,6 +994,11 @@ pub unsafe extern "C" fn bw_auth_login_with_remember(
                         authenticated.state = SESSION_UNLOCKED;
                         #[cfg(windows)]
                         authenticated.restore_local_vault(runtime);
+                        // Cache restoration may take time for large vaults. Do not publish a
+                        // session if a lock, account switch or cancellation arrived meanwhile.
+                        if !auth_request::is_current(request_id) {
+                            return AUTH_CANCELLED;
+                        }
                         session.activate(authenticated);
                     } else if response.two_factor.is_some() {
                         remembered_two_factor::clear(&remember_identity);

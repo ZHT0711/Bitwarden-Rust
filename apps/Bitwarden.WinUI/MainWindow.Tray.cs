@@ -7,6 +7,8 @@ public sealed partial class MainWindow
 {
     private WindowsTrayIcon? _tray;
     private bool _exiting;
+    private bool _exitPrepared;
+    private bool _exitReady;
     private bool _hiddenToTray;
 
     private void InitializeTray()
@@ -45,10 +47,34 @@ public sealed partial class MainWindow
         return true;
     }
 
-    private void OnWindowClosing(AppWindow sender, AppWindowClosingEventArgs args)
+    private async void OnWindowClosing(AppWindow sender, AppWindowClosingEventArgs args)
     {
+        if (_exitReady) return;
         if (!_exiting && DesktopPreferences.Read(DesktopPreferences.KeepInTray) && TryHideToTray())
+        {
             args.Cancel = true;
+            return;
+        }
+        // Keep the dispatcher alive for a bounded cleanup; duplicate close requests must
+        // not bypass it. Revoke vault keys/UI immediately, before waiting on Windows.
+        args.Cancel = true;
+        await ExitAsync();
+    }
+
+    private async Task ExitAsync()
+    {
+        if (_exitPrepared || _closed) return;
+        _exiting = true;
+        try
+        {
+            PrepareForExit();
+            _ = await ClipboardCleaner.ClearForExitAsync(TimeSpan.FromSeconds(5));
+        }
+        finally
+        {
+            _exitReady = true;
+            Close();
+        }
     }
 
     private void RestoreIfTrayUnavailable()
@@ -56,11 +82,10 @@ public sealed partial class MainWindow
         if (_hiddenToTray) ShowMainWindow();
     }
 
-    private void ExitFromTray()
+    private async void ExitFromTray()
     {
         if (_closed || _exiting) return;
-        _exiting = true;
-        Close();
+        await ExitAsync();
     }
 
     private void DisposeTray()

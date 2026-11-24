@@ -384,6 +384,7 @@ dependencies = [
  "uuid",
  "win_webauthn",
  "windows",
+ "windows-core",
  "windows-future",
  "wiremock",
  "zeroize",

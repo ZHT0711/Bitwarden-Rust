@@ -45,7 +45,8 @@ zeroize.workspace = true
 [target.'cfg(windows)'.dependencies]
 bitwarden-sensitive-value.workspace = true
 win_webauthn = { path = "../../vendor/win_webauthn" }
-windows = { version = "0.62.2", features = ["Security_Credentials", "Security_Cryptography", "Storage_Streams", "Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_WinRT", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.62.2", features = ["Security_Credentials", "Security_Cryptography", "Storage_Streams", "UI", "Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_WinRT", "Win32_UI_WindowsAndMessaging"] }
+windows-core = "0.62.2"
 windows-future = "0.3.2"
 
 [dev-dependencies]

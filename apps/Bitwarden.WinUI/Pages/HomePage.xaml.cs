@@ -24,6 +24,7 @@ public sealed partial class HomePage : Page
     public HomePage()
     {
         InitializeComponent();
+        InitializeListOptions();
         PopulateFolders();
         Loaded += async (_, _) => { _loaded = true; await RefreshAsync(false); };
         Unloaded += (_, _) => { _loaded = false; ClearSensitiveState(); };
@@ -51,7 +52,13 @@ public sealed partial class HomePage : Page
         base.OnNavigatedTo(e);
     }
 
-    public void SetSearch(string query) { _query = query.Trim(); ApplyFilters(); }
+    public void SetSearch(string query)
+    {
+        query = query.Trim();
+        if (_query == query) return;
+        _query = query;
+        ApplyFilters();
+    }
     public void ShowAuthenticated() => _ = RefreshAsync(true);
 
     public void ShowLoggedOut()
@@ -66,7 +73,7 @@ public sealed partial class HomePage : Page
     internal void ShowLocked()
     {
         ClearSensitiveState();
-        SetNotice("保险库已锁定", "输入主密码以继续使用当前账户。", InfoBarSeverity.Informational);
+        SetNotice("保险库已锁定", "解锁以继续使用当前账户。", InfoBarSeverity.Informational);
         ConnectButton.Visibility = Visibility.Visible;
         ConnectButton.Content = "解锁保险库";
         EmptyMessage.Text = "保险库已锁定";
@@ -78,6 +85,8 @@ public sealed partial class HomePage : Page
         _version++;
         CancelOperation();
         _overview = null;
+        _orderedSource = null;
+        _orderedItems = [];
         _initialFolderId = null;
         _editorOpen = false;
         _selectingItems = false;
@@ -98,7 +107,7 @@ public sealed partial class HomePage : Page
         SetBusy(false);
     }
 
-    public async Task RefreshAsync(bool forceSync)
+    public async Task RefreshAsync(bool forceSync, bool allowSyncFallback = true)
     {
         if (!_loaded || _syncing || _editorOpen) return;
         CancelOperation();
@@ -122,7 +131,7 @@ public sealed partial class HomePage : Page
                 result = forceSync ? await Task.Run(() => RustCore.SyncVault(token), token)
                     : await Task.Run(RustCore.GetVaultOverview, token);
             }
-            catch (VaultException error) when (!forceSync && (error.Code is "notFound" or "notSynced"))
+            catch (VaultException error) when (allowSyncFallback && !forceSync && (error.Code is "notFound" or "notSynced"))
             {
                 result = await Task.Run(() => RustCore.SyncVault(token), token);
             }
@@ -181,20 +190,23 @@ public sealed partial class HomePage : Page
 
     private void PopulateFolders()
     {
-        var selected = _initialFolderId ?? (FolderFilter.SelectedItem as ComboBoxItem)?.Tag as string;
+        var selected = _initialFolderId ?? (FolderFilter.SelectedItem as FolderChoice)?.Id;
         if (_overview is not null) _initialFolderId = null;
-        FolderFilter.Items.Clear();
-        FolderFilter.Items.Add(new ComboBoxItem { Content = "所有文件夹", Tag = "*" });
-        FolderFilter.Items.Add(new ComboBoxItem { Content = "无文件夹", Tag = "" });
-        foreach (var folder in _overview?.Folders ?? []) FolderFilter.Items.Add(new ComboBoxItem { Content = folder.Name, Tag = folder.Id });
-        FolderFilter.SelectedItem = FolderFilter.Items.OfType<ComboBoxItem>().FirstOrDefault(item => Equals(item.Tag, selected)) ?? FolderFilter.Items[0];
+        _folderHierarchy = FolderHierarchy.Build(_overview?.Folders ?? [], _overview?.Items ?? []);
+        FolderChoice[] choices = [new("*", "所有文件夹"), new("", "无文件夹"),
+            .. _folderHierarchy.All.Select(folder => new FolderChoice(folder.Id, folder.Name))];
+        _folderChoices = choices.ToDictionary(choice => choice.Id, StringComparer.Ordinal);
+        FolderFilter.ItemsSource = choices;
+        FolderFilter.SelectedItem = selected is not null && _folderChoices.TryGetValue(selected, out var choice)
+            ? choice : choices[0];
     }
 
     private void ApplyFilters()
     {
-        var folder = (FolderFilter.SelectedItem as ComboBoxItem)?.Tag as string ?? "*";
-        var items = VaultQuery.Apply(_overview?.Items ?? [], _category, folder, _query);
-        VaultList.ItemsSource = items;
+        var folder = (FolderFilter.SelectedItem as FolderChoice)?.Id ?? "*";
+        var items = VaultQuery.Apply(OrderedItems(), _category, folder, _query);
+        UpdateFolderNavigation(folder);
+        UpdateListItems(items);
         ItemCount.Text = $"{items.Length} 个条目";
         EmptyState.Visibility = items.Length == 0 ? Visibility.Visible : Visibility.Collapsed;
         EmptyMessage.Text = _overview is null ? "登录或同步以查看你的保险库" : _query.Length > 0 ? "没有匹配的条目" : "此分类或文件夹中没有条目";
@@ -203,7 +215,8 @@ public sealed partial class HomePage : Page
 
     private async void VaultList_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
-        if (_syncing || _editorOpen) return;
+        if (_updatingList || _syncing || _editorOpen) return;
+        UpdateListLayout();
         if (_selectingItems)
         {
             UpdateMutationCommands();
@@ -300,8 +313,13 @@ public sealed partial class HomePage : Page
         {
             var panel = new StackPanel { Spacing = 6 };
             panel.Children.Add(new TextBlock { Text = field.Label, Style = (Style)Application.Current.Resources["BodyStrongTextBlockStyle"] });
-            if (field.Sensitive) panel.Children.Add(PasswordVisibility.WithToggle(new PasswordBox { Password = field.Value }));
-            else panel.Children.Add(new TextBox { Text = field.Value, IsReadOnly = true, TextWrapping = TextWrapping.Wrap, AcceptsReturn = true });
+            if (field.Sensitive) panel.Children.Add(PasswordVisibility.WithToggle(new PasswordBox { Password = field.Value }, field.Label));
+            else
+            {
+                var value = new TextBox { Text = field.Value, IsReadOnly = true, TextWrapping = TextWrapping.Wrap, AcceptsReturn = true };
+                Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(value, field.Label);
+                panel.Children.Add(value);
+            }
             var copy = new Button { Content = "复制", HorizontalAlignment = HorizontalAlignment.Left };
             Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(copy, $"复制{field.Label}");
             copy.Click += (_, _) =>
@@ -333,7 +351,8 @@ public sealed partial class HomePage : Page
         _busy = busy;
         LoadingRing.IsActive = busy;
         LoadingRing.Visibility = CancelRequestButton.Visibility = busy ? Visibility.Visible : Visibility.Collapsed;
-        FolderFilter.IsEnabled = !busy;
+        FolderFilter.IsEnabled = SortChoice.IsEnabled = FolderCrumbs.IsEnabled = ChildFolderList.IsEnabled = FolderAncestorsButton.IsEnabled = !busy;
+        if (busy) FolderAncestorsFlyout.Hide();
         UpdateMutationCommands();
     }
     private void SetNotice(string title, string message, InfoBarSeverity severity)
