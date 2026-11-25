@@ -306,7 +306,7 @@ dependencies = [
  "bitwarden-api-api",
  "bitwarden-api-identity",
  "bitwarden-api-key-connector",
- "bitwarden-core 4.0.0",
+ "bitwarden-core",
  "bitwarden-crypto",
  "bitwarden-encoding",
  "bitwarden-error",
@@ -333,7 +333,7 @@ version = "4.0.0"
 source = "git+https://github.com/bitwarden/sdk-internal?rev=56c7617b23501af70221094cdee59e10b2a9d8d2#56c7617b23501af70221094cdee59e10b2a9d8d2"
 dependencies = [
  "bitwarden-api-api",
- "bitwarden-core 4.0.0",
+ "bitwarden-core",
  "bitwarden-crypto",
  "bitwarden-error",
  "bitwarden-ffi",
@@ -342,52 +342,6 @@ dependencies = [
  "serde_repr",
  "thiserror",
  "uuid",
-]
-
-[[package]]
-name = "bitwarden-core"
-version = "0.2.0"
-dependencies = [
- "aes-gcm 0.10.3",
- "argon2 0.5.3",
- "async-trait",
- "base64 0.22.1",
- "bitwarden-api-api",
- "bitwarden-api-base",
- "bitwarden-auth",
- "bitwarden-core 4.0.0",
- "bitwarden-crypto",
- "bitwarden-crypto-sync-handler",
- "bitwarden-fido",
- "bitwarden-generators",
- "bitwarden-send",
- "bitwarden-sensitive-value",
- "bitwarden-state",
- "bitwarden-vault",
- "bytes",
- "chrono",
- "csv",
- "hmac 0.13.0",
- "http",
- "p256 0.13.2",
- "rand 0.8.8",
- "reqwest",
- "reqwest-middleware",
- "serde",
- "serde_json",
- "sha1",
- "sha2 0.11.1",
- "tempfile",
- "thiserror",
- "tokio",
- "url",
- "uuid",
- "win_webauthn",
- "windows",
- "windows-core",
- "windows-future",
- "wiremock",
- "zeroize",
 ]
 
 [[package]]
@@ -496,7 +450,7 @@ source = "git+https://github.com/bitwarden/sdk-internal?rev=56c7617b23501af70221
 dependencies = [
  "async-trait",
  "bitwarden-api-api",
- "bitwarden-core 4.0.0",
+ "bitwarden-core",
  "bitwarden-crypto",
  "bitwarden-ffi",
  "bitwarden-sync",
@@ -561,7 +515,7 @@ source = "git+https://github.com/bitwarden/sdk-internal?rev=56c7617b23501af70221
 dependencies = [
  "async-trait",
  "bitwarden-api-api",
- "bitwarden-core 4.0.0",
+ "bitwarden-core",
  "bitwarden-crypto",
  "bitwarden-encoding",
  "bitwarden-vault",
@@ -584,7 +538,7 @@ name = "bitwarden-generators"
 version = "4.0.0"
 source = "git+https://github.com/bitwarden/sdk-internal?rev=56c7617b23501af70221094cdee59e10b2a9d8d2#56c7617b23501af70221094cdee59e10b2a9d8d2"
 dependencies = [
- "bitwarden-core 4.0.0",
+ "bitwarden-core",
  "bitwarden-crypto",
  "bitwarden-error",
  "bitwarden-ffi",
@@ -639,7 +593,7 @@ name = "bitwarden-organizations"
 version = "4.0.0"
 source = "git+https://github.com/bitwarden/sdk-internal?rev=56c7617b23501af70221094cdee59e10b2a9d8d2#56c7617b23501af70221094cdee59e10b2a9d8d2"
 dependencies = [
- "bitwarden-core 4.0.0",
+ "bitwarden-core",
  "bitwarden-crypto",
  "bitwarden-ffi",
  "bitwarden-state",
@@ -657,7 +611,7 @@ source = "git+https://github.com/bitwarden/sdk-internal?rev=56c7617b23501af70221
 dependencies = [
  "async-trait",
  "bitwarden-api-api",
- "bitwarden-core 4.0.0",
+ "bitwarden-core",
  "bitwarden-ffi",
  "bitwarden-organizations",
  "bitwarden-state",
@@ -693,7 +647,7 @@ dependencies = [
  "bitwarden-api-api",
  "bitwarden-api-base",
  "bitwarden-auth",
- "bitwarden-core 4.0.0",
+ "bitwarden-core",
  "bitwarden-crypto",
  "bitwarden-encoding",
  "bitwarden-error",
@@ -785,7 +739,7 @@ source = "git+https://github.com/bitwarden/sdk-internal?rev=56c7617b23501af70221
 dependencies = [
  "async-trait",
  "bitwarden-api-api",
- "bitwarden-core 4.0.0",
+ "bitwarden-core",
  "bitwarden-state",
  "chrono",
  "serde",
@@ -865,7 +819,7 @@ dependencies = [
  "bitwarden-api-api",
  "bitwarden-api-base",
  "bitwarden-collections",
- "bitwarden-core 4.0.0",
+ "bitwarden-core",
  "bitwarden-crypto",
  "bitwarden-encoding",
  "bitwarden-error",
@@ -978,6 +932,52 @@ name = "bytes"
 version = "1.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "776dfebd015e2d8732c684a2c71003674ccb49457b539b9e82151ba38e96dd7c"
+
+[[package]]
+name = "bytewarden-core"
+version = "0.2.0"
+dependencies = [
+ "aes-gcm 0.10.3",
+ "argon2 0.5.3",
+ "async-trait",
+ "base64 0.22.1",
+ "bitwarden-api-api",
+ "bitwarden-api-base",
+ "bitwarden-auth",
+ "bitwarden-core",
+ "bitwarden-crypto",
+ "bitwarden-crypto-sync-handler",
+ "bitwarden-fido",
+ "bitwarden-generators",
+ "bitwarden-send",
+ "bitwarden-sensitive-value",
+ "bitwarden-state",
+ "bitwarden-vault",
+ "bytes",
+ "chrono",
+ "csv",
+ "hmac 0.13.0",
+ "http",
+ "p256 0.13.2",
+ "rand 0.8.8",
+ "reqwest",
+ "reqwest-middleware",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2 0.11.1",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "url",
+ "uuid",
+ "win_webauthn",
+ "windows",
+ "windows-core",
+ "windows-future",
+ "wiremock",
+ "zeroize",
+]
 
 [[package]]
 name = "cbc"

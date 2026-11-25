@@ -1,5 +1,5 @@
 param(
-    [string]$Library = 'target/release/bitwarden_core.dll',
+    [string]$Library = 'target/release/bytewarden_core.dll',
     [string]$Fixture = 'work/linked-fields-fixture.json',
     [string]$PythonExe = 'python'
 )
@@ -8,8 +8,8 @@ param(
 # because the Rust cache's exclusive writer lock deliberately lasts for the process lifetime.
 $ErrorActionPreference = 'Stop'
 $pythonPath = (Get-Command $PythonExe -CommandType Application -ErrorAction Stop).Source
-$probe = & $pythonPath -c 'import sys; print("bitwarden-fixture-python3" if sys.version_info >= (3, 10) else "unsupported")' | Out-String
-if ($LASTEXITCODE -ne 0 -or $probe.Trim() -ne 'bitwarden-fixture-python3') {
+$probe = & $pythonPath -c 'import sys; print("bytewarden-fixture-python3" if sys.version_info >= (3, 10) else "unsupported")' | Out-String
+if ($LASTEXITCODE -ne 0 -or $probe.Trim() -ne 'bytewarden-fixture-python3') {
     throw 'A working Python 3.10+ interpreter is required. Pass -PythonExe with its full path; a Windows Store execution alias alone is not enough.'
 }
 $root = Split-Path $PSScriptRoot -Parent
@@ -21,7 +21,7 @@ if ($fixtureData.linkedFieldFixture.synthetic -ne $true -or $fixtureData.ciphers
 }
 $run = Join-Path $root ('work/linked-native-' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $run | Out-Null
-$cache = [IO.Directory]::CreateTempSubdirectory('bitwarden-linked-check-')
+$cache = [IO.Directory]::CreateTempSubdirectory('bytewarden-linked-check-')
 $server = $null
 $baseUrl = $null
 $log = Join-Path $run 'checks.log'
@@ -47,12 +47,12 @@ try {
         pythonExecutable = $pythonPath
         dllSha256 = (Get-FileHash -LiteralPath $libraryPath).Hash
         fixtureSha256 = (Get-FileHash -LiteralPath $fixturePath).Hash
-        testSourceSha256 = (Get-FileHash (Join-Path $root 'tests/Bitwarden.Interop.Tests/NativeLinkedFieldChecks.cs')).Hash
+        testSourceSha256 = (Get-FileHash (Join-Path $root 'tests/Bytewarden.Interop.Tests/NativeLinkedFieldChecks.cs')).Hash
         hostSourceSha256 = (Get-FileHash $PSCommandPath).Hash
         server = $baseUrl
         cacheDirectory = $cache.FullName
     } | ConvertTo-Json | Set-Content (Join-Path $run 'inputs.json')
-    & dotnet run --project (Join-Path $root 'tests/Bitwarden.Interop.Tests') -c Release -- --linked-fields $libraryPath $baseUrl $cache.FullName 2>&1 |
+    & dotnet run --project (Join-Path $root 'tests/Bytewarden.Interop.Tests') -c Release -- --linked-fields $libraryPath $baseUrl $cache.FullName 2>&1 |
         Tee-Object -FilePath $log | Select-Object -Last 16 | Write-Host
     if ($LASTEXITCODE) { throw "Native linked checks failed. Evidence: $run" }
     Write-Host "Evidence: $run"

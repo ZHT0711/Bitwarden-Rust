@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<Page
+    x:Class="Bytewarden.WinUI.Pages.AboutPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:local="using:Bytewarden.WinUI.Pages"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d">
+
+    <Grid Padding="20,10,20,16" RowSpacing="12">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+        <TextBlock Style="{StaticResource SubtitleTextBlockStyle}" Text="关于 Bytewarden" />
+        <StackPanel Grid.Row="1" Spacing="8">
+            <TextBlock Text="WinUI 3 桌面客户端原型" />
+            <TextBlock Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="目标对照版本：Bitwarden Desktop 2026.11.0；本机安装版本：2026.10.4.0。" />
+            <TextBlock Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="密码登录、部分二步验证、保险库同步和解密由官方 Rust SDK 处理。会话仅驻留内存；条目写入、离线解锁和完整桌面功能仍在开发中。" TextWrapping="Wrap" />
+        </StackPanel>
+    </Grid>
+</Page>

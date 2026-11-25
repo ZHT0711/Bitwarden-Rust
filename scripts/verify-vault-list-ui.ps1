@@ -1,5 +1,5 @@
-param(
-    [string]$Package = 'apps/Bitwarden.WinUI/AppPackages/Bitwarden.WinUI_0.2.0.0_x64_Test/Bitwarden.WinUI_0.2.0.0_x64.msix',
+﻿param(
+    [string]$Package = 'apps/Bytewarden.WinUI/AppPackages/Bytewarden.WinUI_0.2.0.0_x64_Test/Bytewarden.WinUI_0.2.0.0_x64.msix',
     [string]$Fixture = 'work/ci-fixture.json',
     [string]$PythonExe = 'python',
     [switch]$IncludeFolders,
@@ -28,8 +28,8 @@ if ($MeasureVault -and ($IncludeFolders -or $IncludeClipboardStress)) {
 $root = Split-Path $PSScriptRoot -Parent
 $winAppExe = (Get-Command winapp -CommandType Application -ErrorAction Stop).Source
 $pythonPath = (Get-Command $PythonExe -CommandType Application -ErrorAction Stop).Source
-$pythonProbe = & $pythonPath -c 'import sys; print("bitwarden-fixture-python3" if sys.version_info >= (3, 10) else "unsupported")' | Out-String
-if ($LASTEXITCODE -ne 0 -or $pythonProbe.Trim() -ne 'bitwarden-fixture-python3') {
+$pythonProbe = & $pythonPath -c 'import sys; print("bytewarden-fixture-python3" if sys.version_info >= (3, 10) else "unsupported")' | Out-String
+if ($LASTEXITCODE -ne 0 -or $pythonProbe.Trim() -ne 'bytewarden-fixture-python3') {
     throw 'A working Python 3.10+ interpreter is required. Pass -PythonExe with its full path; a Windows Store execution alias alone is not enough.'
 }
 $packagePath = (Resolve-Path (Join-Path $root $Package)).Path
@@ -50,7 +50,7 @@ if ($MeasureVault) {
 $run = Join-Path $root ('work/list-acceptance-' + [Guid]::NewGuid().ToString('N'))
 $layout = Join-Path $run 'app'
 New-Item -ItemType Directory -Path $run | Out-Null
-$identity = 'ZHT0711.BitwardenRustSyntheticListTest'
+$identity = 'ZHT0711.BytewardenSyntheticListTest'
 $server = $null
 $previewId = $null
 $baseUrl = $null
@@ -195,20 +195,20 @@ try {
         folderSamples = $FolderSamples
         folderRunLabel = $FolderRunLabel
         folderSourceHashes = [ordered]@{
-            home = (Get-FileHash (Join-Path $root 'apps/Bitwarden.WinUI/Pages/HomePage.xaml.cs')).Hash
-            navigation = (Get-FileHash (Join-Path $root 'apps/Bitwarden.WinUI/Pages/HomePage.Folders.cs')).Hash
-            hierarchy = (Get-FileHash (Join-Path $root 'apps/Bitwarden.WinUI/Interop/FolderHierarchy.cs')).Hash
-            homeXaml = (Get-FileHash (Join-Path $root 'apps/Bitwarden.WinUI/Pages/HomePage.xaml')).Hash
-            editor = (Get-FileHash (Join-Path $root 'apps/Bitwarden.WinUI/Pages/VaultEditorDialog.cs')).Hash
-            editorActions = (Get-FileHash (Join-Path $root 'apps/Bitwarden.WinUI/Pages/HomePage.Editor.cs')).Hash
-            listLayout = (Get-FileHash (Join-Path $root 'apps/Bitwarden.WinUI/Pages/HomePage.List.cs')).Hash
+            home = (Get-FileHash (Join-Path $root 'apps/Bytewarden.WinUI/Pages/HomePage.xaml.cs')).Hash
+            navigation = (Get-FileHash (Join-Path $root 'apps/Bytewarden.WinUI/Pages/HomePage.Folders.cs')).Hash
+            hierarchy = (Get-FileHash (Join-Path $root 'apps/Bytewarden.WinUI/Interop/FolderHierarchy.cs')).Hash
+            homeXaml = (Get-FileHash (Join-Path $root 'apps/Bytewarden.WinUI/Pages/HomePage.xaml')).Hash
+            editor = (Get-FileHash (Join-Path $root 'apps/Bytewarden.WinUI/Pages/VaultEditorDialog.cs')).Hash
+            editorActions = (Get-FileHash (Join-Path $root 'apps/Bytewarden.WinUI/Pages/HomePage.Editor.cs')).Hash
+            listLayout = (Get-FileHash (Join-Path $root 'apps/Bytewarden.WinUI/Pages/HomePage.List.cs')).Hash
         }
     } | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $run 'inputs.json')
     [void](WinApp @('tool', 'makeappx', 'unpack', '/p', $packagePath, '/d', $layout, '/o'))
     $manifest = Join-Path $layout 'AppxManifest.xml'
     [xml]$xml = [IO.File]::ReadAllText($manifest)
     $xml.Package.Identity.SetAttribute('Name', $identity)
-    $xml.Package.Properties.DisplayName = 'Bitwarden Rust (Synthetic List Test)'
+    $xml.Package.Properties.DisplayName = 'Bytewarden (Synthetic List Test)'
     $application = $xml.Package.Applications.Application
     $extensions = $application.SelectSingleNode("*[local-name()='Extensions']")
     if ($extensions) { [void]$application.RemoveChild($extensions) }

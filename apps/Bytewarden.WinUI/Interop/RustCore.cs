@@ -1,0 +1,412 @@
+using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+
+namespace Bytewarden.WinUI.Interop;
+
+internal static partial class RustCore
+{
+    private const string LibraryName = "bytewarden_core.dll";
+
+    [DllImport(LibraryName, EntryPoint = "bw_local_cache_set_root", CallingConvention = CallingConvention.Cdecl)]
+    private static extern byte SetLocalCacheRootNative(IntPtr path);
+
+    [DllImport(LibraryName, EntryPoint = "bw_core_version", CallingConvention = CallingConvention.Cdecl)]
+    private static extern IntPtr GetVersionNative();
+
+    [DllImport(LibraryName, EntryPoint = "bw_generate_password", CallingConvention = CallingConvention.Cdecl)]
+    private static extern IntPtr GeneratePasswordNative(uint length, uint options, uint minimumNumbers, uint minimumSpecial);
+
+    [DllImport(LibraryName, EntryPoint = "bw_generate_passphrase", CallingConvention = CallingConvention.Cdecl)]
+    private static extern IntPtr GeneratePassphraseNative(
+        uint numberOfWords,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string wordSeparator,
+        byte capitalize,
+        byte includeNumber);
+
+    [DllImport(LibraryName, EntryPoint = "bw_string_free", CallingConvention = CallingConvention.Cdecl)]
+    private static extern void FreeStringNative(IntPtr value);
+
+    [DllImport(LibraryName, EntryPoint = "bw_auth_login_with_remember", CallingConvention = CallingConvention.Cdecl)]
+    private static extern uint LoginNative(
+        IntPtr email,
+        IntPtr password,
+        uint provider,
+        IntPtr token,
+        uint serverMode,
+        IntPtr serverUrl,
+        IntPtr deviceIdentifier,
+        IntPtr deviceOtp,
+        byte remember,
+        ulong requestId);
+
+    [DllImport(LibraryName, EntryPoint = "bw_auth_send_two_factor_email", CallingConvention = CallingConvention.Cdecl)]
+    private static extern byte SendTwoFactorEmailNative(
+        IntPtr email,
+        IntPtr password,
+        uint serverMode,
+        IntPtr serverUrl,
+        ulong requestId);
+
+    [DllImport(LibraryName, EntryPoint = "bw_auth_resend_new_device_verification", CallingConvention = CallingConvention.Cdecl)]
+    private static extern byte ResendNewDeviceVerificationNative(
+        IntPtr email,
+        IntPtr password,
+        IntPtr deviceIdentifier,
+        uint serverMode,
+        IntPtr serverUrl,
+        ulong requestId);
+
+    [DllImport(LibraryName, EntryPoint = "bw_auth_begin_request", CallingConvention = CallingConvention.Cdecl)]
+    private static extern ulong BeginAuthRequestNative();
+
+    [DllImport(LibraryName, EntryPoint = "bw_auth_cancel_request", CallingConvention = CallingConvention.Cdecl)]
+    private static extern void CancelAuthRequestNative(ulong requestId);
+
+    [DllImport(LibraryName, EntryPoint = "bw_auth_validate_server", CallingConvention = CallingConvention.Cdecl)]
+    private static extern byte ValidateServerNative(uint serverMode, [MarshalAs(UnmanagedType.LPUTF8Str)] string serverUrl);
+
+    [DllImport(LibraryName, EntryPoint = "bw_auth_is_authenticated", CallingConvention = CallingConvention.Cdecl)]
+    private static extern byte IsAuthenticatedNative();
+
+    [DllImport(LibraryName, EntryPoint = "bw_auth_session_state", CallingConvention = CallingConvention.Cdecl)]
+    private static extern byte SessionStateNative();
+
+    [DllImport(LibraryName, EntryPoint = "bw_auth_logout", CallingConvention = CallingConvention.Cdecl)]
+    private static extern byte LogoutNative();
+
+    [DllImport(LibraryName, EntryPoint = "bw_auth_lock", CallingConvention = CallingConvention.Cdecl)]
+    private static extern byte LockNative();
+
+    [DllImport(LibraryName, EntryPoint = "bw_auth_unlock", CallingConvention = CallingConvention.Cdecl)]
+    private static extern IntPtr UnlockNative(IntPtr password, ulong requestId);
+
+    [DllImport(LibraryName, EntryPoint = "bw_vault_overview", CallingConvention = CallingConvention.Cdecl)]
+    private static extern IntPtr VaultOverviewNative();
+
+    [DllImport(LibraryName, EntryPoint = "bw_vault_sync", CallingConvention = CallingConvention.Cdecl)]
+    private static extern IntPtr VaultSyncNative(ulong requestId);
+
+    [DllImport(LibraryName, EntryPoint = "bw_vault_detail", CallingConvention = CallingConvention.Cdecl)]
+    private static extern IntPtr VaultDetailNative(IntPtr id, IntPtr password, ulong requestId);
+
+    [DllImport(LibraryName, EntryPoint = "bw_vault_totp_refresh", CallingConvention = CallingConvention.Cdecl)]
+    private static extern IntPtr VaultTotpRefreshNative(ulong requestId);
+
+    [DllImport(LibraryName, EntryPoint = "bw_vault_editor", CallingConvention = CallingConvention.Cdecl)]
+    private static extern IntPtr VaultEditorNative(IntPtr id, IntPtr password, ulong requestId);
+    [DllImport(LibraryName, EntryPoint = "bw_vault_create", CallingConvention = CallingConvention.Cdecl)]
+    private static extern IntPtr VaultCreateNative(IntPtr json, ulong requestId);
+    [DllImport(LibraryName, EntryPoint = "bw_vault_update", CallingConvention = CallingConvention.Cdecl)]
+    private static extern IntPtr VaultUpdateNative(IntPtr json, IntPtr password, ulong requestId);
+    [DllImport(LibraryName, EntryPoint = "bw_vault_action", CallingConvention = CallingConvention.Cdecl)]
+    private static extern IntPtr VaultActionNative(IntPtr id, IntPtr action, IntPtr revision, IntPtr password, ulong requestId);
+
+    internal static VaultOverview GetVaultOverview() => ReadJson<VaultOverview>(VaultOverviewNative());
+
+    internal static VaultOverview SyncVault(CancellationToken token) =>
+        RunVaultRequest<VaultOverview>(VaultSyncNative, token);
+
+    internal static VaultDetail GetVaultDetail(string id, string password, CancellationToken token)
+    {
+        using var idBuffer = new Utf8Buffer(id);
+        using var passwordBuffer = new Utf8Buffer(password);
+        return RunVaultRequest<VaultDetail>(requestId => VaultDetailNative(idBuffer.Pointer, passwordBuffer.Pointer, requestId), token);
+    }
+
+    internal static TotpCode RefreshTotp(ulong requestId) => ReadJson<TotpCode>(VaultTotpRefreshNative(requestId));
+
+    internal static void CloseVaultDetail(ulong requestId) => CancelAuthRequestNative(requestId);
+
+    internal static VaultEditorData GetVaultEditor(string id, string password, CancellationToken token)
+    {
+        using var idBuffer = new Utf8Buffer(id);
+        using var passwordBuffer = new Utf8Buffer(password);
+        return RunVaultRequest<VaultEditorData>(requestId => VaultEditorNative(idBuffer.Pointer, passwordBuffer.Pointer, requestId), token);
+    }
+
+    internal static VaultMutationResult CreateVaultItem(VaultEditorData data, CancellationToken token)
+    {
+        using var json = new Utf8Buffer(JsonSerializer.Serialize(data, JsonInfo<VaultEditorData>()));
+        return RunVaultRequest<VaultMutationResult>(requestId => VaultCreateNative(json.Pointer, requestId), token, acknowledgedWrite: true);
+    }
+
+    internal static VaultMutationResult UpdateVaultItem(VaultEditorData data, string password, CancellationToken token)
+    {
+        using var json = new Utf8Buffer(JsonSerializer.Serialize(data, JsonInfo<VaultEditorData>()));
+        using var passwordBuffer = new Utf8Buffer(password);
+        return RunVaultRequest<VaultMutationResult>(requestId => VaultUpdateNative(json.Pointer, passwordBuffer.Pointer, requestId), token, acknowledgedWrite: true);
+    }
+
+    internal static VaultMutationResult VaultAction(string id, string action, string revisionDate, string password, CancellationToken token)
+    {
+        using var idBuffer = new Utf8Buffer(id);
+        using var actionBuffer = new Utf8Buffer(action);
+        using var revisionBuffer = new Utf8Buffer(revisionDate);
+        using var passwordBuffer = new Utf8Buffer(password);
+        return RunVaultRequest<VaultMutationResult>(requestId => VaultActionNative(idBuffer.Pointer, actionBuffer.Pointer, revisionBuffer.Pointer, passwordBuffer.Pointer, requestId), token, acknowledgedWrite: true);
+    }
+
+    private static T RunVaultRequest<T>(Func<ulong, IntPtr> operation, CancellationToken token, bool acknowledgedWrite = false)
+    {
+        token.ThrowIfCancellationRequested();
+        var requestId = BeginAuthRequestNative();
+        using var cancellation = token.Register(() => CancelAuthRequestNative(requestId));
+        var result = ReadJson<T>(operation(requestId));
+        if (!acknowledgedWrite) token.ThrowIfCancellationRequested();
+        return result;
+    }
+
+    private static unsafe T ReadJson<T>(IntPtr pointer)
+    {
+        if (pointer == IntPtr.Zero) throw new VaultException("internal");
+        try
+        {
+            var utf8 = MemoryMarshal.CreateReadOnlySpanFromNullTerminated((byte*)pointer);
+            var response = JsonSerializer.Deserialize(utf8, JsonInfo<NativeResponse<T>>());
+            if (response is null) throw new VaultException("internal");
+            if (!response.Ok)
+            {
+                if (response.Error == "cancelled") throw new OperationCanceledException();
+                throw new VaultException(response.Error ?? "internal");
+            }
+            return response.Data ?? throw new VaultException("internal");
+        }
+        catch (JsonException) { throw new VaultException("internal"); }
+        finally { FreeStringNative(pointer); }
+    }
+
+    private sealed record NativeResponse<T>(bool Ok, T? Data, string? Error);
+
+    internal static string Version => Marshal.PtrToStringUTF8(GetVersionNative()) ?? "unknown";
+    internal static bool ConfigureLocalCache(string root)
+    {
+        using var buffer = new Utf8Buffer(root);
+        return SetLocalCacheRootNative(buffer.Pointer) != 0;
+    }
+    internal static bool IsAuthenticated => IsAuthenticatedNative() != 0;
+    internal static VaultSessionState SessionState => (VaultSessionState)SessionStateNative();
+    internal static bool IsValidServer(uint serverMode, string serverUrl) => ValidateServerNative(serverMode, serverUrl) != 0;
+
+    internal static AuthResult Login(
+        string email,
+        string password,
+        uint provider,
+        string token,
+        string deviceOtp,
+        uint serverMode,
+        string serverUrl,
+        string deviceIdentifier,
+        CancellationToken cancellationToken = default,
+        bool rememberTwoFactor = false)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        using var emailBuffer = new Utf8Buffer(email);
+        using var passwordBuffer = new Utf8Buffer(password);
+        using var tokenBuffer = new Utf8Buffer(token);
+        using var deviceOtpBuffer = new Utf8Buffer(deviceOtp);
+        using var serverBuffer = new Utf8Buffer(serverUrl);
+        using var deviceIdentifierBuffer = new Utf8Buffer(deviceIdentifier);
+        var requestId = BeginAuthRequestNative();
+        using var cancellation = cancellationToken.Register(() => CancelAuthRequestNative(requestId));
+
+        var result = LoginNative(emailBuffer.Pointer, passwordBuffer.Pointer, provider, tokenBuffer.Pointer,
+            serverMode, serverBuffer.Pointer, deviceIdentifierBuffer.Pointer, deviceOtpBuffer.Pointer,
+            rememberTwoFactor ? (byte)1 : (byte)0, requestId);
+        if (cancellationToken.IsCancellationRequested && (result & 0xff) != (uint)AuthStatus.Authenticated)
+        {
+            return new AuthResult(AuthStatus.Cancelled, 0);
+        }
+        return new AuthResult((AuthStatus)(result & 0xff), result >> 8);
+    }
+
+    internal static void Logout()
+    {
+        if (LogoutNative() == 0) throw new VaultException("cacheRevocationFailed");
+    }
+    internal static bool Lock() => LockNative() != 0;
+
+    // Opening a new request supersedes any outstanding native operation.
+    internal static void CancelActiveRequest() => BeginAuthRequestNative();
+
+    internal static void Unlock(string password, CancellationToken token)
+    {
+        using var buffer = new Utf8Buffer(password);
+        RunVaultRequest<bool>(requestId => UnlockNative(buffer.Pointer, requestId), token, acknowledgedWrite: true);
+    }
+
+    internal static AuthStatus SendTwoFactorEmail(
+        string email,
+        string password,
+        uint serverMode,
+        string serverUrl,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        using var emailBuffer = new Utf8Buffer(email);
+        using var passwordBuffer = new Utf8Buffer(password);
+        using var serverBuffer = new Utf8Buffer(serverUrl);
+        var requestId = BeginAuthRequestNative();
+        using var cancellation = cancellationToken.Register(() => CancelAuthRequestNative(requestId));
+        var status = (AuthStatus)SendTwoFactorEmailNative(emailBuffer.Pointer, passwordBuffer.Pointer,
+            serverMode, serverBuffer.Pointer, requestId);
+        if (cancellationToken.IsCancellationRequested)
+        {
+            return AuthStatus.Cancelled;
+        }
+        return status;
+    }
+
+    internal static AuthStatus ResendNewDeviceVerification(
+        string email, string password, string deviceIdentifier, uint serverMode, string serverUrl,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        using var emailBuffer = new Utf8Buffer(email);
+        using var passwordBuffer = new Utf8Buffer(password);
+        using var deviceIdentifierBuffer = new Utf8Buffer(deviceIdentifier);
+        using var serverBuffer = new Utf8Buffer(serverUrl);
+        var requestId = BeginAuthRequestNative();
+        using var cancellation = cancellationToken.Register(() => CancelAuthRequestNative(requestId));
+        var status = (AuthStatus)ResendNewDeviceVerificationNative(emailBuffer.Pointer, passwordBuffer.Pointer,
+            deviceIdentifierBuffer.Pointer, serverMode, serverBuffer.Pointer, requestId);
+        if (cancellationToken.IsCancellationRequested)
+        {
+            return AuthStatus.Cancelled;
+        }
+        return status;
+    }
+
+    private sealed class Utf8Buffer : IDisposable
+    {
+        private readonly int _byteLength;
+        public IntPtr Pointer { get; private set; }
+
+        public Utf8Buffer(string value) => Pointer = AllocateUtf8(value, out _byteLength);
+
+        public void Dispose()
+        {
+            ZeroAndFree(Pointer, _byteLength);
+            Pointer = IntPtr.Zero;
+        }
+    }
+
+    private static unsafe IntPtr AllocateUtf8(string value, out int byteLength)
+    {
+        byteLength = Encoding.UTF8.GetByteCount(value);
+        var pointer = Marshal.AllocHGlobal(byteLength + 1);
+        try
+        {
+            var destination = new Span<byte>((void*)pointer, byteLength + 1);
+            var written = Encoding.UTF8.GetBytes(value.AsSpan(), destination);
+            destination[written] = 0;
+            return pointer;
+        }
+        catch
+        {
+            ZeroAndFree(pointer, byteLength);
+            throw;
+        }
+    }
+
+    private static unsafe void ZeroAndFree(IntPtr pointer, int byteLength)
+    {
+        if (pointer == IntPtr.Zero)
+        {
+            return;
+        }
+
+        try
+        {
+            CryptographicOperations.ZeroMemory(new Span<byte>((void*)pointer, byteLength + 1));
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(pointer);
+        }
+    }
+
+    internal static string GeneratePassword(
+        uint length,
+        bool includeUppercase,
+        bool includeLowercase,
+        bool includeNumbers,
+        bool includeSpecial,
+        bool avoidAmbiguous,
+        uint minimumNumbers,
+        uint minimumSpecial)
+    {
+        uint options = 0;
+        if (includeUppercase) options |= 1;
+        if (includeLowercase) options |= 2;
+        if (includeNumbers) options |= 4;
+        if (includeSpecial) options |= 8;
+        if (avoidAmbiguous) options |= 16;
+
+        var value = GeneratePasswordNative(length, options, minimumNumbers, minimumSpecial);
+        if (value == IntPtr.Zero)
+        {
+            throw new InvalidOperationException("Password settings are invalid or require more characters than the selected length.");
+        }
+
+        try
+        {
+            return Marshal.PtrToStringUTF8(value) ?? throw new InvalidOperationException("Rust core returned invalid UTF-8.");
+        }
+        finally
+        {
+            FreeStringNative(value);
+        }
+    }
+
+    internal static string GeneratePassphrase(
+        uint numberOfWords,
+        string wordSeparator,
+        bool capitalize,
+        bool includeNumber)
+    {
+        var value = GeneratePassphraseNative(
+            numberOfWords,
+            wordSeparator,
+            capitalize ? (byte)1 : (byte)0,
+            includeNumber ? (byte)1 : (byte)0);
+        if (value == IntPtr.Zero)
+        {
+            throw new InvalidOperationException("Passphrase settings are invalid. Choose between 3 and 20 words.");
+        }
+
+        try
+        {
+            return Marshal.PtrToStringUTF8(value) ?? throw new InvalidOperationException("Rust core returned invalid UTF-8.");
+        }
+        finally
+        {
+            FreeStringNative(value);
+        }
+    }
+}
+
+internal enum AuthStatus : uint
+{
+    Failed = 0,
+    Authenticated = 1,
+    TwoFactorRequired = 2,
+    TimedOut = 3,
+    Cancelled = 4,
+    NewDeviceVerificationRequired = 5,
+    InvalidNewDeviceVerificationCode = 6,
+    AccountAlreadySignedIn = 7,
+    AccountLimitReached = 8,
+    InvalidTwoFactorCode = 9,
+    RateLimited = 10,
+}
+
+internal readonly record struct AuthResult(AuthStatus Status, uint AvailableTwoFactorMethods);
+
+internal enum VaultSessionState : byte
+{
+    SignedOut = 0,
+    Unlocked = 1,
+    Locked = 2,
+}

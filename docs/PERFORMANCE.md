@@ -38,7 +38,7 @@
 
 ```powershell
 ./scripts/build-rust-core.ps1 -Profile Release
-./scripts/measure-generator.ps1 -LibraryPath ./target/release/bitwarden_core.dll
+./scripts/measure-generator.ps1 -LibraryPath ./target/release/bytewarden_core.dll
 ```
 
 生成器脚本通过实际 C ABI 测量首次密码生成，以及预热后的密码和密码短语生成耗时；只报告耗时，不输出生成内容。默认每种模式采样 300 次。
@@ -46,7 +46,7 @@
 ## 2026-11-23 列表元数据搜索
 
 ```powershell
-dotnet run --project tests/Bitwarden.Interop.Tests -c Release -- --measure-search
+dotnet run --project tests/Bytewarden.Interop.Tests -c Release -- --measure-search
 ```
 
 使用 WinUI 实际调用的 `VaultQuery`，但不启动界面。每组建立 100、1,000、10,000 个非敏感合成显示记录，先按名称排序一次，预热过滤 10 次，再采样 100 次多词查询 `synthetic user42`。每次核对结果数量，报告中位数和 P95；计时包括查询分词、元数据筛选与结果数组分配，不包括 Rust 解密、ABI / JSON、磁盘、网络、WinUI 重绑定或渲染。首次排序没有预热，可能包含 JIT，不能据此比较不同数据规模的排序性能。
@@ -64,7 +64,7 @@ dotnet run --project tests/Bitwarden.Interop.Tests -c Release -- --measure-searc
 ## 2026-11-23 文件夹索引专项优化
 
 ```powershell
-dotnet run --project tests/Bitwarden.Interop.Tests -c Release -- --measure-folders
+dotnet run --project tests/Bytewarden.Interop.Tests -c Release -- --measure-folders
 ```
 
 使用实际 `FolderHierarchy.Build`，仅构建非敏感合成文件夹和列表元数据，不启动 WinUI、不访问账户。每个场景预热 3 次、采样 25 次；计时覆盖排序、路径索引、显示名、父子数组、遍历与计数。输入字符串及条目在计时之前建立，校验在计时之后执行。分配量使用 `GC.GetAllocatedBytesForCurrentThread` 的单次构建差值，不代表进程常驻内存或峰值；P95 为排序后的第 24 个样本。没有固定耗时断言。
@@ -120,13 +120,13 @@ dotnet run --project tests/Bitwarden.Interop.Tests -c Release -- --measure-folde
 ```powershell
 . ./scripts/build-rust-core.ps1 -Profile Release
 foreach ($scenario in 'flat', 'branching', 'deep', 'long-orphan') {
-    $env:BITWARDEN_FOLDER_SCENARIO = $scenario
-    $env:BITWARDEN_FIXTURE_OUTPUT = Join-Path (Get-Location) "work/folder-stress-$scenario.json"
-    cargo test --locked --release -p bitwarden-core@0.2.0 write_synthetic_folder_ui_fixture -- --ignored
+    $env:BYTEWARDEN_FOLDER_SCENARIO = $scenario
+    $env:BYTEWARDEN_FIXTURE_OUTPUT = Join-Path (Get-Location) "work/folder-stress-$scenario.json"
+    cargo test --locked --release -p bytewarden-core write_synthetic_folder_ui_fixture -- --ignored
     if ($LASTEXITCODE) { throw 'Synthetic fixture generation failed' }
     ./scripts/verify-vault-list-ui.ps1 -Fixture "work/folder-stress-$scenario.json" -MeasureFolders -FolderSamples 3 -FolderRunLabel optimized
 }
-Remove-Item Env:BITWARDEN_FOLDER_SCENARIO, Env:BITWARDEN_FIXTURE_OUTPUT
+Remove-Item Env:BYTEWARDEN_FOLDER_SCENARIO, Env:BYTEWARDEN_FIXTURE_OUTPUT
 ```
 
 UIA 完整名称应读取 JSON `text` 字段，不能比较 CLI 人类输出的自动折行，也不能删除真实名称里的空格来绕过验证。压力模式只访问公开 SDK 合成账户和回环服务，测试包已清理；它不会运行剪贴板压力步骤。
@@ -173,9 +173,9 @@ CPU 为目标应用在整段 21 字符窗口里的进程 CPU 差值，包括中�
 上述阶段的验收包 SHA-256 为 `0ECA3C9E2CAADA1DCE55A150B745DC11639B0033CC03E2B78745C65C91F76FB3`，包内 DLL 为 `1F4A494CD6232F3BA6E5034EF617254E2EC179D3C4B963AFE25D61EDF3F4495C`。197 项托管、206 项原生剪贴板、476 项包内 DLL 互操作、52 项关联字段专项（命令合计 249）、Rust Release 110 / 5 默认忽略、fixture 自检 9 项及 fmt / Clippy 通过；Release 构建 0 错误 / 3 既有提示。C# LSP 未确认，以实际编译 / 运行为类型证据。原 / 新 UI 目录为 `work/list-acceptance-5712949f93cc40c3a0d953c9e1f45cd1/` 与 `work/list-acceptance-af3eaac036e24e8a987fb53afb950680/`，原始输入、内存、源码 / 包摘要与门禁见 `work/vault-scale-final-evidence.json`；测试身份已清理，未访问真实账户。
 
 ```powershell
-$env:BITWARDEN_FIXTURE_OUTPUT = Join-Path (Get-Location) 'work/vault-scale-10000.json'
-cargo test --locked --release -p bitwarden-core@0.2.0 write_synthetic_large_vault_ui_fixture -- --ignored
-Remove-Item Env:BITWARDEN_FIXTURE_OUTPUT
+$env:BYTEWARDEN_FIXTURE_OUTPUT = Join-Path (Get-Location) 'work/vault-scale-10000.json'
+cargo test --locked --release -p bytewarden-core write_synthetic_large_vault_ui_fixture -- --ignored
+Remove-Item Env:BYTEWARDEN_FIXTURE_OUTPUT
 # 先构建实际 Release MSIX，再独立运行；不与其它测量 / 回归开关混用。
 ./scripts/verify-vault-list-ui.ps1 -Fixture 'work/vault-scale-10000.json' -MeasureVault -VaultIdleSeconds 30 -VaultRunLabel optimized
 ```
@@ -194,7 +194,7 @@ Remove-Item Env:BITWARDEN_FIXTURE_OUTPUT
 
 **审计发现这两包的原生 DLL 摘要不同（1F4A… / 7FAF…），因此不能把约 19% / 30% 的版本差异宣称为动画的单变量因果收益；需要重建匹配原生 DLL 的控制包复测。** 在同一 7FAF… DLL 下另对搜索宽度做两轮比较，20 ms CPU 均值 451.56 → 400.00 ms；60 ms 的两轮方向相反，合并 464.06 → 431.25 ms，不能称其普遍降低 CPU。
 
-新增 `tests/Bitwarden.InputFrameProbe`，逐键记录 UTC 与单调时钟，检查精确文本 / 计数 / 滚动布局，支持 `--require-stable-width`，并核对真实末行位于视口。实际 WinApp CLI `ui record --frames --fps 30 --max-edge 2048` 保存 15 秒 HWND JPEG / MP4 和时间索引。候选三组请求间隔的空白 / 输入后搜索框位置和宽度不变；实际帧已验看完整查询、单结果与 09999 末行。录制是含 GPU 捕获、编码和 30 fps 采样开销的诊断，`mediaTimeMs` 是固定视频时间轴，不是呈现时间；不能以 UIA 约 7 ms 代替像素就绪、物理键盘或 IME 延迟。
+新增 `tests/Bytewarden.InputFrameProbe`，逐键记录 UTC 与单调时钟，检查精确文本 / 计数 / 滚动布局，支持 `--require-stable-width`，并核对真实末行位于视口。实际 WinApp CLI `ui record --frames --fps 30 --max-edge 2048` 保存 15 秒 HWND JPEG / MP4 和时间索引。候选三组请求间隔的空白 / 输入后搜索框位置和宽度不变；实际帧已验看完整查询、单结果与 09999 末行。录制是含 GPU 捕获、编码和 30 fps 采样开销的诊断，`mediaTimeMs` 是固定视频时间轴，不是呈现时间；不能以 UIA 约 7 ms 代替像素就绪、物理键盘或 IME 延迟。
 
 候选 MSIX `work/input-stable-layout.msix` 的 SHA-256 为 `F96655B4153F4FF8DC0F037EA47F89786641515215B94F3D2AFA4285592DB13B`，实际 ZIP 包内 DLL 为 `7FAF239995507878052EE2A42542EC665D0BEB7E2E61B9D26746282900071E60`，已冻结为 `work/input-layout-packaged-native.dll`。已通过同包四组 110 文件夹压力、两轮万条 6 项检查、197 托管、Rust Release 110 / 5 默认忽略，以及实际 Release 构建；C# LSP 仍未确认。完整 UI 回归三轮均未完成：出现非预期搜索文本和前台切换，最后由 CLI 的安全检查拒绝聚焦，未绕过安全检查。新的完整 / linked UI 和 7FAF… 包内 DLL 原生门禁仍待验证，不能借用旧 1F4A… DLL 的门禁。当前进度与摘要见本机 `work/input-layout-progress-evidence.json`，不是完成证书。
 

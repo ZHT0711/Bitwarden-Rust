@@ -1,4 +1,4 @@
-# Dot-sourced by verify-vault-list-ui.ps1; isolated public SDK account and actual MSIX only.
+﻿# Dot-sourced by verify-vault-list-ui.ps1; isolated public SDK account and actual MSIX only.
 function WaitVaultScaleCount([string]$Expected) {
     $deadline = [DateTime]::UtcNow.AddSeconds(60)
     $last = ''
@@ -19,7 +19,7 @@ function InvokeVaultScaleChecks([double]$InitialLoadMs, [int]$IdleSeconds, [stri
         completed = $false; label = $Label; items = 10000; initialLoadMs = $InitialLoadMs
         initialLoadScope = 'Sign-in UIA click through 10000-item ready property; includes loopback server, SDK authentication/decryption, CLI and polling. Not cold process startup or frame time.'
         os = [Environment]::OSVersion.VersionString; logicalProcessors = [Environment]::ProcessorCount
-        packagedNativeSha256 = (Get-FileHash (Join-Path $layout 'bitwarden_core.dll')).Hash
+        packagedNativeSha256 = (Get-FileHash (Join-Path $layout 'bytewarden_core.dll')).Hash
         probeSourceHashes = [ordered]@{}; probeAssemblySha256 = ''; checks = 0; lockedIdle = @()
     }
     $locked = [Collections.Generic.List[object]]::new()
@@ -32,13 +32,13 @@ function InvokeVaultScaleChecks([double]$InitialLoadMs, [int]$IdleSeconds, [stri
     try {
         Check $true 'actual MSIX decrypts and displays 10000 public synthetic items'
         [void](WinApp @('ui', 'screenshot', '-a', [string]$previewId, '-o', (Join-Path $run 'vault-scale-loaded.png')))
-        $project = Join-Path $root 'tests/Bitwarden.PerformanceProbe/Bitwarden.PerformanceProbe.csproj'
+        $project = Join-Path $root 'tests/Bytewarden.PerformanceProbe/Bytewarden.PerformanceProbe.csproj'
         & dotnet build $project -c Release *> (Join-Path $run 'probe-build.log')
         if ($LASTEXITCODE) { throw "Performance probe build failed. See $run/probe-build.log" }
-        foreach ($source in @('Program.cs', 'NativeInput.cs', 'Bitwarden.PerformanceProbe.csproj')) {
+        foreach ($source in @('Program.cs', 'NativeInput.cs', 'Bytewarden.PerformanceProbe.csproj')) {
             $metrics.probeSourceHashes[$source] = (Get-FileHash (Join-Path (Split-Path $project) $source)).Hash
         }
-        $probe = Join-Path (Split-Path $project) 'bin/Release/net10.0-windows/Bitwarden.PerformanceProbe.dll'
+        $probe = Join-Path (Split-Path $project) 'bin/Release/net10.0-windows/Bytewarden.PerformanceProbe.dll'
         $metrics.probeAssemblySha256 = (Get-FileHash $probe).Hash
         SaveVaultScaleMetrics
         $hwnd = [string](Get-Process -Id $previewId).MainWindowHandle

@@ -1,7 +1,7 @@
 /target/
 /work/
-/apps/Bitwarden.WinUI/AppPackages/
-/apps/Bitwarden.WinUI/Properties/PublishProfiles/
+/apps/Bytewarden.WinUI/AppPackages/
+/apps/Bytewarden.WinUI/Properties/PublishProfiles/
 .vscode/
 .vs/
 **/bin/

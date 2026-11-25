@@ -7,7 +7,7 @@
 - 官方源：`https://github.com/bitwarden/clients/releases/tag/desktop-v2026.11.0`。2026-11-20 经 GitHub API 核对，是当时最新非预发布桌面版本，发布时间为 UTC 2026-11-19 20:49:07。
 - 已下载官方 x64 Store APPX，清单确认身份 `8bitSolutionsLLC.bitwardendesktop`、版本 `2026.11.0.0`，包大小和 SHA-256 记录在 [基线记录](upstream-desktop-baseline.json)。仅检查安装包，没有升级本机官方 2026.10.4.0，也尚未完成新版运行界面的逐项对照。
 - SDK 固定提交 `56c7617b23501af70221094cdee59e10b2a9d8d2`。SDK 数据类型存在不代表对应官方桌面功能已启用。
-- 重写版独立包身份 `ZHT0711.BitwardenRustLocalPreview`，不覆盖官方应用；当前为 x64 开发预览。
+- 重写版独立包身份 `ZHT0711.BytewardenLocalPreview`，不覆盖官方应用；当前为 x64 开发预览。
 
 ## 当前证据与差距
 

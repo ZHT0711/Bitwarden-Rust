@@ -51,23 +51,23 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           rustfmt --edition 2024 --check --config skip_children=true vendor/sdk-internal/crates/bitwarden-core/src/client/builder.rs vendor/sdk-internal/crates/bitwarden-core/src/client/internal.rs vendor/sdk-internal/crates/bitwarden-core/src/client/mod.rs vendor/sdk-internal/crates/bitwarden-core/src/client/loopback_http.rs
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          cargo test --locked -p bitwarden-core@0.2.0
+          cargo test --locked -p bytewarden-core
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          cargo clippy --locked -p bitwarden-core@0.2.0 --all-targets -- -D warnings
+          cargo clippy --locked -p bytewarden-core --all-targets -- -D warnings
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           New-Item -ItemType Directory -Force -Path work | Out-Null
-          $env:BITWARDEN_FIXTURE_OUTPUT = Join-Path $env:GITHUB_WORKSPACE 'work/ci-fixture.json'
-          cargo test --locked -p bitwarden-core@0.2.0 write_synthetic_ui_fixture -- --ignored
+          $env:BYTEWARDEN_FIXTURE_OUTPUT = Join-Path $env:GITHUB_WORKSPACE 'work/ci-fixture.json'
+          cargo test --locked -p bytewarden-core write_synthetic_ui_fixture -- --ignored
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Release native behavior
         shell: pwsh
         run: |
           . ./scripts/build-rust-core.ps1 -Profile Release
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          cargo test --locked --release -p bitwarden-core@0.2.0
+          cargo test --locked --release -p bytewarden-core
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          $env:BITWARDEN_FIXTURE_OUTPUT = Join-Path $env:GITHUB_WORKSPACE 'work/linked-fields-fixture.json'
-          cargo test --locked --release -p bitwarden-core@0.2.0 write_synthetic_linked_field_fixture -- --ignored
+          $env:BYTEWARDEN_FIXTURE_OUTPUT = Join-Path $env:GITHUB_WORKSPACE 'work/linked-fields-fixture.json'
+          cargo test --locked --release -p bytewarden-core write_synthetic_linked_field_fixture -- --ignored
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Managed filters and release native HTTP lifecycle
         shell: pwsh
@@ -113,7 +113,7 @@ jobs:
             if (-not $ready) { throw 'Fixture server readiness timed out after 30 seconds.' }
             $server.Refresh()
             if ($server.HasExited) { throw 'Fixture server exited before the native lifecycle checks.' }
-            dotnet run --project tests/Bitwarden.Interop.Tests -- target/release/bitwarden_core.dll $baseUrl
+            dotnet run --project tests/Bytewarden.Interop.Tests -- target/release/bytewarden_core.dll $baseUrl
             if ($LASTEXITCODE) { throw "Managed/native lifecycle checks failed with exit code $LASTEXITCODE." }
           } catch {
             if (-not $ready) {
@@ -149,9 +149,9 @@ jobs:
         shell: pwsh
         run: ./scripts/verify-linked-fields-native.ps1
       - name: Build unsigned x64 MSIX preview
-        run: dotnet build apps/Bitwarden.WinUI/Bitwarden.WinUI.csproj -c Release -p:Platform=x64 -p:GenerateAppxPackageOnBuild=true -p:AppxPackageSigningEnabled=false --nologo
+        run: dotnet build apps/Bytewarden.WinUI/Bytewarden.WinUI.csproj -c Release -p:Platform=x64 -p:GenerateAppxPackageOnBuild=true -p:AppxPackageSigningEnabled=false --nologo
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: Bitwarden-Rust-unsigned-msix-x64
-          path: apps/Bitwarden.WinUI/AppPackages/**/*.msix
+          name: Bytewarden-unsigned-msix-x64
+          path: apps/Bytewarden.WinUI/AppPackages/**/*.msix
           if-no-files-found: error

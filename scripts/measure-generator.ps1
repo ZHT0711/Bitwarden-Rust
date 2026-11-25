@@ -1,5 +1,5 @@
 param(
-    [string] $LibraryPath = (Join-Path $PSScriptRoot "../target/debug/bitwarden_core.dll"),
+    [string] $LibraryPath = (Join-Path $PSScriptRoot "../target/debug/bytewarden_core.dll"),
     [ValidateRange(10, 100000)]
     [int] $Iterations = 300
 )

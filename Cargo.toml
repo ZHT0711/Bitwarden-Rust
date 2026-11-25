@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/bitwarden-core",
+    "crates/bytewarden-core",
 ]
 exclude = ["vendor/sdk-internal", "vendor/win_webauthn"]
 

@@ -1,0 +1,10 @@
+{
+  "profiles": {
+    "Bytewarden (Package)": {
+      "commandName": "MsixPackage"
+    },
+    "Bytewarden.WinUI (Unpackaged)": {
+      "commandName": "Project"
+    }
+  }
+}

@@ -1,4 +1,4 @@
-# Dot-sourced by verify-vault-list-ui.ps1; only public synthetic data and the isolated preview.
+﻿# Dot-sourced by verify-vault-list-ui.ps1; only public synthetic data and the isolated preview.
 function InvokeClipboardStressChecks {
     Add-Type -TypeDefinition @'
 using System;
@@ -88,7 +88,7 @@ public static class ClipboardStressNative {
     }
     public static bool HasOwnerFormat() {
         OpenRead();
-        try { return IsClipboardFormatAvailable(RegisterClipboardFormat("BitwardenRust.ClipboardOwner")); }
+        try { return IsClipboardFormatAvailable(RegisterClipboardFormat("Bytewarden.ClipboardOwner")); }
         finally { CloseClipboard(); }
     }
     public static int ReadFlag(string name) {
@@ -246,7 +246,7 @@ public static class ClipboardStressNative {
         [ClipboardStressNative]::TrayMenu($hwnd)
         $menu = [ClipboardStressNative]::TrayMenuWindow($hwnd)
         WinApp @('ui', 'inspect', '-w', [string]$menu, '--depth', '5') | Set-Content (Join-Path $run 'clipboard-tray-menu.txt')
-        [void](WinApp @('ui', 'invoke', '退出 Bitwarden Rust', '-w', [string]$menu, '--type', 'MenuItem'))
+        [void](WinApp @('ui', 'invoke', '退出 Bytewarden', '-w', [string]$menu, '--type', 'MenuItem'))
         Start-Sleep -Milliseconds 600
         Check (-not $app.HasExited -and (Tree) -notmatch 'fixture-user|ListItem.*"Synthetic') `
             'native tray exit revokes sensitive UI and waits while owned clipboard access is busy'
