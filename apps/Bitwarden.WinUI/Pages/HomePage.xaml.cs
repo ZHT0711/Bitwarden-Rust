@@ -18,6 +18,12 @@ public sealed partial class HomePage : Page
     private bool _loaded;
     private bool _syncing;
     private int _version;
+    private int _displayedItemCount = -1;
+    private VaultItem[]? _lastFilterSource;
+    private string? _lastFilterCategory;
+    private string? _lastFilterFolder;
+    private string? _lastFilterQuery;
+    private VaultItem[]? _lastFilteredItems;
     private CancellationTokenSource? _operation;
     private TotpCodeView? _totpView;
 
@@ -34,6 +40,38 @@ public sealed partial class HomePage : Page
     {
         _category = e.Parameter as string ?? "vault";
         _initialFolderId = (e.Parameter as FolderNavigation)?.Id;
+        UpdateCategoryHeader();
+        base.OnNavigatedTo(e);
+    }
+
+    internal void SwitchCategory(string category, string? folderId = null)
+    {
+        if (!_loaded)
+        {
+            _category = category;
+            _initialFolderId = folderId;
+            UpdateCategoryHeader();
+            return;
+        }
+        var targetCategory = folderId is not null ? "vault" : category;
+        if (_category == targetCategory && folderId is null) return;
+        _category = targetCategory;
+        UpdateCategoryHeader();
+        if (_selectingItems && _category == "trash") SetItemSelectionMode(false);
+        if (folderId is not null)
+        {
+            if (_folderChoices.TryGetValue(folderId, out var choice) && !ReferenceEquals(FolderFilter.SelectedItem, choice))
+            {
+                FolderFilter.SelectedItem = choice;
+                return;
+            }
+            _initialFolderId = folderId;
+        }
+        ApplyFilters();
+    }
+
+    private void UpdateCategoryHeader()
+    {
         (PageTitle.Text, PageSubtitle.Text) = _category switch
         {
             "favorites" => ("收藏夹", "你标记为收藏的保险库条目。"),
@@ -49,7 +87,6 @@ public sealed partial class HomePage : Page
             "trash" => ("回收站", "已删除的保险库条目。"),
             _ => ("我的保险库", "密码、笔记与敏感信息都集中在这里。"),
         };
-        base.OnNavigatedTo(e);
     }
 
     public void SetSearch(string query)
@@ -87,6 +124,8 @@ public sealed partial class HomePage : Page
         _overview = null;
         _orderedSource = null;
         _orderedItems = [];
+        ResetFilterCache();
+        _displayedItemCount = -1;
         _initialFolderId = null;
         _editorOpen = false;
         _selectingItems = false;
@@ -94,17 +133,32 @@ public sealed partial class HomePage : Page
         _syncing = false;
         VaultList.ItemsSource = null;
         VaultList.SelectionMode = ListViewSelectionMode.Single;
-        foreach (var field in DetailPanel.Children.OfType<StackPanel>())
-        {
-            foreach (var box in field.Children.OfType<Grid>().SelectMany(row => row.Children.OfType<PasswordBox>()))
-                box.Password = string.Empty;
-            foreach (var box in field.Children.OfType<TextBox>()) box.Text = string.Empty;
-        }
+        ClearDetailInputs(DetailPanel);
         DetailPanel.Children.Clear();
         DetailPanel.Children.Add(new TextBlock { Text = "选择一个条目查看详情" });
         PopulateFolders();
         ApplyFilters();
         SetBusy(false);
+    }
+
+    private void ResetFilterCache()
+    {
+        _lastFilterSource = null;
+        _lastFilterCategory = null;
+        _lastFilterFolder = null;
+        _lastFilterQuery = null;
+        _lastFilteredItems = null;
+    }
+
+    private static void ClearDetailInputs(Panel panel)
+    {
+        foreach (var child in panel.Children)
+        {
+            if (child is PasswordBox passwordBox) passwordBox.Password = string.Empty;
+            else if (child is TextBox textBox) textBox.Text = string.Empty;
+            else if (child is Panel nested) ClearDetailInputs(nested);
+            else if (child is Border { Child: Panel borderedPanel }) ClearDetailInputs(borderedPanel);
+        }
     }
 
     public async Task RefreshAsync(bool forceSync, bool allowSyncFallback = true)
@@ -193,24 +247,63 @@ public sealed partial class HomePage : Page
         var selected = _initialFolderId ?? (FolderFilter.SelectedItem as FolderChoice)?.Id;
         if (_overview is not null) _initialFolderId = null;
         _folderHierarchy = FolderHierarchy.Build(_overview?.Folders ?? [], _overview?.Items ?? []);
-        FolderChoice[] choices = [new("*", "所有文件夹"), new("", "无文件夹"),
-            .. _folderHierarchy.All.Select(folder => new FolderChoice(folder.Id, folder.Name))];
-        _folderChoices = choices.ToDictionary(choice => choice.Id, StringComparer.Ordinal);
+        var all = _folderHierarchy.All;
+        var choices = new FolderChoice[all.Length + 2];
+        choices[0] = new("*", "所有文件夹");
+        choices[1] = new("", "无文件夹");
+        var byId = new Dictionary<string, FolderChoice>(choices.Length, StringComparer.Ordinal)
+        {
+            [choices[0].Id] = choices[0],
+            [choices[1].Id] = choices[1],
+        };
+        for (var index = 0; index < all.Length; index++)
+        {
+            var folder = all[index];
+            var choice = new FolderChoice(folder.Id, folder.Name);
+            choices[index + 2] = choice;
+            byId[choice.Id] = choice;
+        }
+        _folderChoices = byId;
         FolderFilter.ItemsSource = choices;
-        FolderFilter.SelectedItem = selected is not null && _folderChoices.TryGetValue(selected, out var choice)
-            ? choice : choices[0];
+        FolderFilter.SelectedItem = selected is not null && byId.TryGetValue(selected, out var existing)
+            ? existing : choices[0];
     }
 
     private void ApplyFilters()
     {
         var folder = (FolderFilter.SelectedItem as FolderChoice)?.Id ?? "*";
-        var items = VaultQuery.Apply(OrderedItems(), _category, folder, _query);
+        var ordered = OrderedItems();
+        var canNarrow = ReferenceEquals(_lastFilterSource, ordered) &&
+            _lastFilterCategory == _category &&
+            _lastFilterFolder == folder &&
+            _lastFilteredItems is not null &&
+            _lastFilterQuery is not null &&
+            !_lastFilterQuery.Contains('"') &&
+            !_query.Contains('"') &&
+            _query.StartsWith(_lastFilterQuery, StringComparison.OrdinalIgnoreCase);
+        var source = canNarrow ? _lastFilteredItems! : ordered;
+        var items = VaultQuery.Apply(source, _category, folder, _query);
+        _lastFilterSource = ordered;
+        _lastFilterCategory = _category;
+        _lastFilterFolder = folder;
+        _lastFilterQuery = _query;
+        _lastFilteredItems = items;
+
         UpdateFolderNavigation(folder);
-        UpdateListItems(items);
-        ItemCount.Text = $"{items.Length} 个条目";
-        EmptyState.Visibility = items.Length == 0 ? Visibility.Visible : Visibility.Collapsed;
-        EmptyMessage.Text = _overview is null ? "登录或同步以查看你的保险库" : _query.Length > 0 ? "没有匹配的条目" : "此分类或文件夹中没有条目";
-        UpdateMutationCommands();
+        var listChanged = UpdateListItems(items);
+        if (_displayedItemCount != items.Length)
+        {
+            _displayedItemCount = items.Length;
+            ItemCount.Text = $"{items.Length} 个条目";
+        }
+        var emptyVisibility = items.Length == 0 ? Visibility.Visible : Visibility.Collapsed;
+        if (EmptyState.Visibility != emptyVisibility) EmptyState.Visibility = emptyVisibility;
+        if (items.Length == 0)
+        {
+            var message = _overview is null ? "登录或同步以查看你的保险库" : _query.Length > 0 ? "没有匹配的条目" : "此分类或文件夹中没有条目";
+            if (EmptyMessage.Text != message) EmptyMessage.Text = message;
+        }
+        if (listChanged || _overview is null || _syncing) UpdateMutationCommands();
     }
 
     private async void VaultList_SelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -269,8 +362,15 @@ public sealed partial class HomePage : Page
     private void ShowDetail(VaultDetail detail)
     {
         DetailPanel.Children.Clear();
-        DetailPanel.Children.Add(new TextBlock { Text = detail.Name, Style = (Style)Application.Current.Resources["SubtitleTextBlockStyle"], TextWrapping = TextWrapping.Wrap });
-        DetailPanel.Children.Add(new TextBlock { Text = VaultTypes.Label(detail.ItemType) });
+        var header = new StackPanel { Spacing = 4 };
+        header.Children.Add(new TextBlock { Text = detail.Name, Style = (Style)Application.Current.Resources["SubtitleTextBlockStyle"], TextWrapping = TextWrapping.Wrap });
+        header.Children.Add(new TextBlock
+        {
+            Text = VaultTypes.Label(detail.ItemType),
+            Style = (Style)Application.Current.Resources["CaptionTextBlockStyle"],
+            Opacity = 0.72,
+        });
+        DetailPanel.Children.Add(header);
         if (detail.Restricted || detail.PasswordHidden) DetailPanel.Children.Add(new InfoBar { IsOpen = true, IsClosable = false, Severity = InfoBarSeverity.Warning,
             Message = detail.Restricted ? "此条目受组织访问策略限制，仅显示可用的信息。" : "组织权限禁止查看密码和隐藏字段。" });
         if (detail.Totp is { Status: "ready", Value: { } code } && detail.TotpRequestId is { } requestId)
@@ -309,18 +409,15 @@ public sealed partial class HomePage : Page
             }
             DetailPanel.Children.Add(section);
         }
+        var bodyStrong = (Style)Application.Current.Resources["BodyStrongTextBlockStyle"];
         foreach (var field in detail.Fields)
         {
             var panel = new StackPanel { Spacing = 6 };
-            panel.Children.Add(new TextBlock { Text = field.Label, Style = (Style)Application.Current.Resources["BodyStrongTextBlockStyle"] });
-            if (field.Sensitive) panel.Children.Add(PasswordVisibility.WithToggle(new PasswordBox { Password = field.Value }, field.Label));
-            else
-            {
-                var value = new TextBox { Text = field.Value, IsReadOnly = true, TextWrapping = TextWrapping.Wrap, AcceptsReturn = true };
-                Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(value, field.Label);
-                panel.Children.Add(value);
-            }
-            var copy = new Button { Content = "复制", HorizontalAlignment = HorizontalAlignment.Left };
+            var labelRow = new Grid { ColumnSpacing = 8 };
+            labelRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            labelRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            labelRow.Children.Add(new TextBlock { Text = field.Label, Style = bodyStrong, VerticalAlignment = VerticalAlignment.Center });
+            var copy = new Button { Content = "复制", Padding = new Thickness(10, 3, 10, 3) };
             Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(copy, $"复制{field.Label}");
             copy.Click += (_, _) =>
             {
@@ -328,11 +425,26 @@ public sealed partial class HomePage : Page
                 catch (Exception error) when (error is System.Runtime.InteropServices.COMException or InvalidOperationException)
                 { copy.Content = "剪贴板暂时不可用"; }
             };
-            panel.Children.Add(copy);
+            Grid.SetColumn(copy, 1);
+            labelRow.Children.Add(copy);
+            panel.Children.Add(labelRow);
+            if (field.Sensitive) panel.Children.Add(PasswordVisibility.WithToggle(new PasswordBox { Password = field.Value }, field.Label));
+            else
+            {
+                var value = new TextBox { Text = field.Value, IsReadOnly = true, TextWrapping = TextWrapping.Wrap, AcceptsReturn = true };
+                Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(value, field.Label);
+                panel.Children.Add(value);
+            }
             DetailPanel.Children.Add(panel);
         }
         ShowAttachmentDetails(detail);
-        DetailPanel.Children.Add(new TextBlock { Text = $"修改时间 {detail.RevisionDate.ToLocalTime():yyyy-MM-dd HH:mm:ss}", TextWrapping = TextWrapping.Wrap });
+        DetailPanel.Children.Add(new TextBlock
+        {
+            Text = $"修改时间 {detail.RevisionDate.ToLocalTime():yyyy-MM-dd HH:mm:ss}",
+            TextWrapping = TextWrapping.Wrap,
+            Style = (Style)Application.Current.Resources["CaptionTextBlockStyle"],
+            Opacity = 0.72,
+        });
     }
 
     private bool IsCurrent(int version, CancellationToken token) => _loaded && version == _version && !token.IsCancellationRequested;
@@ -356,7 +468,13 @@ public sealed partial class HomePage : Page
         UpdateMutationCommands();
     }
     private void SetNotice(string title, string message, InfoBarSeverity severity)
-    { ConnectionNotice.Title = title; ConnectionNotice.Message = message; ConnectionNotice.Severity = severity; ConnectionNotice.IsOpen = true; }
+    {
+        ConnectionNotice.Title = title;
+        ConnectionNotice.Message = message;
+        ConnectionNotice.Severity = severity;
+        ConnectionNotice.IsClosable = _overview is not null && severity == InfoBarSeverity.Success;
+        ConnectionNotice.IsOpen = true;
+    }
     private static bool IsCoreUnavailable(Exception error) => error is DllNotFoundException or EntryPointNotFoundException or BadImageFormatException;
     private void FolderFilter_SelectionChanged(object sender, SelectionChangedEventArgs e) { if (VaultList is not null) ApplyFilters(); }
     private void CancelRequest_Click(object sender, RoutedEventArgs e) => _operation?.Cancel();

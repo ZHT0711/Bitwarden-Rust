@@ -54,6 +54,17 @@ internal static class VaultQueryChecks
         var invisible = source.Concat([a with { Id = "trash", Deleted = true }, b with { Id = "archive", Archived = true }]);
         check(VaultQuery.Apply(VaultQuery.Sort(invisible, VaultSort.RevisionNewest), "vault", "*", "mail").Length == 2,
             "sorted search excludes trash and archived items");
+        var large = Enumerable.Range(0, 10_000).Select(index => a with
+        {
+            Id = index.ToString(CultureInfo.InvariantCulture), Name = "Synthetic metadata",
+            Subtitle = $"user{index % 100}@example.invalid",
+        }).ToArray();
+        for (var warmup = 0; warmup < 10; warmup++) _ = VaultQuery.Apply(large, "vault", "*", "synthetic user42");
+        var allocatedBefore = GC.GetAllocatedBytesForCurrentThread();
+        var largeResult = VaultQuery.Apply(large, "vault", "*", "synthetic user42");
+        var allocated = GC.GetAllocatedBytesForCurrentThread() - allocatedBefore;
+        check(largeResult.Length == 100 && ReferenceEquals(largeResult[0], large[42]), "10000-item AND search keeps exact metadata objects and source order");
+        check(allocated < 32_768, "10000-item metadata search avoids per-row closure/delegate allocations");
     }
 
     internal static void Measure()
@@ -68,6 +79,7 @@ internal static class VaultQueryChecks
             var sortMilliseconds = watch.Elapsed.TotalMilliseconds;
             for (var warmup = 0; warmup < 10; warmup++) _ = VaultQuery.Apply(ordered, "vault", "*", "synthetic user42");
             var samples = new double[100];
+            var allocatedBefore = GC.GetAllocatedBytesForCurrentThread();
             for (var index = 0; index < samples.Length; index++)
             {
                 watch.Restart();
@@ -76,8 +88,9 @@ internal static class VaultQueryChecks
                 if (result.Length != size / 100) throw new InvalidOperationException("Synthetic search count changed.");
                 samples[index] = watch.Elapsed.TotalMilliseconds;
             }
+            var allocatedPerQuery = (GC.GetAllocatedBytesForCurrentThread() - allocatedBefore) / samples.Length;
             Array.Sort(samples);
-            Console.WriteLine(FormattableString.Invariant($"metadata-search items={size} initial-sort-ms={sortMilliseconds:F4} median-ms={samples[50]:F4} p95-ms={samples[94]:F4}"));
+            Console.WriteLine(FormattableString.Invariant($"metadata-search items={size} initial-sort-ms={sortMilliseconds:F4} median-ms={samples[50]:F4} p95-ms={samples[94]:F4} allocated-bytes-per-query={allocatedPerQuery}"));
         }
     }
 }

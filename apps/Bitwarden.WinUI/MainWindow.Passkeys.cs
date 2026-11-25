@@ -9,7 +9,7 @@ namespace Bitwarden_WinUI;
 
 public sealed partial class MainWindow
 {
-    private DispatcherTimer? _passkeyTimer;
+    private Microsoft.UI.Dispatching.DispatcherQueueTimer? _passkeyTimer;
     private bool _passkeyChecking;
     private ContentDialog? _passkeyDialog;
     private Action? _clearPasskeyApproval;
@@ -28,12 +28,24 @@ public sealed partial class MainWindow
         catch (VaultException) { return; }
         catch (Exception error) when (IsCoreUnavailable(error)) { return; }
         if (_closed) return;
-        _passkeyTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(350) };
+        _passkeyTimer = DispatcherQueue.CreateTimer();
+        _passkeyTimer.Interval = TimeSpan.FromMilliseconds(350);
         _passkeyTimer.Tick += CheckPasskeyRequest;
         _passkeyTimer.Start();
     }
 
-    private async void CheckPasskeyRequest(object? sender, object e)
+    private void CheckPasskeyRequest(Microsoft.UI.Dispatching.DispatcherQueueTimer sender, object args)
+    {
+        if (_closed || _passkeyChecking || _signInDialogOpen || _accountTransition) return;
+        try
+        {
+            if (!RustCore.HasPendingPasskey()) return;
+        }
+        catch (Exception error) when (IsCoreUnavailable(error)) { return; }
+        _ = HandlePendingPasskeyAsync();
+    }
+
+    private async Task HandlePendingPasskeyAsync()
     {
         if (_closed || _passkeyChecking || _signInDialogOpen || _accountTransition) return;
         _passkeyChecking = true;

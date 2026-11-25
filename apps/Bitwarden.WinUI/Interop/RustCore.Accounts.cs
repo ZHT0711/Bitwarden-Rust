@@ -13,6 +13,26 @@ internal sealed record VaultAccount(string Id, string Email, uint ServerMode, st
         _ => ServerUrl,
     };
 
+    internal string CompactServerLabel => ServerMode switch
+    {
+        0 => "Bitwarden.com",
+        1 => "Bitwarden.eu",
+        _ => FormatCompactServer(ServerUrl),
+    };
+
+    internal static string FormatCompactServer(string serverUrl)
+    {
+        if (string.IsNullOrWhiteSpace(serverUrl)) return string.Empty;
+        var text = serverUrl.Trim();
+        if (Uri.TryCreate(text, UriKind.Absolute, out var uri) && !string.IsNullOrEmpty(uri.Host))
+        {
+            var host = uri.IsDefaultPort ? uri.Host : $"{uri.Host}:{uri.Port}";
+            var path = uri.AbsolutePath.TrimEnd('/');
+            text = string.IsNullOrEmpty(path) ? host : path.Length <= 12 ? host + path : host + "/…";
+        }
+        return text.Length <= 36 ? text : string.Concat(text.AsSpan(0, 35), "…");
+    }
+
     internal string Scope => AccountSettingsScope.Create(ServerMode, ServerUrl, Email);
 }
 

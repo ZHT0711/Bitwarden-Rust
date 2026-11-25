@@ -7,15 +7,29 @@ namespace Bitwarden_WinUI;
 
 public sealed partial class MainWindow
 {
+    private double _windowWidth = 1200;
+
     private void WindowRoot_SizeChanged(object sender, SizeChangedEventArgs args)
     {
+        _windowWidth = args.NewSize.Width;
+        ApplyResponsiveChrome();
+    }
+
+    private void ApplyResponsiveChrome()
+    {
         if (AccountCommands is null || SearchBox is null) return;
-        var compact = args.NewSize.Width < 700;
-        Grid.SetRow(AccountCommands, compact ? 1 : 0);
-        Grid.SetColumn(AccountCommands, compact ? 0 : 1);
-        Grid.SetColumnSpan(AccountCommands, compact ? 2 : 1);
-        Grid.SetColumnSpan(SearchBox, compact ? 2 : 1);
-        SearchBox.HorizontalAlignment = compact ? HorizontalAlignment.Stretch : HorizontalAlignment.Left;
+        var compactButtons = _windowWidth < 760;
+        var showServerBadge = _windowWidth >= 960;
+        var signedIn = ActiveAccount is not null;
+
+        SyncButtonLabel.Visibility = compactButtons ? Visibility.Collapsed : Visibility.Visible;
+        LockButtonLabel.Visibility = compactButtons ? Visibility.Collapsed : Visibility.Visible;
+        SyncButton.Padding = compactButtons ? new Thickness(8, 0, 8, 0) : new Thickness(10, 0, 10, 0);
+        LockButton.Padding = compactButtons ? new Thickness(8, 0, 8, 0) : new Thickness(10, 0, 10, 0);
+
+        AccountPrimaryLabel.Visibility = compactButtons && signedIn ? Visibility.Collapsed : Visibility.Visible;
+        AccountServerBadge.Visibility = showServerBadge && signedIn ? Visibility.Visible : Visibility.Collapsed;
+        SignInButton.Padding = compactButtons && signedIn ? new Thickness(8, 0, 8, 0) : new Thickness(10, 0, 10, 0);
     }
 
     private void ApplyDesktopTheme(int theme) => WindowRoot.RequestedTheme = theme switch

@@ -924,6 +924,10 @@ fn append_object<T: Serialize>(
 mod folder_fixture_tests;
 
 #[cfg(test)]
+#[path = "vault/large_fixture_tests.rs"]
+mod large_fixture_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use bitwarden_api_api::{

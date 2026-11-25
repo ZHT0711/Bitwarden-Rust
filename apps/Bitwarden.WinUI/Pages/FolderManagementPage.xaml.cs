@@ -344,7 +344,7 @@ public sealed partial class FolderManagementPage : Page
     {
         _busy = busy;
         LoadingRing.IsActive = busy;
-        RenderFolders();
+        UpdateCommands();
     }
 
     private void SetNotice(string title, string message, InfoBarSeverity severity)

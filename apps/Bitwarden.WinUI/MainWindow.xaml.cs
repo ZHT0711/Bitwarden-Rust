@@ -32,7 +32,7 @@ public sealed partial class MainWindow : Window
 
         ExtendsContentIntoTitleBar = true;
         SetTitleBar(AppTitleBar);
-        AppWindow.TitleBar.PreferredHeightOption = TitleBarHeightOption.Tall;
+        AppWindow.TitleBar.PreferredHeightOption = TitleBarHeightOption.Standard;
         AppWindow.SetIcon("Assets/AppIcon.ico");
         AccountSettingsScope.SignedOut += GeneratorPage.ResetSavedAlgorithm;
         InitializeVaultTimeout();
@@ -63,6 +63,8 @@ public sealed partial class MainWindow : Window
         Closed += (_, _) =>
         {
             _closed = true;
+            _searchDispatch?.Cancel();
+            UnbindSearchInput();
             DisposeTray();
             PrepareForExit();
             ClipboardCleaner.Stop();
@@ -114,8 +116,15 @@ public sealed partial class MainWindow : Window
         {
             var folder = _folderToOpen;
             _folderToOpen = null;
-            NavFrame.Navigate(typeof(HomePage),
-                folder is null ? tag : new HomePage.FolderNavigation(folder));
+            if (NavFrame.Content is HomePage existingHome)
+            {
+                existingHome.SwitchCategory(tag, folder);
+            }
+            else
+            {
+                NavFrame.Navigate(typeof(HomePage),
+                    folder is null ? tag : new HomePage.FolderNavigation(folder));
+            }
         }
     }
 
@@ -134,6 +143,7 @@ public sealed partial class MainWindow : Window
 
     private void SearchBox_QuerySubmitted(AutoSuggestBox sender, AutoSuggestBoxQuerySubmittedEventArgs args)
     {
+        _searchDispatch?.Cancel();
         if (NavFrame.Content is HomePage page)
         {
             page.SetSearch(args.QueryText);
@@ -153,12 +163,8 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    private void SearchBox_TextChanged(AutoSuggestBox sender, AutoSuggestBoxTextChangedEventArgs args)
-    {
-        if (NavFrame.Content is HomePage page) page.SetSearch(sender.Text);
-        else if (NavFrame.Content is FolderManagementPage folderPage) folderPage.SetSearch(sender.Text);
-        else if (NavFrame.Content is SendsPage sends) sends.SetSearch(sender.Text);
-    }
+    private void SearchBox_TextChanged(AutoSuggestBox sender, AutoSuggestBoxTextChangedEventArgs args) =>
+        RequestSearch(sender.Text);
 
     private async void Sync_Click(object sender, RoutedEventArgs e)
     {
@@ -184,6 +190,9 @@ public sealed partial class MainWindow : Window
 
     private void NavFrame_Navigated(object sender, NavigationEventArgs e)
     {
+        _searchDispatch?.Cancel();
+        if (NavFrame.BackStack.Count > 0) NavFrame.BackStack.Clear();
+        if (NavFrame.ForwardStack.Count > 0) NavFrame.ForwardStack.Clear();
         SearchBox.PlaceholderText = e.Content switch
         {
             FolderManagementPage => "搜索文件夹",

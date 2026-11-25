@@ -55,7 +55,28 @@ internal static class FolderHierarchyChecks
         check(choice.Name == " /Original name/ " && choice.DisplayName == choice.Name, "folder choices preserve full stored names including whitespace and delimiters");
         check(choice.ToString() == choice.Name && !choice.ToString().Contains("Id ="), "data-bound folder choices expose labels rather than record dumps");
         check((choice with { Name = "Changed" }).Id == choice.Id, "folder choice identity does not depend on display text");
+        check(choice.AutomationId == "FolderChoice_same-id" && (choice with { Name = "Changed" }).AutomationId == choice.AutomationId,
+            "folder choice automation identity survives abbreviation and rename without a long CLI argument");
         check(new FolderChoice("empty", "  ") is { Name: "  ", DisplayName: "—" }, "unnamed folder choices change only their visible placeholder");
+        VaultFolder[] editorFolders = [new("second", " /Same name/ "), new("first", " /Same name/ ")];
+        var editorChoices = FolderChoice.ForEditor(editorFolders, "first");
+        check(editorChoices.Select(item => item.Id).SequenceEqual(["", "second", "first"]) &&
+            editorChoices[1].Name == editorFolders[0].Name && editorChoices[2].Name == editorFolders[1].Name,
+            "editor choices preserve source order, duplicate labels, exact IDs and raw names");
+        check(editorChoices.Single(item => item.Id == "first").Name == " /Same name/ " && editorChoices[0].Name == "无文件夹",
+            "editor selection and unfiled sentinel use IDs rather than abbreviated labels");
+        var savedMissing = FolderChoice.ForEditor(editorFolders, "FIRST");
+        check(savedMissing.Length == 4 && savedMissing[^1] is { Id: "FIRST", Name: "原文件夹（尚未加载）" },
+            "editor preserves a missing saved assignment and compares folder IDs ordinally");
+        check(FolderChoice.ForEditor([], null).Single().Id == "" && FolderChoice.ForEditor([], "").Single().Id == "",
+            "empty editor folder sources have exactly one unfiled choice");
+        check(FolderChoice.ForEditor([new("long", new string('x', 10000))], "long")[1] is { Id: "long", Name.Length: 10000, DisplayText.Length: <= 160 },
+            "editor choice abbreviations bound display only without shortening a saved name");
+        var editorLarge = Enumerable.Range(0, 10000).Select(index => new VaultFolder($"e{index}", $"Folder {index}")).ToArray();
+        var largeChoices = FolderChoice.ForEditor(editorLarge, "e9999");
+        check(largeChoices.Length == 10001 && largeChoices[^1].Id == "e9999" &&
+            largeChoices.Skip(1).Select(item => item.Id).SequenceEqual(editorLarge.Select(folder => folder.Id)),
+            "10000-folder editor choices keep every real assignment and do not add a duplicate fallback");
         var missing = FolderHierarchy.Build([new("top", "3"), new("joined", "3/3.1/3.1.1"), new("leaf", "3/3.1/3.1.1/Leaf")], []);
         check(missing.Find("joined")!.Parent == missing.Find("top") && missing.Find("joined")!.DisplayName == "3.1/3.1.1",
             "folders reproduce the official missing-intermediate-parent example");

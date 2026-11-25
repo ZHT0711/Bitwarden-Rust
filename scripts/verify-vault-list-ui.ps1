@@ -1,10 +1,14 @@
 param(
     [string]$Package = 'apps/Bitwarden.WinUI/AppPackages/Bitwarden.WinUI_0.2.0.0_x64_Test/Bitwarden.WinUI_0.2.0.0_x64.msix',
     [string]$Fixture = 'work/ci-fixture.json',
+    [string]$PythonExe = 'python',
     [switch]$IncludeFolders,
     [switch]$IncludeClipboardStress,
     [switch]$CheckLinkedFields,
     [switch]$MeasureFolders,
+    [switch]$MeasureVault,
+    [ValidateRange(0, 600)][int]$VaultIdleSeconds = 60,
+    [ValidateSet('baseline', 'optimized')][string]$VaultRunLabel = 'baseline',
     [ValidateRange(3, 20)][int]$FolderSamples = 5,
     [ValidateSet('baseline', 'optimized')][string]$FolderRunLabel = 'baseline'
 )
@@ -12,20 +16,35 @@ param(
 # Uses only the SDK's public synthetic account and a loopback fixture server.
 # It unpacks the actual MSIX, never the potentially stale bin/.../AppX layout.
 $ErrorActionPreference = 'Stop'
-if ($CheckLinkedFields -and ($IncludeFolders -or $IncludeClipboardStress -or $MeasureFolders)) {
-    throw 'Linked-field mode is separate; do not combine it with folder or clipboard regression switches.'
+if ($CheckLinkedFields -and ($IncludeFolders -or $IncludeClipboardStress -or $MeasureFolders -or $MeasureVault)) {
+    throw 'Linked-field mode is separate; do not combine it with folder, vault-scale or clipboard regression switches.'
 }
-if ($MeasureFolders -and ($IncludeFolders -or $IncludeClipboardStress)) {
-    throw 'Folder pressure mode is separate; do not combine -MeasureFolders with regression switches.'
+if ($MeasureFolders -and ($IncludeFolders -or $IncludeClipboardStress -or $MeasureVault)) {
+    throw 'Folder pressure mode is separate; do not combine it with other regression/measurement switches.'
+}
+if ($MeasureVault -and ($IncludeFolders -or $IncludeClipboardStress)) {
+    throw 'Complete-vault pressure mode is separate; do not combine it with regression switches.'
 }
 $root = Split-Path $PSScriptRoot -Parent
 $winAppExe = (Get-Command winapp -CommandType Application -ErrorAction Stop).Source
+$pythonPath = (Get-Command $PythonExe -CommandType Application -ErrorAction Stop).Source
+$pythonProbe = & $pythonPath -c 'import sys; print("bitwarden-fixture-python3" if sys.version_info >= (3, 10) else "unsupported")' | Out-String
+if ($LASTEXITCODE -ne 0 -or $pythonProbe.Trim() -ne 'bitwarden-fixture-python3') {
+    throw 'A working Python 3.10+ interpreter is required. Pass -PythonExe with its full path; a Windows Store execution alias alone is not enough.'
+}
 $packagePath = (Resolve-Path (Join-Path $root $Package)).Path
 $fixturePath = (Resolve-Path (Join-Path $root $Fixture)).Path
 if ($CheckLinkedFields) {
     $linkedFixture = [IO.File]::ReadAllText($fixturePath) | ConvertFrom-Json
     if ($linkedFixture.linkedFieldFixture.synthetic -ne $true -or $linkedFixture.ciphers.Count -ne 6) {
         throw 'Expected the dedicated six-cipher public linked-field fixture.'
+    }
+}
+if ($MeasureVault) {
+    $vaultFixture = [IO.File]::ReadAllText($fixturePath) | ConvertFrom-Json -Depth 12
+    if ($vaultFixture.vaultStress.synthetic -ne $true -or $vaultFixture.vaultStress.items -ne 10000 -or
+        $vaultFixture.ciphers.Count -ne 10000 -or $vaultFixture.folders.Count -ne 0) {
+        throw 'Expected the dedicated 10000-item public SDK complete-vault fixture.'
     }
 }
 $run = Join-Path $root ('work/list-acceptance-' + [Guid]::NewGuid().ToString('N'))
@@ -146,6 +165,10 @@ public static class SyntheticListWindow {
     [DllImport("user32.dll")] public static extern int GetSystemMetrics(int index);
     [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr hwnd);
     [DllImport("user32.dll", SetLastError=true)] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int width, int height, uint flags);
+    [StructLayout(LayoutKind.Sequential)] public struct Rect { public int left, top, right, bottom; }
+    [StructLayout(LayoutKind.Sequential)] public struct Point { public int x, y; }
+    [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out Rect rect);
+    [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref Point point);
     [DllImport("user32.dll", SetLastError=true)] public static extern bool OpenClipboard(IntPtr h);
     [DllImport("user32.dll", SetLastError=true)] public static extern bool CloseClipboard();
     public static void HoldClipboard(int milliseconds) {
@@ -161,10 +184,14 @@ try {
         package = $packagePath
         packageSha256 = (Get-FileHash -LiteralPath $packagePath -Algorithm SHA256).Hash
         fixtureSha256 = (Get-FileHash -LiteralPath $fixturePath -Algorithm SHA256).Hash
+        pythonExecutable = $pythonPath
         includeFolders = [bool]$IncludeFolders
         includeClipboardStress = [bool]$IncludeClipboardStress
         checkLinkedFields = [bool]$CheckLinkedFields
         measureFolders = [bool]$MeasureFolders
+        measureVault = [bool]$MeasureVault
+        vaultIdleSeconds = $VaultIdleSeconds
+        vaultRunLabel = $VaultRunLabel
         folderSamples = $FolderSamples
         folderRunLabel = $FolderRunLabel
         folderSourceHashes = [ordered]@{
@@ -172,6 +199,9 @@ try {
             navigation = (Get-FileHash (Join-Path $root 'apps/Bitwarden.WinUI/Pages/HomePage.Folders.cs')).Hash
             hierarchy = (Get-FileHash (Join-Path $root 'apps/Bitwarden.WinUI/Interop/FolderHierarchy.cs')).Hash
             homeXaml = (Get-FileHash (Join-Path $root 'apps/Bitwarden.WinUI/Pages/HomePage.xaml')).Hash
+            editor = (Get-FileHash (Join-Path $root 'apps/Bitwarden.WinUI/Pages/VaultEditorDialog.cs')).Hash
+            editorActions = (Get-FileHash (Join-Path $root 'apps/Bitwarden.WinUI/Pages/HomePage.Editor.cs')).Hash
+            listLayout = (Get-FileHash (Join-Path $root 'apps/Bitwarden.WinUI/Pages/HomePage.List.cs')).Hash
         }
     } | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $run 'inputs.json')
     [void](WinApp @('tool', 'makeappx', 'unpack', '/p', $packagePath, '/d', $layout, '/o'))
@@ -186,7 +216,7 @@ try {
     # Refuse to disturb a previous, still-running test or overwrite its data.
     if (Get-AppxPackage -Name $identity) { throw 'A synthetic list test package is already registered. Close and unregister that test first.' }
     $portFile = Join-Path $run 'fixture.port'
-    $server = Start-Process -FilePath (Get-Command python).Source -ArgumentList @(
+    $server = Start-Process -FilePath $pythonPath -ArgumentList @(
         '-u', 'tests/fixture_server.py', '--fixture', ('"' + $fixturePath + '"'), '--port-file', ('"' + $portFile + '"'), '--peer'
     ) -WorkingDirectory $root -PassThru -WindowStyle Hidden -RedirectStandardOutput (Join-Path $run 'server.out') -RedirectStandardError (Join-Path $run 'server.err')
     $deadline = [DateTime]::UtcNow.AddSeconds(30)
@@ -215,8 +245,16 @@ try {
     SetValue '电子邮箱' 'test@bitwarden.com'
     SetValue '主密码' 'asdfasdfasdf'
     if ($MeasureFolders) { . (Join-Path $PSScriptRoot 'vault-folder-stress-ui-checks.ps1') }
+    if ($MeasureVault) { . (Join-Path $PSScriptRoot 'vault-scale-ui-checks.ps1') }
     $initialLoadWatch = [Diagnostics.Stopwatch]::StartNew()
     Click 'PrimaryButton'
+    if ($MeasureVault) {
+        WaitVaultScaleCount '10000 个条目'
+        $initialLoadWatch.Stop()
+        InvokeVaultScaleChecks -InitialLoadMs $initialLoadWatch.Elapsed.TotalMilliseconds -IdleSeconds $VaultIdleSeconds -Label $VaultRunLabel
+        Write-Host "PASS: $checks named complete-vault pressure checks. Evidence: $run"
+        return
+    }
     if ($MeasureFolders) {
         WaitFolderStressProperty 'ItemCount' 'Name' '2 个条目'
         $initialLoadWatch.Stop()

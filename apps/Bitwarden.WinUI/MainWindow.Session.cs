@@ -13,17 +13,23 @@ public sealed partial class MainWindow
     private bool _closed;
     private CancellationTokenSource? _unlockRequest;
     private VaultAccount[] _accounts = [];
+    private VaultAccount? _activeAccount;
     private readonly Dictionary<string, string> _reconnectSyncErrors = new();
     private const string ReconnectSyncWarning = "已登录，尚未同步保险库";
-    private VaultAccount? ActiveAccount => _accounts.FirstOrDefault(account => account.Active);
+    private VaultAccount? ActiveAccount => _activeAccount;
 
     private void ApplyAccountSnapshot(VaultAccount[] accounts)
     {
-        var previous = ActiveAccount;
-        var removed = _accounts.Where(old => accounts.All(current => current.Id != old.Id)).ToArray();
+        var previous = _activeAccount;
+        var removed = _accounts.Length == 0 ? [] : _accounts.Where(old => accounts.All(current => current.Id != old.Id)).ToArray();
         RetainAccountTimeouts(accounts);
         _accounts = accounts;
-        var active = ActiveAccount;
+        VaultAccount? active = null;
+        foreach (var candidate in accounts)
+        {
+            if (candidate.Active) { active = candidate; break; }
+        }
+        _activeAccount = active;
         AccountSettingsScope.Use(active?.Scope);
         foreach (var account in removed)
         {
@@ -45,25 +51,28 @@ public sealed partial class MainWindow
         var unlocked = state == VaultSessionState.Unlocked;
         var signedIn = state != VaultSessionState.SignedOut;
         var available = !_accountTransition && !_signInDialogOpen;
+        var account = ActiveAccount;
         SearchBox.IsEnabled = unlocked && available;
         SyncButton.IsEnabled = unlocked && available;
-        SyncButton.Content = ActiveAccount is { NeedsSignIn: true } ? "联机同步" : "同步";
-        LockButton.IsEnabled = SignInButton.IsEnabled = !_accountTransition && !_signInDialogOpen;
+        var syncLabel = account is { NeedsSignIn: true } ? "联机同步" : "同步";
+        SyncButtonLabel.Text = syncLabel;
+        AutomationProperties.SetName(SyncButton, syncLabel);
+        ToolTipService.SetToolTip(SyncButton, $"{syncLabel}（Ctrl+R）");
+
+        LockButton.IsEnabled = SignInButton.IsEnabled = available;
         LockButton.Visibility = signedIn ? Visibility.Visible : Visibility.Collapsed;
-        LockButton.Content = unlocked ? "锁定" : "解锁";
-        var account = ActiveAccount;
-        SignInButton.Content = account is null ? "登录" : new StackPanel
-        {
-            Children =
-            {
-                new TextBlock { Text = account.Email, MaxWidth = 152, TextTrimming = TextTrimming.CharacterEllipsis },
-                new TextBlock { Text = account.ServerLabel, MaxWidth = 152, TextTrimming = TextTrimming.CharacterEllipsis,
-                    Style = (Style)Application.Current.Resources["CaptionTextBlockStyle"] },
-            },
-        };
+        var lockLabel = unlocked ? "锁定" : "解锁";
+        LockButtonLabel.Text = lockLabel;
+        LockButtonIcon.Glyph = unlocked ? "\uE72E" : "\uE785";
+        AutomationProperties.SetName(LockButton, lockLabel);
+        ToolTipService.SetToolTip(LockButton, $"{lockLabel}（Ctrl+L）");
+
+        AccountPrimaryLabel.Text = account is null ? "登录" : account.Email;
+        AccountServerLabel.Text = account is null ? string.Empty : account.CompactServerLabel;
         AutomationProperties.SetName(SignInButton, account is null
             ? "登录" : $"账户 {account.Email} · {account.ServerLabel}");
         ToolTipService.SetToolTip(SignInButton, account is null ? null : $"{account.Email}\n{account.ServerLabel}");
+        ApplyResponsiveChrome();
         if (NavFrame.Content is SettingsPage settings)
         {
             var busy = _signInDialogOpen || _accountTransition;
@@ -214,10 +223,12 @@ public sealed partial class MainWindow
             var lockLabel = account.State == VaultSessionState.Locked ? "已锁定" : "已解锁";
             var item = new RadioMenuFlyoutItem
             {
-                Text = $"{account.Email} · {account.ServerLabel} · {lockLabel}",
+                Text = $"{account.Email} · {account.CompactServerLabel} · {lockLabel}",
                 GroupName = "VaultAccounts",
                 IsChecked = account.Active,
             };
+            AutomationProperties.SetName(item, $"{account.Email} · {account.ServerLabel} · {lockLabel}");
+            ToolTipService.SetToolTip(item, $"{account.Email}\n{account.ServerLabel} · {lockLabel}");
             item.Click += async (_, _) =>
             {
                 if (!account.Active) await RunAccountCommandAsync(() => RustCore.SwitchAccount(account.Id));

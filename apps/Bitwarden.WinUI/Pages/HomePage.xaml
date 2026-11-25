@@ -5,7 +5,7 @@
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
     xmlns:interop="using:Bitwarden_WinUI.Interop"
     xmlns:controls="using:Bitwarden_WinUI.Controls">
-    <Grid x:Name="VaultLayout" Padding="24,8,24,24" RowSpacing="14" RowDefinitions="Auto,Auto,Auto,Auto,*" SizeChanged="VaultLayout_SizeChanged">
+    <Grid x:Name="VaultLayout" Padding="20,10,20,16" RowSpacing="10" RowDefinitions="Auto,*" SizeChanged="VaultLayout_SizeChanged">
         <VisualStateManager.VisualStateGroups>
             <VisualStateGroup>
                 <VisualState x:Name="WideVault" />
@@ -18,13 +18,19 @@
                         <Setter Target="PageSubtitle.Visibility" Value="Collapsed" />
                         <Setter Target="FilterFolderColumn.Width" Value="*" />
                         <Setter Target="FilterSortColumn.Width" Value="*" />
+                        <Setter Target="FilterSpacerColumn.Width" Value="0" />
                         <Setter Target="FolderFilter.MinWidth" Value="0" />
+                        <Setter Target="FolderFilter.MaxWidth" Value="9999" />
+                        <Setter Target="FolderFilter.HorizontalAlignment" Value="Stretch" />
                         <Setter Target="SortChoice.MinWidth" Value="0" />
+                        <Setter Target="SortChoice.MaxWidth" Value="9999" />
+                        <Setter Target="SortChoice.HorizontalAlignment" Value="Stretch" />
                         <Setter Target="ItemCount.(Grid.Row)" Value="1" />
                         <Setter Target="ItemCount.(Grid.Column)" Value="0" />
+                        <Setter Target="ItemCount.(Grid.ColumnSpan)" Value="2" />
                         <Setter Target="RequestProgress.(Grid.Row)" Value="1" />
                         <Setter Target="RequestProgress.(Grid.Column)" Value="1" />
-                        <Setter Target="RequestProgress.(Grid.ColumnSpan)" Value="3" />
+                        <Setter Target="RequestProgress.(Grid.ColumnSpan)" Value="4" />
                         <Setter Target="DetailPane.(Grid.Column)" Value="0" />
                         <Setter Target="DetailPane.(Grid.ColumnSpan)" Value="2" />
                         <Setter Target="ListPane.(Grid.ColumnSpan)" Value="2" />
@@ -32,10 +38,14 @@
                 </VisualState>
             </VisualStateGroup>
         </VisualStateManager.VisualStateGroups>
-        <Grid ColumnDefinitions="*,Auto" RowDefinitions="Auto,Auto" ColumnSpacing="12" RowSpacing="8">
-            <StackPanel Spacing="4">
-                <TextBlock x:Name="PageTitle" Style="{StaticResource TitleTextBlockStyle}" Text="我的保险库" />
-                <TextBlock x:Name="PageSubtitle" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="密码、笔记与敏感信息都集中在这里。" TextWrapping="Wrap" />
+        <ScrollViewer x:Name="VaultHeaderScroll" HorizontalScrollBarVisibility="Disabled" VerticalScrollBarVisibility="Auto"
+            AutomationProperties.Name="保险库筛选与文件夹导航">
+        <Grid RowDefinitions="Auto,Auto,Auto,Auto" RowSpacing="8">
+        <Grid ColumnDefinitions="*,Auto" RowDefinitions="Auto,Auto" ColumnSpacing="12" RowSpacing="4">
+            <StackPanel Orientation="Horizontal" Spacing="10" VerticalAlignment="Center">
+                <TextBlock x:Name="PageTitle" Style="{StaticResource SubtitleTextBlockStyle}" Text="我的保险库" VerticalAlignment="Center" />
+                <TextBlock x:Name="PageSubtitle" Style="{StaticResource CaptionTextBlockStyle}" Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                    Text="密码、笔记与敏感信息都集中在这里。" VerticalAlignment="Center" Margin="0,2,0,0" TextTrimming="CharacterEllipsis" />
             </StackPanel>
             <CommandBar x:Name="ItemCommands" Grid.Column="1" Background="Transparent" VerticalAlignment="Center" DefaultLabelPosition="Right"
                 ClosedDisplayMode="Compact" IsDynamicOverflowEnabled="True" MaxWidth="280">
@@ -58,33 +68,35 @@
         </Grid>
         <InfoBar x:Name="ConnectionNotice" Grid.Row="1" IsClosable="False" IsOpen="True"
             Title="请先登录" Message="登录后同步并在本机解密你的 Bitwarden 保险库。" Severity="Informational" />
-        <Grid Grid.Row="2" RowSpacing="8" RowDefinitions="Auto,Auto,Auto" ColumnSpacing="12">
+        <Grid Grid.Row="2" RowSpacing="6" RowDefinitions="Auto,Auto,Auto" ColumnSpacing="10">
             <Grid.ColumnDefinitions>
-                <ColumnDefinition x:Name="FilterFolderColumn" Width="*" />
+                <ColumnDefinition x:Name="FilterFolderColumn" Width="Auto" />
                 <ColumnDefinition x:Name="FilterSortColumn" Width="Auto" />
+                <ColumnDefinition x:Name="FilterSpacerColumn" Width="*" />
                 <ColumnDefinition Width="Auto" />
                 <ColumnDefinition Width="Auto" />
             </Grid.ColumnDefinitions>
-            <ComboBox x:Name="FolderFilter" MinWidth="180" MaxWidth="260" HorizontalAlignment="Stretch"
+            <ComboBox x:Name="FolderFilter" MinWidth="180" MaxWidth="260" HorizontalAlignment="Left"
                 AutomationProperties.Name="筛选文件夹" SelectionChanged="FolderFilter_SelectionChanged">
                 <ComboBox.ItemTemplate>
                     <DataTemplate x:DataType="interop:FolderChoice">
                         <TextBlock Text="{x:Bind DisplayText}" AutomationProperties.Name="{x:Bind DisplayName}"
+                            Loaded="FolderChoiceLabel_Loaded" DataContextChanged="FolderChoiceLabel_DataContextChanged"
                             MaxWidth="260" TextTrimming="CharacterEllipsis" />
                     </DataTemplate>
                 </ComboBox.ItemTemplate>
             </ComboBox>
-            <ComboBox x:Name="SortChoice" Grid.Column="1" MinWidth="170" MaxWidth="240" HorizontalAlignment="Stretch"
+            <ComboBox x:Name="SortChoice" Grid.Column="1" MinWidth="160" MaxWidth="220" HorizontalAlignment="Left"
                 AutomationProperties.Name="条目排序" AutomationProperties.AutomationId="VaultSortChoice" SelectionChanged="SortChoice_Changed" />
-            <TextBlock x:Name="ItemCount" Grid.Column="2" VerticalAlignment="Center" Text="0 个条目"
+            <TextBlock x:Name="ItemCount" Grid.Column="3" VerticalAlignment="Center" Text="0 个条目"
                 AutomationProperties.LiveSetting="Polite" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
-            <StackPanel x:Name="RequestProgress" Grid.Column="3" Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right">
-                <ProgressRing x:Name="LoadingRing" Width="24" Height="24" IsActive="False" Visibility="Collapsed" AutomationProperties.Name="正在处理保险库请求" />
+            <StackPanel x:Name="RequestProgress" Grid.Column="4" Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right">
+                <ProgressRing x:Name="LoadingRing" Width="20" Height="20" IsActive="False" Visibility="Collapsed" AutomationProperties.Name="正在处理保险库请求" />
                 <Button x:Name="CancelRequestButton" Content="取消请求" Click="CancelRequest_Click" Visibility="Collapsed" />
             </StackPanel>
-            <TextBlock x:Name="SortFeedback" Grid.Row="2" Grid.ColumnSpan="4" Visibility="Collapsed" TextWrapping="Wrap" AutomationProperties.LiveSetting="Polite" />
+            <TextBlock x:Name="SortFeedback" Grid.Row="2" Grid.ColumnSpan="5" Visibility="Collapsed" TextWrapping="Wrap" AutomationProperties.LiveSetting="Polite" />
         </Grid>
-        <StackPanel x:Name="FolderNavigationPanel" Grid.Row="3" Spacing="8" Visibility="Collapsed">
+        <StackPanel x:Name="FolderNavigationPanel" Grid.Row="3" Spacing="6" Visibility="Collapsed">
             <Grid ColumnDefinitions="*,Auto" ColumnSpacing="8">
                 <BreadcrumbBar x:Name="FolderCrumbs" ItemClicked="FolderCrumbs_ItemClicked" AutomationProperties.Name="文件夹路径">
                     <BreadcrumbBar.ItemTemplate>
@@ -99,6 +111,9 @@
                         <Flyout x:Name="FolderAncestorsFlyout">
                             <ListView x:Name="FolderAncestorList" MinWidth="240" MaxWidth="360" MaxHeight="320"
                                 SelectionMode="None" HorizontalContentAlignment="Stretch" AutomationProperties.Name="更早的实际上级文件夹">
+                                <ListView.ItemContainerTransitions>
+                                    <TransitionCollection />
+                                </ListView.ItemContainerTransitions>
                                 <ListView.ItemTemplate>
                                     <DataTemplate x:DataType="interop:FolderRow">
                                         <HyperlinkButton Tag="{x:Bind}" Click="FolderAncestor_Click" Padding="8"
@@ -120,9 +135,12 @@
                 <ListView x:Name="ChildFolderList" MaxHeight="140" SelectionMode="None" IsItemClickEnabled="True"
                     ItemClick="ChildFolderList_ItemClick" HorizontalContentAlignment="Stretch"
                     AutomationProperties.Name="子文件夹" AutomationProperties.AutomationId="ChildFolderList">
+                    <ListView.ItemContainerTransitions>
+                        <TransitionCollection />
+                    </ListView.ItemContainerTransitions>
                     <ListView.ItemTemplate>
                         <DataTemplate x:DataType="interop:FolderRow">
-                            <Grid Padding="8,6" ColumnDefinitions="Auto,*,Auto" ColumnSpacing="12">
+                            <Grid Padding="8,5" ColumnDefinitions="Auto,*,Auto" ColumnSpacing="10">
                                 <SymbolIcon Symbol="Folder" />
                                 <TextBlock Grid.Column="1" Text="{x:Bind DisplayText}" AutomationProperties.Name="{x:Bind DisplayName}"
                                     TextTrimming="CharacterEllipsis" VerticalAlignment="Center" />
@@ -134,20 +152,25 @@
                 </ListView>
             </StackPanel>
         </StackPanel>
-        <Grid Grid.Row="4" ColumnSpacing="16" ColumnDefinitions="*,*">
+        </Grid>
+        </ScrollViewer>
+        <Grid Grid.Row="1" ColumnSpacing="12" ColumnDefinitions="2*,3*">
             <Border x:Name="ListPane" SizeChanged="ListPane_SizeChanged" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
                 BorderThickness="1" CornerRadius="8">
                 <Grid>
                     <ListView x:Name="VaultList" SelectionMode="Single" SelectionChanged="VaultList_SelectionChanged"
                         AutomationProperties.Name="保险库条目" Padding="4" ScrollViewer.HorizontalScrollBarVisibility="Disabled"
                         HorizontalContentAlignment="Stretch">
+                        <ListView.ItemContainerTransitions>
+                            <TransitionCollection />
+                        </ListView.ItemContainerTransitions>
                         <ListView.ItemTemplate>
                             <DataTemplate x:DataType="interop:VaultItem">
-                                <Grid Padding="8,10" ColumnSpacing="12" ColumnDefinitions="Auto,*,Auto">
+                                <Grid Padding="8,8" ColumnSpacing="10" ColumnDefinitions="Auto,*,Auto">
                                     <controls:WebsiteIcon Host="{x:Bind WebsiteHost}" VerticalAlignment="Center" />
-                                    <StackPanel Grid.Column="1" Spacing="4">
+                                    <StackPanel Grid.Column="1" Spacing="2" VerticalAlignment="Center">
                                         <TextBlock Text="{x:Bind DisplayName}" Style="{StaticResource BodyStrongTextBlockStyle}" TextTrimming="CharacterEllipsis" />
-                                        <TextBlock Text="{x:Bind Subtitle}" Foreground="{ThemeResource TextFillColorSecondaryBrush}" TextTrimming="CharacterEllipsis" />
+                                        <TextBlock Text="{x:Bind Subtitle}" Style="{StaticResource CaptionTextBlockStyle}" Foreground="{ThemeResource TextFillColorSecondaryBrush}" TextTrimming="CharacterEllipsis" />
                                     </StackPanel>
                                     <TextBlock Grid.Column="2" Text="{x:Bind StatusLabel}" VerticalAlignment="Center"
                                         Style="{StaticResource CaptionTextBlockStyle}" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
@@ -157,8 +180,8 @@
                     </ListView>
                     <ScrollViewer x:Name="EmptyState" Padding="16" VerticalContentAlignment="Center"
                         HorizontalScrollBarVisibility="Disabled" VerticalScrollBarVisibility="Auto">
-                        <StackPanel HorizontalAlignment="Center" Spacing="12">
-                            <FontIcon x:Name="EmptyIcon" Glyph="&#xE72E;" FontSize="32" HorizontalAlignment="Center" />
+                        <StackPanel HorizontalAlignment="Center" Spacing="10">
+                            <FontIcon x:Name="EmptyIcon" Glyph="&#xE72E;" FontSize="28" HorizontalAlignment="Center" />
                             <TextBlock x:Name="EmptyMessage" Text="登录以查看你的保险库" TextWrapping="Wrap" TextAlignment="Center" />
                             <Button x:Name="ConnectButton" Content="连接账户" Click="ConnectAccount_Click" HorizontalAlignment="Center" />
                         </StackPanel>
@@ -168,9 +191,9 @@
             <Border x:Name="DetailPane" Grid.Column="1" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
                 BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1" CornerRadius="8">
                 <Grid RowDefinitions="Auto,*">
-                    <Button x:Name="DetailBackButton" Content="返回条目列表" Margin="20,12,20,0" Click="DetailBack_Click" Visibility="Collapsed" />
-                    <ScrollViewer x:Name="DetailScroll" AutomationProperties.Name="条目详情" Grid.Row="1" Padding="20" HorizontalScrollBarVisibility="Disabled">
-                        <StackPanel x:Name="DetailPanel" Spacing="14">
+                    <Button x:Name="DetailBackButton" Content="返回条目列表" Margin="18,12,18,0" Click="DetailBack_Click" Visibility="Collapsed" />
+                    <ScrollViewer x:Name="DetailScroll" AutomationProperties.Name="条目详情" Grid.Row="1" Padding="18,16" HorizontalScrollBarVisibility="Disabled">
+                        <StackPanel x:Name="DetailPanel" Spacing="12">
                             <TextBlock Text="选择一个条目查看详情" TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                         </StackPanel>
                     </ScrollViewer>

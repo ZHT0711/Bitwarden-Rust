@@ -175,12 +175,52 @@ function InvokeFolderStressChecks([double]$InitialLoadMs, [int]$Samples, [string
         }
         # Extra correctness coverage, not part of the paired home/navigation memory peak.
         CaptureFolderStressMemory 'paired-navigation-end'
-        Click 'NewItemButton'
+        MeasureFolderStress 'editor-open' 0 { Click 'NewItemButton' } {
+            [void](WaitFolderStressValue 'VaultEditorFolder' ([string]$meta.targetName))
+        }
         Check ([string]::Equals((WaitFolderStressValue 'VaultEditorFolder' ([string]$meta.targetName)), $meta.targetName, [StringComparison]::Ordinal)) `
             'new item draft inherits the selected exact leaf folder ID rather than an unfiled default'
         CaptureFolderStressMemory 'extra-editor-open'
+        MeasureFolderStress 'editor-folder-open' 0 {
+            [void](WinApp @('ui', 'invoke', 'VaultEditorFolder', '-w',
+                [string](Get-Process -Id $previewId).MainWindowHandle, '--type', 'ComboBox', '--action', 'expand'))
+        } { WaitFolderStressProperty 'VaultEditorFolder' 'ExpandCollapseState' 'Expanded' }
+        [void](WinApp @('ui', 'invoke', 'VaultEditorFolder', '-w',
+            [string](Get-Process -Id $previewId).MainWindowHandle, '--type', 'ComboBox', '--action', 'collapse'))
+        Check $true 'editor folder picker opens and closes with the full folder fixture'
         Click 'CloseButton'
         WaitFolderStressProperty 'FolderFilter' 'IsEnabled' '(?im)^\s*IsEnabled\s*[:=]\s*True\s*$'
+        Click 'Synthetic login' 'ListItem'
+        WaitFolderStressProperty 'EditItemButton' 'IsEnabled' '(?im)^\s*IsEnabled\s*[:=]\s*True\s*$'
+        MeasureFolderStress 'move-dialog-open' 0 {
+            Click 'MoreButton'
+            [void](WinApp @('ui', 'invoke', 'MoveItemsButton', '-a', [string]$previewId, '--type', 'Button'))
+        } { [void](WaitFolderStressValue '目标文件夹' '无文件夹') }
+        MeasureFolderStress 'move-folder-open' 0 {
+            [void](WinApp @('ui', 'invoke', '目标文件夹', '-w',
+                [string](Get-Process -Id $previewId).MainWindowHandle, '--type', 'ComboBox', '--action', 'expand'))
+        } { WaitFolderStressProperty '目标文件夹' 'ExpandCollapseState' 'Expanded' }
+        $popupTree = WinApp @('ui', 'inspect', '-a', [string]$previewId, '--depth', '5')
+        $popupTree | Set-Content (Join-Path $run 'move-picker-popup.txt')
+        $popupMatch = [regex]::Match($popupTree, '(?m)^--- HWND (\d+): "PopupHost"')
+        if (-not $popupMatch.Success) { throw 'The scaled move picker did not expose its own PopupHost window.' }
+        $popupHwnd = $popupMatch.Groups[1].Value
+        # Tiny orphan popups have no scrollbar. Target a stable real ID, not a CLI-truncated
+        # name or ephemeral UIA slug: the orphan's full name exceeds Windows' argv limit.
+        if ($meta.scenario -ne 'long-orphan') {
+            $pickerEnd = if ($meta.scenario -eq 'branching') { 'top' } else { 'bottom' }
+            [void](WinApp @('ui', 'scroll', '目标文件夹', '-w', $popupHwnd, '--to', $pickerEnd))
+        }
+        [void](WinApp @('ui', 'invoke', ("FolderChoice_" + $meta.targetId), '-w', $popupHwnd))
+        Check ([string]::Equals((WaitFolderStressValue '目标文件夹' ([string]$meta.targetName)), $meta.targetName, [StringComparison]::Ordinal)) `
+            'move picker preserves exact full-name leaf identity at actual folder scale'
+        Click 'CloseButton'
+        WaitFolderStressProperty 'FolderFilter' 'IsEnabled' '(?im)^\s*IsEnabled\s*[:=]\s*True\s*$'
+        SetValue 'TextBox' 'unmatched synthetic metadata'
+        WaitFolderStressProperty 'ItemCount' 'Name' '0 个条目'
+        SetValue 'TextBox' ''
+        WaitFolderStressProperty 'ItemCount' 'Name' '1 个条目'
+        CheckFolderStressItems 'Synthetic login' 'Synthetic protected item' 'canceling scaled move preserves the original exact leaf membership'
         Resize ([Math]::Min(1000, $wide)) $height
         WaitFolderStressProperty 'ItemCount' 'Name' '1 个条目'
         [void](WinApp @('ui', 'screenshot', '-w', [string](Get-Process -Id $previewId).MainWindowHandle,
@@ -208,6 +248,54 @@ function InvokeFolderStressChecks([double]$InitialLoadMs, [int]$Samples, [string
                 $text.x + $text.width -le $pane.x + $pane.width + 1 -and
                 $text.y + $text.height -le $pane.y + $pane.height + 1) `
                 'short empty parent shows an entire text line inside the list viewport, not merely a clipped UIA element'
+            foreach ($size in @(@(1000, 1100), @(1600, 1000), @(1000, 1380))) {
+                Resize $size[0] $size[1]
+                Start-Sleep -Milliseconds 250
+                $bounds = @{}
+                foreach ($selector in 'EmptyMessage', 'VaultList') {
+                    $raw = WinApp @('ui', 'get-property', $selector, '-w',
+                        [string](Get-Process -Id $previewId).MainWindowHandle, '--property', 'BoundingRectangle', '--json')
+                    $raw | Set-Content (Join-Path $run ("short-$($size[0])x$($size[1])-$selector.json"))
+                    $bounds[$selector] = ($raw | ConvertFrom-Json).element
+                }
+                [void](WinApp @('ui', 'screenshot', '-w', [string](Get-Process -Id $previewId).MainWindowHandle,
+                    '-o', (Join-Path $run "short-$($size[0])x$($size[1])-empty.png")))
+                $text = $bounds.EmptyMessage
+                $pane = $bounds.VaultList
+                $oldDpi = [SyntheticListWindow]::SetThreadDpiAwarenessContext([IntPtr]::new(-4))
+                try {
+                    $hwnd = (Get-Process -Id $previewId).MainWindowHandle
+                    $client = [SyntheticListWindow+Rect]::new()
+                    $origin = [SyntheticListWindow+Point]::new()
+                    if (-not [SyntheticListWindow]::GetClientRect($hwnd, [ref]$client) -or
+                        -not [SyntheticListWindow]::ClientToScreen($hwnd, [ref]$origin)) { throw 'Cannot get physical client bounds.' }
+                    $window = @{ x = $origin.x; y = $origin.y; width = $client.right; height = $client.bottom }
+                } finally { [void][SyntheticListWindow]::SetThreadDpiAwarenessContext($oldDpi) }
+                $window | ConvertTo-Json | Set-Content (Join-Path $run "short-$($size[0])x$($size[1])-client.json")
+                Check (-not $text.isOffscreen -and $text.height -ge 18 * $scale -and $pane.height -ge 48 * $scale -and
+                    $text.x -ge $pane.x -and $text.y -ge $pane.y -and
+                    $text.x + $text.width -le $pane.x + $pane.width + 1 -and
+                    $text.y + $text.height -le $pane.y + $pane.height + 1 -and
+                    $pane.y + $pane.height -le $window.y + $window.height + 1) `
+                    "short $($size[0])x$($size[1]) empty text and usable list viewport are fully inside the actual client window"
+                [void](WinApp @('ui', 'scroll', 'VaultHeaderScroll', '-w', [string]$hwnd, '--to', 'bottom'))
+                $header = (WinApp @('ui', 'get-property', 'VaultHeaderScroll', '-w', [string]$hwnd,
+                    '--property', 'BoundingRectangle', '--json') | ConvertFrom-Json).element
+                foreach ($selector in 'FolderAncestorsButton', 'ChildFolderList') {
+                    $raw = WinApp @('ui', 'get-property', $selector, '-w', [string]$hwnd,
+                        '--property', 'BoundingRectangle', '--json')
+                    $raw | Set-Content (Join-Path $run "short-$($size[0])x$($size[1])-$selector.json")
+                    $control = ($raw | ConvertFrom-Json).element
+                    Check (-not $control.isOffscreen -and $control.height -ge 30 * $scale -and
+                        $control.x -ge $header.x -and $control.x + $control.width -le $header.x + $header.width + 1 -and
+                        $control.y -ge $header.y -and $control.y + $control.height -le $header.y + $header.height + 1 -and
+                        $control.y + $control.height -le $window.y + $window.height + 1) `
+                        "short $($size[0])x$($size[1]) $selector remains fully reachable by header scrolling"
+                }
+                [void](WinApp @('ui', 'screenshot', '-w', [string]$hwnd,
+                    '-o', (Join-Path $run "short-$($size[0])x$($size[1])-navigation.png")))
+            }
+            Resize ([Math]::Min(1000, $wide)) $height
             Click 'FolderAncestorsButton'
             [void](WinApp @('ui', 'scroll', 'FolderAncestorList', '-a', [string]$previewId, '--to', 'bottom'))
             # Parent 998 has early real ancestors 0..990; the last eight stay in the breadcrumb.
@@ -227,6 +315,26 @@ function InvokeFolderStressChecks([double]$InitialLoadMs, [int]$Samples, [string
             WaitFolderStressProperty 'ItemCount' 'Name' '0 个条目'
         }
         Check ((WaitFolderStressValue 'FolderFilter' '所有文件夹') -eq '所有文件夹') 'locking clears selected long-path metadata from the filter'
+        if ($meta.scenario -eq 'deep') {
+            foreach ($size in @(@(1000, 1100), @(1600, 1000), @(1000, 1380))) {
+                Resize $size[0] $size[1]
+                Start-Sleep -Milliseconds 250
+                $pane = (WinApp @('ui', 'get-property', 'VaultList', '-w',
+                    [string](Get-Process -Id $previewId).MainWindowHandle, '--property', 'BoundingRectangle', '--json') | ConvertFrom-Json).element
+                foreach ($selector in 'EmptyMessage', 'ConnectButton') {
+                    $raw = WinApp @('ui', 'get-property', $selector, '-w',
+                        [string](Get-Process -Id $previewId).MainWindowHandle, '--property', 'BoundingRectangle', '--json')
+                    $raw | Set-Content (Join-Path $run "locked-short-$($size[0])x$($size[1])-$selector.json")
+                    $control = ($raw | ConvertFrom-Json).element
+                    Check (-not $control.isOffscreen -and $control.height -ge 18 * $scale -and
+                        $control.x -ge $pane.x -and $control.x + $control.width -le $pane.x + $pane.width + 1 -and
+                        $control.y -ge $pane.y -and $control.y + $control.height -le $pane.y + $pane.height + 1) `
+                        "locked short $($size[0])x$($size[1]) $selector is fully visible inside the list viewport"
+                }
+                [void](WinApp @('ui', 'screenshot', '-w', [string](Get-Process -Id $previewId).MainWindowHandle,
+                    '-o', (Join-Path $run "locked-short-$($size[0])x$($size[1]).png")))
+            }
+        }
         Start-Sleep -Seconds 1
         CaptureFolderStressMemory 'after-lock-idle'
         $metrics.completed = $true

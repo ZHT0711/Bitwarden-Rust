@@ -158,13 +158,13 @@ internal static partial class RustCore
         return result;
     }
 
-    private static T ReadJson<T>(IntPtr pointer)
+    private static unsafe T ReadJson<T>(IntPtr pointer)
     {
         if (pointer == IntPtr.Zero) throw new VaultException("internal");
         try
         {
-            var json = Marshal.PtrToStringUTF8(pointer) ?? throw new VaultException("internal");
-            var response = JsonSerializer.Deserialize(json, JsonInfo<NativeResponse<T>>());
+            var utf8 = MemoryMarshal.CreateReadOnlySpanFromNullTerminated((byte*)pointer);
+            var response = JsonSerializer.Deserialize(utf8, JsonInfo<NativeResponse<T>>());
             if (response is null) throw new VaultException("internal");
             if (!response.Ok)
             {
@@ -292,33 +292,25 @@ internal static partial class RustCore
         }
     }
 
-    private static IntPtr AllocateUtf8(string value, out int byteLength)
+    private static unsafe IntPtr AllocateUtf8(string value, out int byteLength)
     {
-        var bytes = Encoding.UTF8.GetBytes(value);
-        byteLength = bytes.Length;
-        var pointer = IntPtr.Zero;
+        byteLength = Encoding.UTF8.GetByteCount(value);
+        var pointer = Marshal.AllocHGlobal(byteLength + 1);
         try
         {
-            pointer = Marshal.AllocHGlobal(byteLength + 1);
-            Marshal.Copy(bytes, 0, pointer, byteLength);
-            Marshal.WriteByte(pointer, byteLength, 0);
+            var destination = new Span<byte>((void*)pointer, byteLength + 1);
+            var written = Encoding.UTF8.GetBytes(value.AsSpan(), destination);
+            destination[written] = 0;
             return pointer;
         }
         catch
         {
-            if (pointer != IntPtr.Zero)
-            {
-                Marshal.FreeHGlobal(pointer);
-            }
+            ZeroAndFree(pointer, byteLength);
             throw;
-        }
-        finally
-        {
-            CryptographicOperations.ZeroMemory(bytes);
         }
     }
 
-    private static void ZeroAndFree(IntPtr pointer, int byteLength)
+    private static unsafe void ZeroAndFree(IntPtr pointer, int byteLength)
     {
         if (pointer == IntPtr.Zero)
         {
@@ -327,10 +319,7 @@ internal static partial class RustCore
 
         try
         {
-            for (var index = 0; index <= byteLength; index++)
-            {
-                Marshal.WriteByte(pointer, index, 0);
-            }
+            CryptographicOperations.ZeroMemory(new Span<byte>((void*)pointer, byteLength + 1));
         }
         finally
         {

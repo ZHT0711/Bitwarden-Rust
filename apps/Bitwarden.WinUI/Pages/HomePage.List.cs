@@ -40,15 +40,26 @@ public sealed partial class HomePage
         SortFeedback.Text = DesktopPreferences.TrySaveVaultSort((int)_sort) ? string.Empty : "本次排序已应用，但无法保存到本机。";
         SortFeedback.Visibility = SortFeedback.Text.Length == 0 ? Visibility.Collapsed : Visibility.Visible;
         _orderedSource = null;
+        ResetFilterCache();
         ApplyFilters();
     }
 
-    private void UpdateListItems(VaultItem[] items)
+    private bool UpdateListItems(VaultItem[] items)
     {
         // A no-op search must not clear selection or trigger another reprompt / detail decryption.
         var previous = VaultList.ItemsSource as VaultItem[];
-        if (VaultQuery.SameProjection(previous, items)) return;
-        var selected = VaultList.SelectedItems.OfType<VaultItem>().ToArray();
+        if (VaultQuery.SameProjection(previous, items)) return false;
+
+        VaultItem[] selected;
+        if (_selectingItems)
+        {
+            selected = VaultList.SelectedItems.Count == 0 ? [] : VaultList.SelectedItems.OfType<VaultItem>().ToArray();
+        }
+        else
+        {
+            selected = VaultList.SelectedItem is VaultItem current ? [current] : [];
+        }
+
         var retained = VaultQuery.RetainSelection(selected, items);
         _updatingList = true;
         try
@@ -63,11 +74,21 @@ public sealed partial class HomePage
         {
             CancelOperation();
             _version++;
+            ClearDetailInputs(DetailPanel);
             DetailPanel.Children.Clear();
             SetBusy(false);
         }
         UpdateListLayout();
+        return true;
     }
+
+    private void FolderChoiceLabel_Loaded(object sender, RoutedEventArgs e)
+    {
+        if (sender is FrameworkElement label) Controls.FolderPicker.SetContainerIdentity(label);
+    }
+
+    private void FolderChoiceLabel_DataContextChanged(FrameworkElement sender, DataContextChangedEventArgs e) =>
+        Controls.FolderPicker.SetContainerIdentity(sender);
 
     private void ListPane_SizeChanged(object sender, SizeChangedEventArgs e)
     {
@@ -78,6 +99,10 @@ public sealed partial class HomePage
 
     private void VaultLayout_SizeChanged(object sender, SizeChangedEventArgs e)
     {
+        // Bound the header, not the virtualized item list. All filters/ancestors remain
+        // reachable by scrolling, even when their desired height exceeds the window.
+        VaultHeaderScroll.MaxHeight = Math.Max(0, e.NewSize.Height - VaultLayout.Padding.Top -
+            VaultLayout.Padding.Bottom - VaultLayout.RowSpacing - 96);
         _compactList = e.NewSize.Width < 720;
         VisualStateManager.GoToState(this, _compactList ? "CompactVault" : "WideVault", false);
         UpdateListLayout();

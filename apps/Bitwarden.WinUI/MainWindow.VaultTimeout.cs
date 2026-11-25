@@ -83,12 +83,19 @@ public sealed partial class MainWindow
     private void RecordVaultActivity()
     {
         if (ActiveAccount is { State: VaultSessionState.Unlocked } account &&
-            _accountActivity.TryGetValue(account.Id, out var activity)) RecordActivity(activity);
+            _accountActivity.TryGetValue(account.Id, out var activity))
+        {
+            var now = Environment.TickCount64;
+            if (now - activity.LastActivity < 1000) return;
+            RecordActivity(activity, now);
+        }
     }
 
-    private static void RecordActivity(VaultActivity activity)
+    private static void RecordActivity(VaultActivity activity) => RecordActivity(activity, Environment.TickCount64);
+
+    private static void RecordActivity(VaultActivity activity, long now)
     {
-        activity.LastActivity = Environment.TickCount64;
+        activity.LastActivity = now;
         if (WindowsVaultEvents.TryGetLastInput(out var input)) activity.LastWindowsInput = input;
     }
 

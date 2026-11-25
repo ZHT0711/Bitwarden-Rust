@@ -8,12 +8,12 @@
     xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
     mc:Ignorable="d">
 
-    <Grid Padding="24,8,24,24" RowSpacing="18">
+    <Grid Padding="20,10,20,16" RowSpacing="12">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
         </Grid.RowDefinitions>
-        <TextBlock Style="{StaticResource TitleTextBlockStyle}" Text="关于 Bitwarden Rust" />
+        <TextBlock Style="{StaticResource SubtitleTextBlockStyle}" Text="关于 Bitwarden Rust" />
         <StackPanel Grid.Row="1" Spacing="8">
             <TextBlock Text="WinUI 3 桌面客户端原型" />
             <TextBlock Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="目标对照版本：Bitwarden Desktop 2026.11.0；本机安装版本：2026.10.4.0。" />

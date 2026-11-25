@@ -44,6 +44,14 @@ pub extern "C" fn bw_passkey_register() -> *mut c_char {
     .unwrap_or_else(|_| vault_error("internal"))
 }
 #[no_mangle]
+pub extern "C" fn bw_passkey_has_pending() -> u8 {
+    catch_unwind(AssertUnwindSafe(|| {
+        u8::from(passkey_provider::pending().is_some())
+    }))
+    .unwrap_or(0)
+}
+
+#[no_mangle]
 pub extern "C" fn bw_passkey_pending() -> *mut c_char {
     catch_unwind(AssertUnwindSafe(|| {
         let Some(request) = passkey_provider::pending() else {

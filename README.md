@@ -17,7 +17,7 @@
 - 右上角的账户菜单可添加及切换最多 5 个账户。自托管和官方 US／EU 支持并存，每个账户单独保存会话、保险库缓存、锁定状态及超时设置。同一进程中切换到已同步的账户可以立即读取本机缓存。
 - 通过 SDK API 同步保险库、初始化组织密钥并解密个人 / 组织条目。保险库服务端密文在进程内存中缓存，并在 Windows 上写入当前用户 DPAPI 保护的本机快照；跨重启恢复时账户保持锁定。选择「解锁并同步」只需输一次主密码；若服务器要求二步验证，在同一对话框继续。也可选择「仅离线解锁」或已启用的 Windows Hello 读取本机缓存，不连接服务器；同步成功前，缓存条目不可编辑。界面列表接收显示元数据，选中条目才解密详情。
 - 分类、收藏、回收站、归档、文件夹筛选与详情读取。名称 / 副标题支持多词同时匹配和双引号短语搜索；可按名称升降序或修改时间新旧排序，排序偏好跨重启保留。搜索只使用显示元数据，不读取密码或隐藏字段；官方完整高级搜索语法仍未实现。读取覆盖 SDK 中的登录、安全笔记、银行卡、身份信息、SSH 密钥、银行账户、驾驶执照和护照八种类型。
-- 窄窗口自动收起导航，保险库采用单栏列表 / 详情并可返回列表。Ctrl+F 搜索、Ctrl+N 新建、Ctrl+E 编辑、Ctrl+R 同步、Ctrl+L 锁定，沿用当前账户权限与主密码复验。设置可选择跟随 Windows、浅色或深色主题。
+- 窄窗口自动收起导航，保险库采用单栏列表 / 详情并可返回列表；短窗口顶部筛选与文件夹导航可独立滚动，为条目和空状态保留空间。Ctrl+F 搜索、Ctrl+N 新建、Ctrl+E 编辑、Ctrl+R 同步、Ctrl+L 锁定，沿用当前账户权限与主密码复验。设置可选择跟随 Windows、浅色或深色主题。
 - “我的文件夹”按 `/` 路径展示真实层级，支持完整名称搜索、近期面包屑 / 早期真实祖先菜单与子文件夹入口、包含子文件夹的条目计数，以及新建、重命名、单个或批量删除。超深路径只渲染最后 8 个真实节点，省略的实际祖先仍可按原 ID 导航；长名称仅缩略可视标签，原名、ID 和精确条目归属不变。缺失的父路径不会生成虚拟文件夹。重命名或删除父文件夹不会级联改动未选中的子文件夹；删除只将所删文件夹的条目移至“无文件夹”，不删除条目。离线只读缓存仍可浏览。缺少批量接口的自托管服务器可逐个删除，若中途失败则先同步核对。
 - Rust 端执行主密码复验和隐藏密码权限；详情 DTO 显式排除保险库密钥和 FIDO2 私密材料，损坏条目单独计数。
 - 登录、银行卡和身份信息详情支持 27 种关联自定义字段。关联值随源字段编辑更新，敏感目标沿用默认遮挡和组织权限，受主密码复验保护的条目在验证后才显示。搜索仍只使用列表显示元数据。
@@ -42,7 +42,7 @@
 
 ## 构建与验证
 
-需要 Rust stable、.NET 10 SDK、MSVC x64 工具、Windows SDK；界面验证使用 `winapp` CLI。先检查现有工具，只安装缺少的组件：
+需要 Rust stable、.NET 10 SDK、MSVC x64 工具、Windows SDK；界面验证使用 `winapp` CLI，合成服务器验收另需 Python 3.10+。先检查现有工具，只安装缺少的组件：
 
 ```powershell
 rustc --version
@@ -66,7 +66,7 @@ winapp run apps/Bitwarden.WinUI/Bitwarden.WinUI.csproj --no-build -p Platform=x6
 
 GitHub Actions 执行 Rust 格式 / 测试 / Clippy、C# 筛选及实际 DLL 互操作检查，并构建未签名 x64 MSIX 开发包。未签名包不能直接作为正式签名安装包分发。
 
-可重复的生成器、大库写入投影、列表元数据搜索、文件夹索引与实际文件夹 UI / 进程资源测量见 [性能测量](docs/PERFORMANCE.md)。文件夹索引避免超长缺失父路径的逐级前缀切片；另以最新 MSIX 独立验证万级平面 / 分支、千层真实链及 8,192 段缺失路径，共 82 项具名压力检查。UIA 端到端耗时和真实进程内存按各自范围记录，不等同于帧率、长期常驻、10,000 条目 UI 或真实服务验收。
+可重复的生成器、大库写入投影、列表元数据搜索、文件夹索引与实际文件夹 UI / 进程资源测量见 [性能测量](docs/PERFORMANCE.md)。文件夹索引避免超长缺失父路径的逐级前缀切片；另以最新 MSIX 独立验证万级平面 / 分支、千层真实链及 8,192 段缺失路径，共 110 项具名压力检查（包含编辑 / 移动下拉和短窗口正文 / 锁定动作）。UIA 端到端耗时和真实进程内存按各自范围记录，不等同于帧率、长期常驻、10,000 条目 UI 或真实服务验收。
 
 构建最新 Release MSIX 并生成公开合成 fixture 后，可运行以下列表、嵌套文件夹、快捷键、主题和剪贴板验收：
 
@@ -80,7 +80,7 @@ dotnet build apps/Bitwarden.WinUI/Bitwarden.WinUI.csproj -c Release -p:Platform=
 ./scripts/verify-vault-list-ui.ps1 -Fixture 'work/list-fixture-current.json' -IncludeFolders -IncludeClipboardStress
 ```
 
-脚本从 MSIX 解包，不依赖可能陈旧的 `AppX` 布局；使用独立临时测试包并在结束时移除，期间会占用测试窗口焦点并写入合成剪贴板内容。它不验证云端、真实账户或系统扩展。`-IncludeFolders` 增加三层文件夹、条目归属、非级联修改与重启后离线浏览；`-IncludeClipboardStress` 再验证长占用、新复制、锁定、正常 / 托盘退出和五秒退出预算，额外花费几分钟。两个开关均省略时只运行原有列表验收。每轮记录实际包与 fixture 的 SHA-256，并把有名称的检查写入独立 `checks.log`。
+脚本从 MSIX 解包，不依赖可能陈旧的 `AppX` 布局；使用独立临时测试包并在结束时移除，期间会占用测试窗口焦点并写入合成剪贴板内容。它不验证云端、真实账户或系统扩展。`-IncludeFolders` 增加三层文件夹、条目归属、非级联修改与重启后离线浏览；`-IncludeClipboardStress` 再验证长占用、新复制、锁定、正常 / 托盘退出和五秒退出预算，额外花费几分钟。两个开关均省略时只运行原有列表验收。每轮记录实际包与 fixture 的 SHA-256，并把有名称的检查写入独立 `checks.log`。若 `python` 指向未激活的 Windows Store 执行别名，可传 `-PythonExe '实际 Python 可执行文件完整路径'`；脚本在创建测试包前验证解释器，不需要修改全局 PATH。
 
 文件夹压力模式独立运行，不与 `-IncludeFolders` / `-IncludeClipboardStress` 混用；先按 [性能记录](docs/PERFORMANCE.md#2026-11-23-实际万级文件夹与千层路径-winui-验收) 生成四种 SDK 合成密文 fixture，再运行：
 
@@ -89,6 +89,14 @@ dotnet build apps/Bitwarden.WinUI/Bitwarden.WinUI.csproj -c Release -p:Platform=
 ```
 
 该模式还验证草稿默认文件夹、早期真实祖先菜单与锁定，记录 UIA / CLI 合并时间和实际测试进程内存；不读取真实账户，不运行剪贴板步骤。
+
+条目压力模式也独立运行：按 [性能记录](docs/PERFORMANCE.md#2026-11-25-万条条目输入与筛选分配) 生成 **10,000 个真实 SDK 密文条目** fixture，再执行：
+
+```powershell
+./scripts/verify-vault-list-ui.ps1 -Fixture 'work/vault-scale-10000.json' -MeasureVault -VaultIdleSeconds 30 -VaultRunLabel optimized
+```
+
+此模式以实际 MSIX、持久化直接 UIA / 原生 Unicode 输入探针检查全量加载、搜索、末项可达、复验和锁定；只允许合成测试身份，切换到其它应用会停止输入。记录前台解锁 / 锁定的短期 CPU 与内存。输入到 UIA 就绪不是物理 IME 或帧时间，30 秒空闲不是长期稳定性；慢速输入的 CPU 代价仍需优化。不与文件夹、关联字段或剪贴板模式混用。
 
 关联字段使用独立的六条目合成 fixture。构建 Release DLL 和 MSIX 后，从仓库根目录运行：
 
@@ -100,6 +108,8 @@ Remove-Item Env:BITWARDEN_FIXTURE_OUTPUT
 ./scripts/verify-linked-fields-native.ps1
 ./scripts/verify-vault-list-ui.ps1 -Fixture 'work/linked-fields-fixture.json' -CheckLinkedFields
 ```
+
+两个关联字段验收脚本同样支持 `-PythonExe '完整的 Python 可执行文件路径'`，并在启动服务器 / 创建本机缓存之前拒绝失效或低于 3.10 的解释器。
 
 以下原生事务检查也会写入本机合成剪贴板内容，不读取预先存在的剪贴板，不需账户 / 服务器，仅用于 Windows 本机专项验收：
 

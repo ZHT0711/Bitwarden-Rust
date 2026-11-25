@@ -139,9 +139,24 @@ public sealed record FolderRow(string Id, string Name, string DisplayName, int I
 // WinUI owns container realization; UIA traversal can still request additional containers.
 public sealed record FolderChoice(string Id, string Name)
 {
+    public string AutomationId => $"FolderChoice_{Id}";
     public string DisplayName => string.IsNullOrWhiteSpace(Name) ? "—" : Name;
     public string DisplayText => FolderDisplay.Compact(DisplayName);
     public override string ToString() => DisplayName;
+
+    // Keep server order/IDs and a missing saved assignment without allocating any UI containers.
+    internal static FolderChoice[] ForEditor(VaultFolder[] folders, string? selectedId = null)
+    {
+        var choices = new List<FolderChoice>(folders.Length + 2) { new(string.Empty, "无文件夹") };
+        var found = string.IsNullOrEmpty(selectedId);
+        foreach (var folder in folders)
+        {
+            choices.Add(new(folder.Id, folder.Name));
+            found |= string.Equals(folder.Id, selectedId, StringComparison.Ordinal);
+        }
+        if (!found) choices.Add(new(selectedId!, "原文件夹（尚未加载）"));
+        return choices.ToArray();
+    }
 }
 
 public sealed record FolderCrumb(string? Id, string Name)

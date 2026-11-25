@@ -1,11 +1,17 @@
 param(
     [string]$Library = 'target/release/bitwarden_core.dll',
-    [string]$Fixture = 'work/linked-fields-fixture.json'
+    [string]$Fixture = 'work/linked-fields-fixture.json',
+    [string]$PythonExe = 'python'
 )
 
 # Public SDK fixture only. The host removes the isolated cache after the native process exits,
 # because the Rust cache's exclusive writer lock deliberately lasts for the process lifetime.
 $ErrorActionPreference = 'Stop'
+$pythonPath = (Get-Command $PythonExe -CommandType Application -ErrorAction Stop).Source
+$probe = & $pythonPath -c 'import sys; print("bitwarden-fixture-python3" if sys.version_info >= (3, 10) else "unsupported")' | Out-String
+if ($LASTEXITCODE -ne 0 -or $probe.Trim() -ne 'bitwarden-fixture-python3') {
+    throw 'A working Python 3.10+ interpreter is required. Pass -PythonExe with its full path; a Windows Store execution alias alone is not enough.'
+}
 $root = Split-Path $PSScriptRoot -Parent
 $libraryPath = (Resolve-Path (Join-Path $root $Library)).Path
 $fixturePath = (Resolve-Path (Join-Path $root $Fixture)).Path
@@ -21,7 +27,7 @@ $baseUrl = $null
 $log = Join-Path $run 'checks.log'
 try {
     $portFile = Join-Path $run 'port'
-    $server = Start-Process -FilePath (Get-Command python -CommandType Application | Select-Object -First 1).Source -ArgumentList @(
+    $server = Start-Process -FilePath $pythonPath -ArgumentList @(
         '-u', 'tests/fixture_server.py', '--fixture', ('"' + $fixturePath + '"'),
         '--port-file', ('"' + $portFile + '"'), '--peer'
     ) -WorkingDirectory $root -PassThru -WindowStyle Hidden -RedirectStandardOutput (Join-Path $run 'server.out') -RedirectStandardError (Join-Path $run 'server.err')
@@ -38,6 +44,7 @@ try {
     } while ([DateTime]::UtcNow -lt $deadline)
     if ($health.fixture -ne $true) { throw 'Linked fixture never became ready.' }
     [ordered]@{
+        pythonExecutable = $pythonPath
         dllSha256 = (Get-FileHash -LiteralPath $libraryPath).Hash
         fixtureSha256 = (Get-FileHash -LiteralPath $fixturePath).Hash
         testSourceSha256 = (Get-FileHash (Join-Path $root 'tests/Bitwarden.Interop.Tests/NativeLinkedFieldChecks.cs')).Hash

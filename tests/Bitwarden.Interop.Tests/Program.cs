@@ -44,6 +44,7 @@ void Check(bool result, string name)
 VaultTimeoutChecks.Run(Check);
 GeneratorSettingsChecks.Run(Check);
 VaultQueryChecks.Run(Check);
+SearchDispatchChecks.Run(Check);
 FolderHierarchyChecks.Run(Check);
 ClipboardClearChecks.Run(Check);
 PasskeyChecks.Run(Check);
@@ -65,6 +66,15 @@ Check(VaultQuery.Apply(mixed, "vault", "", "").Length == 7, "no-folder filter");
 Check(VaultQuery.Apply(mixed, "vault", "*", " TYPE 3 ").Single().Id == "3", "search trims whitespace and ignores case");
 Check(VaultQuery.Apply(mixed, "vault", "*", "EXAMPLE.INVALID").Length == 8, "search includes displayed usernames");
 Check(VaultQuery.Apply(mixed, "vault", "*", "no match").Length == 0, "unmatched search is empty");
+Check(VaultAccount.FormatCompactServer("https://vault.example.com") == "vault.example.com", "compact server label strips default HTTPS scheme");
+Check(VaultAccount.FormatCompactServer("http://127.0.0.1:56781") == "127.0.0.1:56781", "compact server label preserves explicit custom port");
+Check(VaultAccount.FormatCompactServer("https://bitwarden-vault-prod-east.internal.very-long-company-domain.example.com:8443/subpath/extra").Length <= 36,
+    "long self-hosted server URL is bounded cleanly for header display");
+var longAccount = new VaultAccount("id", "user@example.invalid", 2,
+    "https://bitwarden-vault-prod-east.internal.very-long-company-domain.example.com:8443/subpath/extra",
+    VaultSessionState.Unlocked, true);
+Check(longAccount.ServerLabel == longAccount.ServerUrl && longAccount.CompactServerLabel.EndsWith("…", StringComparison.Ordinal),
+    "account keeps full self-hosted URL for accessibility and tooltips while compacting visual badge");
 
 if (args is ["--linked-fields", _, _, _])
 {
@@ -86,6 +96,7 @@ if (args.Length > 0)
     var libraryPath = Path.GetFullPath(args[0]);
     UseNativeLibrary(libraryPath);
     Check(RustCore.Version == "0.2.0", "managed interop loads current native core");
+    Check(!RustCore.HasPendingPasskey(), "idle native core reports no pending passkey without JSON allocation");
     Check(RustCore.GeneratePassword(24, true, true, true, true, false, 2, 2).Length == 24, "password generator ABI");
     Check(RustCore.IsValidServer(2, "http://127.0.0.1:23456"), "loopback server validation ABI");
     Check(!RustCore.IsValidServer(2, "http://example.invalid"), "insecure remote server is rejected");

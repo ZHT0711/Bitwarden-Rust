@@ -6,14 +6,14 @@
     xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
     xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
     mc:Ignorable="d">
-    <Grid Padding="24,8,24,24" RowSpacing="18">
+    <Grid Padding="20,10,20,16" RowSpacing="12">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
         </Grid.RowDefinitions>
-        <StackPanel Spacing="4">
-            <TextBlock Style="{StaticResource TitleTextBlockStyle}" Text="设置" />
-            <TextBlock Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="应用偏好与安全选项。" />
+        <StackPanel Orientation="Horizontal" Spacing="10" VerticalAlignment="Center">
+            <TextBlock Style="{StaticResource SubtitleTextBlockStyle}" Text="设置" VerticalAlignment="Center" />
+            <TextBlock Style="{StaticResource CaptionTextBlockStyle}" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="应用偏好与安全选项。" VerticalAlignment="Center" Margin="0,2,0,0" />
         </StackPanel>
         <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
         <StackPanel MaxWidth="720" Spacing="16">

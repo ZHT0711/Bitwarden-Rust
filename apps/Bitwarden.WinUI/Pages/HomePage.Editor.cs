@@ -82,11 +82,15 @@ public sealed partial class HomePage
             return;
         }
 
-        var folders = new ComboBox { Header = "目标文件夹", MinWidth = 240 };
-        folders.Items.Add(new ComboBoxItem { Content = "无文件夹" });
-        foreach (var folder in _overview.Folders)
-            folders.Items.Add(new ComboBoxItem { Content = folder.Name, Tag = folder.Id });
-        folders.SelectedIndex = 0;
+        var folders = new ComboBox
+        {
+            Header = "目标文件夹", MinWidth = 240, MaxWidth = 480,
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            ItemTemplate = FolderFilter.ItemTemplate,
+            ItemsSource = FolderChoice.ForEditor(_overview.Folders),
+            SelectedIndex = 0,
+        };
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(folders, "VaultMoveFolder");
         var dialog = _actionDialog = new ContentDialog
         {
             XamlRoot = XamlRoot,
@@ -107,8 +111,8 @@ public sealed partial class HomePage
         try
         {
             if (await dialog.ShowAsync() != ContentDialogResult.Primary || !IsCurrent(version, token)) return;
-            var target = (folders.SelectedItem as ComboBoxItem)?.Tag as string;
-            folders.Items.Clear();
+            var target = (folders.SelectedItem as FolderChoice)?.Id is { Length: > 0 } folder ? folder : null;
+            folders.ItemsSource = null;
             _actionDialog = null;
             var ids = items.Select(item => item.Id).ToArray();
             var result = await Task.Run(() => RustCore.MoveVaultItems(ids, target, token), token);
@@ -132,7 +136,7 @@ public sealed partial class HomePage
         }
         finally
         {
-            folders.Items.Clear();
+            folders.ItemsSource = null;
             if (ReferenceEquals(_actionDialog, dialog)) _actionDialog = null;
             if (ReferenceEquals(_operation, operation)) _operation = null;
             if (version == _version)
@@ -180,7 +184,7 @@ public sealed partial class HomePage
                 if (!_loaded || version != _version) return;
                 if (!data.CanEdit || data.IsDeleted) throw new VaultException(data.EditBlockedReason ?? "permissionDenied");
             }
-            _activeEditor = VaultEditorDialog.Create(XamlRoot, data, _overview.Folders, async (draft, requestToken) =>
+            _activeEditor = VaultEditorDialog.Create(XamlRoot, data, _overview.Folders, FolderFilter.ItemTemplate, async (draft, requestToken) =>
             {
                 try
                 {

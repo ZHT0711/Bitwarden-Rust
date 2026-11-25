@@ -41,7 +41,7 @@ internal sealed class VaultEditorDialog
     private int _activeType;
     private VaultMutationResult? _result;
 
-    private VaultEditorDialog(XamlRoot root, VaultEditorData data, VaultFolder[] folders,
+    private VaultEditorDialog(XamlRoot root, VaultEditorData data, VaultFolder[] folders, DataTemplate folderTemplate,
         Func<VaultEditorData, CancellationToken, Task<VaultMutationResult>> save, Action onWriteCancellation)
     {
         _original = data;
@@ -70,11 +70,10 @@ internal sealed class VaultEditorDialog
         _notes.Text = data.Notes ?? string.Empty;
         _favorite.IsChecked = data.Favorite;
         _reprompt.IsChecked = data.Reprompt;
-        _folder.Items.Add(new ComboBoxItem { Content = "无文件夹", Tag = string.Empty });
-        foreach (var folder in folders) _folder.Items.Add(new ComboBoxItem { Content = folder.Name, Tag = folder.Id });
-        if (data.FolderId is not null && !folders.Any(folder => folder.Id == data.FolderId))
-            _folder.Items.Add(new ComboBoxItem { Content = "原文件夹（尚未加载）", Tag = data.FolderId });
-        _folder.SelectedItem = _folder.Items.OfType<ComboBoxItem>().FirstOrDefault(item => Equals(item.Tag, data.FolderId ?? string.Empty));
+        var folderChoices = FolderChoice.ForEditor(folders, data.FolderId);
+        _folder.ItemTemplate = folderTemplate;
+        _folder.ItemsSource = folderChoices;
+        _folder.SelectedItem = folderChoices.First(choice => choice.Id == (data.FolderId ?? string.Empty));
 
         _form.Children.Add(_notice);
         if (data.Id is null) _form.Children.Add(new TextBlock { Text = "新条目将创建在个人保险库。", TextWrapping = TextWrapping.Wrap });
@@ -128,8 +127,8 @@ internal sealed class VaultEditorDialog
         _dialog.Closing += (_, args) => { if (_busy && !_aborted) { args.Cancel = true; CancelWrite(); } };
     }
 
-    internal static VaultEditorDialog Create(XamlRoot root, VaultEditorData data, VaultFolder[] folders,
-        Func<VaultEditorData, CancellationToken, Task<VaultMutationResult>> save, Action onWriteCancellation) => new(root, data, folders, save, onWriteCancellation);
+    internal static VaultEditorDialog Create(XamlRoot root, VaultEditorData data, VaultFolder[] folders, DataTemplate folderTemplate,
+        Func<VaultEditorData, CancellationToken, Task<VaultMutationResult>> save, Action onWriteCancellation) => new(root, data, folders, folderTemplate, save, onWriteCancellation);
 
     internal async Task<VaultMutationResult?> ShowAsync(CancellationToken cancellationToken)
     {
@@ -147,6 +146,7 @@ internal sealed class VaultEditorDialog
             _request?.Dispose();
             _request = null;
             _name.Text = _notes.Text = string.Empty;
+            _folder.ItemsSource = null;
             foreach (var input in _inputs.Values) input.Clear();
             foreach (var uri in _uris) uri.Clear();
             foreach (var field in _custom) field.Clear();
@@ -173,7 +173,7 @@ internal sealed class VaultEditorDialog
         {
             draft = _original with
             {
-                Name = _name.Text, ItemType = _activeType, FolderId = (_folder.SelectedItem as ComboBoxItem)?.Tag is string folder && folder.Length > 0 ? folder : null,
+                Name = _name.Text, ItemType = _activeType, FolderId = (_folder.SelectedItem as FolderChoice)?.Id is { Length: > 0 } folder ? folder : null,
                 Favorite = _favorite.IsChecked == true, Reprompt = _reprompt.IsChecked == true, Notes = _original.Notes is null && _notes.Text.Length == 0 ? null : _notes.Text,
                 Values = ReadValues(), Uris = _activeType == 1 ? _uris.Select(row => row.Read()).ToArray() : [],
                 CustomFields = _custom.Select(row => row.Read()).ToArray(),

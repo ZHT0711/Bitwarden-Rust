@@ -24,6 +24,8 @@ internal static partial class RustCore
     private static extern IntPtr PasskeyStateNative();
     [DllImport(LibraryName, EntryPoint = "bw_passkey_sync_metadata", CallingConvention = CallingConvention.Cdecl)]
     private static extern IntPtr PasskeySyncMetadataNative();
+    [DllImport(LibraryName, EntryPoint = "bw_passkey_has_pending", CallingConvention = CallingConvention.Cdecl)]
+    private static extern byte PasskeyHasPendingNative();
     [DllImport(LibraryName, EntryPoint = "bw_passkey_pending", CallingConvention = CallingConvention.Cdecl)]
     private static extern IntPtr PasskeyPendingNative();
     [DllImport(LibraryName, EntryPoint = "bw_passkey_respond", CallingConvention = CallingConvention.Cdecl)]
@@ -39,6 +41,7 @@ internal static partial class RustCore
     internal static void RegisterPasskeys() => ReadJson<bool>(PasskeyRegisterNative());
     internal static string PasskeyState() => ReadJson<string>(PasskeyStateNative());
     internal static bool SyncPasskeyMetadata() => ReadJson<bool>(PasskeySyncMetadataNative());
+    internal static bool HasPendingPasskey() => PasskeyHasPendingNative() != 0;
     internal static PasskeyPending PendingPasskey() => ReadJson<PasskeyPending>(PasskeyPendingNative());
     internal static bool IsPasskeyActive(string id)
     {

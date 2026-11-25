@@ -94,6 +94,29 @@ function InvokeFolderUiChecks {
 
     NavigateFolderTest 'VaultNavigationItem'
     [void](WaitUi 'VaultList')
+    foreach ($targetFolder in '工作/项目/验证', '无文件夹') {
+        Click 'Synthetic login' 'ListItem'
+        [void](WaitUi '修改时间')
+        Click 'MoreButton'
+        [void](WinApp @('ui', 'invoke', 'MoveItemsButton', '-a', [string]$previewId, '--type', 'Button'))
+        [void](WaitUi 'VaultMoveFolder')
+        Check ((WaitValue 'VaultMoveFolder' '无文件夹') -eq '无文件夹') "move picker starts with the unfiled sentinel before moving to $targetFolder"
+        Click 'VaultMoveFolder'
+        PopupFolderTest $targetFolder
+        Check ((WaitValue 'VaultMoveFolder' $targetFolder) -eq $targetFolder) "move picker selects the exact folder label for $targetFolder"
+        Click 'PrimaryButton'
+        [void](WaitUi '已移动 1 个条目')
+        Click 'FolderFilter'
+        PopupFolderTest $targetFolder
+        $moved = WaitUi 'ListItem "Synthetic login"'
+        $expectedCount = if ($targetFolder -eq '无文件夹') { '2 个条目' } else { '1 个条目' }
+        $protectedPresent = $moved -match 'ListItem "Synthetic protected item"'
+        Check ($moved.Contains($expectedCount) -and $protectedPresent -eq ($targetFolder -eq '无文件夹')) `
+            "confirmed move to $targetFolder updates only the selected item's exact folder membership"
+        Click 'FolderFilter'
+        PopupFolderTest '所有文件夹'
+        [void](WaitUi '2 个条目')
+    }
     Click 'Synthetic login' 'ListItem'
     [void](WaitUi '修改时间')
     Keys 'ctrl+e'
