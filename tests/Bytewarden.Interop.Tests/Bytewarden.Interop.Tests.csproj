@@ -15,6 +15,8 @@
     <Compile Include="../../apps/Bytewarden.WinUI/Interop/RustCore.Attachments.cs" Link="RustCore.Attachments.cs" />
     <Compile Include="../../apps/Bytewarden.WinUI/Interop/RustCore.Accounts.cs" Link="RustCore.Accounts.cs" />
     <Compile Include="../../apps/Bytewarden.WinUI/Interop/RustCore.Hello.cs" Link="RustCore.Hello.cs" />
+    <Compile Include="../../apps/Bytewarden.WinUI/Interop/RustCore.Pin.cs" Link="RustCore.Pin.cs" />
+    <Compile Include="../../apps/Bytewarden.WinUI/Interop/RustCore.Extensions.cs" Link="RustCore.Extensions.cs" />
     <Compile Include="../../apps/Bytewarden.WinUI/Interop/RustCore.Sends.cs" Link="RustCore.Sends.cs" />
     <Compile Include="../../apps/Bytewarden.WinUI/Interop/RustCore.Export.cs" Link="RustCore.Export.cs" />
     <Compile Include="../../apps/Bytewarden.WinUI/Interop/AccountSettingsScope.cs" Link="AccountSettingsScope.cs" />

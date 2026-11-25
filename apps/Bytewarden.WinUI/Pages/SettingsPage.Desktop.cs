@@ -11,16 +11,21 @@ public sealed partial class SettingsPage
     private bool _updatingDesktopOptions = true;
     private bool _updatingStartup;
     internal Action<int>? ApplyTheme { get; set; }
+    internal Action<bool>? ApplyPreventScreenshots { get; set; }
 
     private void InitializeDesktopOptions()
     {
         KeepInTrayToggle.IsOn = DesktopPreferences.Read(DesktopPreferences.KeepInTray);
         StartHiddenToggle.IsOn = DesktopPreferences.Read(DesktopPreferences.StartHidden);
+        MinimizeToTrayToggle.IsOn = DesktopPreferences.Read(DesktopPreferences.MinimizeToTray, fallback: false);
         ThemeChoice.SelectedIndex = DesktopPreferences.ReadTheme();
+        QuickCopyActionsToggle.IsOn = DesktopPreferences.Read(DesktopPreferences.ShowQuickCopyActions, fallback: true);
         foreach (var seconds in DesktopPreferences.ClipboardChoices)
             ClipboardDelayChoice.Items.Add(new ComboBoxItem { Content = seconds == 0 ? "不定时清除" : $"{seconds} 秒", Tag = seconds });
         SelectSavedClipboardDelay();
         MinimizeOnCopyToggle.IsOn = DesktopPreferences.Read(DesktopPreferences.MinimizeOnCopy, fallback: false);
+        PreventScreenshotsToggle.IsOn = DesktopPreferences.Read(DesktopPreferences.PreventScreenshots, fallback: false);
+        AutoPromptHelloToggle.IsOn = DesktopPreferences.Read(DesktopPreferences.AutoPromptHello, fallback: false);
         _updatingDesktopOptions = false;
         Loaded += async (_, _) => await RefreshStartupAsync();
     }
@@ -68,6 +73,43 @@ public sealed partial class SettingsPage
         ClipboardStatus.Text = "无法保存复制后最小化选项。";
     }
 
+    private void QuickCopyActions_Toggled(object sender, RoutedEventArgs e)
+    {
+        if (_updatingDesktopOptions) return;
+        if (DesktopPreferences.TrySave(DesktopPreferences.ShowQuickCopyActions, QuickCopyActionsToggle.IsOn))
+        { ThemeStatus.Text = string.Empty; return; }
+        _updatingDesktopOptions = true;
+        QuickCopyActionsToggle.IsOn = DesktopPreferences.Read(DesktopPreferences.ShowQuickCopyActions, fallback: true);
+        _updatingDesktopOptions = false;
+        ThemeStatus.Text = "无法保存快捷复制选项。";
+    }
+
+    private void PreventScreenshots_Toggled(object sender, RoutedEventArgs e)
+    {
+        if (_updatingDesktopOptions) return;
+        var enabled = PreventScreenshotsToggle.IsOn;
+        if (DesktopPreferences.TrySave(DesktopPreferences.PreventScreenshots, enabled))
+        {
+            ApplyPreventScreenshots?.Invoke(enabled);
+            ClipboardStatus.Text = string.Empty;
+            return;
+        }
+        _updatingDesktopOptions = true;
+        PreventScreenshotsToggle.IsOn = DesktopPreferences.Read(DesktopPreferences.PreventScreenshots, fallback: false);
+        _updatingDesktopOptions = false;
+        ClipboardStatus.Text = "无法保存防截屏选项。";
+    }
+
+    private void AutoPromptHello_Toggled(object sender, RoutedEventArgs e)
+    {
+        if (_updatingDesktopOptions) return;
+        if (DesktopPreferences.TrySave(DesktopPreferences.AutoPromptHello, AutoPromptHelloToggle.IsOn)) return;
+        _updatingDesktopOptions = true;
+        AutoPromptHelloToggle.IsOn = DesktopPreferences.Read(DesktopPreferences.AutoPromptHello, fallback: false);
+        _updatingDesktopOptions = false;
+        HelloUnlockStatus.Text = "无法保存自动弹出 Windows Hello 设置。";
+    }
+
     internal Task RefreshStartupAsync() => UpdateStartupAsync(null);
 
     private async void StartupToggle_Toggled(object sender, RoutedEventArgs e)
@@ -78,10 +120,15 @@ public sealed partial class SettingsPage
     private void DesktopOption_Toggled(object sender, RoutedEventArgs e)
     {
         if (_updatingDesktopOptions || sender is not ToggleSwitch toggle) return;
-        var key = ReferenceEquals(toggle, KeepInTrayToggle) ? DesktopPreferences.KeepInTray : DesktopPreferences.StartHidden;
+        var key = ReferenceEquals(toggle, KeepInTrayToggle)
+            ? DesktopPreferences.KeepInTray
+            : ReferenceEquals(toggle, MinimizeToTrayToggle)
+                ? DesktopPreferences.MinimizeToTray
+                : DesktopPreferences.StartHidden;
+        var fallback = !ReferenceEquals(toggle, MinimizeToTrayToggle);
         if (DesktopPreferences.TrySave(key, toggle.IsOn)) return;
         _updatingDesktopOptions = true;
-        toggle.IsOn = DesktopPreferences.Read(key);
+        toggle.IsOn = DesktopPreferences.Read(key, fallback);
         _updatingDesktopOptions = false;
         StartupStatus.Text = "无法保存本机偏好，请重试。";
     }

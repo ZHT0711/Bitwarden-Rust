@@ -4,7 +4,8 @@ using System.Text.Json;
 namespace Bytewarden.WinUI.Interop;
 
 internal sealed record VaultAccount(string Id, string Email, uint ServerMode, string ServerUrl,
-    VaultSessionState State, bool Active, bool NeedsSignIn = false, bool HelloEnabled = false)
+    VaultSessionState State, bool Active, bool NeedsSignIn = false, bool HelloEnabled = false,
+    bool PinEnabled = false, bool PinPersistent = false)
 {
     internal string ServerLabel => ServerMode switch
     {

@@ -22,10 +22,16 @@
             </CommandBar>
         </Grid>
         <InfoBar x:Name="SendNotice" Grid.Row="1" IsClosable="True" />
-        <Grid Grid.Row="2" ColumnDefinitions="*,Auto" ColumnSpacing="12">
-            <TextBlock x:Name="SendCount" VerticalAlignment="Center"
+        <Grid Grid.Row="2" ColumnDefinitions="Auto,*,Auto" ColumnSpacing="12">
+            <ComboBox x:Name="SendTypeFilter" MinWidth="130" SelectedIndex="0" SelectionChanged="SendTypeFilter_Changed"
+                AutomationProperties.Name="筛选 Send 类型">
+                <ComboBoxItem Content="全部类型" />
+                <ComboBoxItem Content="文本 Send" />
+                <ComboBoxItem Content="文件 Send" />
+            </ComboBox>
+            <TextBlock x:Name="SendCount" Grid.Column="1" VerticalAlignment="Center"
                 Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="0 个 Send" />
-            <ProgressRing x:Name="LoadingRing" Grid.Column="1" Height="24" Width="24" IsActive="False" />
+            <ProgressRing x:Name="LoadingRing" Grid.Column="2" Height="24" Width="24" IsActive="False" />
         </Grid>
         <Border Grid.Row="3" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
             BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1" CornerRadius="8">

@@ -15,11 +15,13 @@ internal sealed partial class TimeoutJsonContext : JsonSerializerContext { }
 internal static partial class RustCore
 {
     private sealed record VaultMoveRequest(string[] Ids, string? FolderId);
+    private sealed record VaultBulkActionRequest(string[] Ids, string Action);
     private sealed record PasskeyResponseRequest(string Id, string ItemId, string Revision, int CredentialIndex);
 
     // Closed response types are deliberate: trimmed builds must never fall back to reflection.
     [JsonSourceGenerationOptions(JsonSerializerDefaults.Web)]
     [JsonSerializable(typeof(NativeResponse<bool>))]
+    [JsonSerializable(typeof(NativeResponse<uint>))]
     [JsonSerializable(typeof(NativeResponse<string>))]
     [JsonSerializable(typeof(NativeResponse<PasskeyPending>))]
     [JsonSerializable(typeof(NativeResponse<VaultAccount[]>))]
@@ -31,12 +33,15 @@ internal static partial class RustCore
     [JsonSerializable(typeof(NativeResponse<SendOverview>))]
     [JsonSerializable(typeof(NativeResponse<SendDetail>))]
     [JsonSerializable(typeof(NativeResponse<VaultExportReport>))]
+    [JsonSerializable(typeof(PasswordHistoryEntry))]
+    [JsonSerializable(typeof(PasswordHistoryEntry[]))]
     [JsonSerializable(typeof(VaultExportRequest))]
     [JsonSerializable(typeof(SendRequest))]
     [JsonSerializable(typeof(VaultEditorData))]
     [JsonSerializable(typeof(VaultAccountTimeout[]))]
     [JsonSerializable(typeof(string[]))]
     [JsonSerializable(typeof(VaultMoveRequest))]
+    [JsonSerializable(typeof(VaultBulkActionRequest))]
     [JsonSerializable(typeof(PasskeyResponseRequest))]
     private sealed partial class NativeJsonContext : JsonSerializerContext { }
 

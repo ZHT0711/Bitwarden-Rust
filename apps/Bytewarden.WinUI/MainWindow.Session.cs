@@ -77,6 +77,7 @@ public sealed partial class MainWindow
         {
             var busy = _signInDialogOpen || _accountTransition;
             settings.ShowHelloUnlock(account, busy);
+            settings.ShowPinUnlock(account, busy);
             settings.ShowVaultExport(account, busy);
         }
         UpdateVaultTimeoutMonitor();
@@ -286,10 +287,19 @@ public sealed partial class MainWindow
         UpdateSessionControls(VaultSessionState.Locked);
 
         var helloAccount = ActiveAccount is { HelloEnabled: true } account ? account.Id : null;
-        var password = new PasswordBox { Header = "主密码", MinWidth = 300 };
+        var pinAccount = ActiveAccount is { PinEnabled: true } pAccount ? pAccount.Id : null;
+        var usePin = pinAccount is not null;
+        var password = new PasswordBox { Header = usePin ? "PIN 码" : "主密码", MinWidth = 300 };
+        var switchModeButton = new HyperlinkButton
+        {
+            Content = usePin ? "改用主密码" : "改用 PIN 码",
+            Visibility = pinAccount is not null ? Visibility.Visible : Visibility.Collapsed,
+            Padding = new Thickness(0),
+        };
         var status = new TextBlock { TextWrapping = TextWrapping.Wrap, MaxWidth = 360 };
         var panel = new StackPanel { Spacing = 8 };
         panel.Children.Add(PasswordVisibility.WithToggle(password));
+        panel.Children.Add(switchModeButton);
         panel.Children.Add(status);
         var dialog = new ContentDialog
         {
@@ -303,13 +313,29 @@ public sealed partial class MainWindow
             IsPrimaryButtonEnabled = false,
         };
 
+        switchModeButton.Click += (_, _) =>
+        {
+            if (_unlockRequest is not null || pinAccount is null) return;
+            usePin = !usePin;
+            password.Password = string.Empty;
+            password.Header = usePin ? "PIN 码" : "主密码";
+            switchModeButton.Content = usePin ? "改用主密码" : "改用 PIN 码";
+            status.Text = string.Empty;
+            password.Focus(FocusState.Programmatic);
+        };
         password.PasswordChanged += (_, _) =>
         {
             dialog.IsPrimaryButtonEnabled = _unlockRequest is null && password.Password.Length != 0;
             dialog.DefaultButton = password.Password.Length != 0 || helloAccount is null
                 ? ContentDialogButton.Primary : ContentDialogButton.Secondary;
         };
-        dialog.Opened += (_, _) => { if (helloAccount is null) password.Focus(FocusState.Programmatic); };
+        dialog.Opened += async (_, _) =>
+        {
+            if (helloAccount is not null && DesktopPreferences.Read(DesktopPreferences.AutoPromptHello, fallback: false))
+                await UnlockAsync(true);
+            else if (helloAccount is null || usePin)
+                password.Focus(FocusState.Programmatic);
+        };
         dialog.Closing += (_, args) =>
         {
             if (_unlockRequest is null) return;
@@ -330,19 +356,35 @@ public sealed partial class MainWindow
         {
             if (_unlockRequest is not null || (hello ? helloAccount is null : password.Password.Length == 0)) return;
             var entered = hello ? string.Empty : password.Password;
+            var usingPin = !hello && usePin && pinAccount is not null;
             using var request = _unlockRequest = new CancellationTokenSource();
             password.Password = string.Empty;
-            password.IsEnabled = dialog.IsPrimaryButtonEnabled = dialog.IsSecondaryButtonEnabled = false;
+            password.IsEnabled = switchModeButton.IsEnabled = dialog.IsPrimaryButtonEnabled = dialog.IsSecondaryButtonEnabled = false;
             dialog.CloseButtonText = "取消解锁";
-            status.Text = hello ? "请按照 Windows Hello 提示验证…" : "正在本机解锁…";
+            status.Text = hello
+                ? "请按照 Windows Hello 提示验证…"
+                : usingPin ? "正在验证 PIN 码…" : "正在本机解锁…";
             var unlocked = false;
             try
             {
-                await UnlockLocalVaultAsync(hello ? helloAccount : null, entered, request.Token);
+                if (usingPin)
+                    await Task.Run(() => RustCore.UnlockPin(pinAccount!, entered, request.Token));
+                else
+                    await UnlockLocalVaultAsync(hello ? helloAccount : null, entered, request.Token);
                 unlocked = true;
             }
             catch (OperationCanceledException) { status.Text = "解锁已取消。"; }
-            catch (VaultException error) { status.Text = error.UserMessage; }
+            catch (VaultException error)
+            {
+                if (usingPin && error.Code is "pinRevoked" or "pinNotEnabled")
+                {
+                    pinAccount = null;
+                    usePin = false;
+                    switchModeButton.Visibility = Visibility.Collapsed;
+                    password.Header = "主密码";
+                }
+                status.Text = error.UserMessage;
+            }
             catch (Exception error) when (IsCoreUnavailable(error))
             { status.Text = "Rust 核心未能加载，请重新构建或修复应用安装。"; }
             finally
@@ -355,6 +397,7 @@ public sealed partial class MainWindow
                     else
                     {
                         password.IsEnabled = true;
+                        switchModeButton.IsEnabled = pinAccount is not null;
                         dialog.IsSecondaryButtonEnabled = helloAccount is not null;
                         dialog.CloseButtonText = "取消";
                         password.Focus(FocusState.Programmatic);

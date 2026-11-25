@@ -37,6 +37,8 @@ public sealed partial class MainWindow : Window
         AccountSettingsScope.SignedOut += GeneratorPage.ResetSavedAlgorithm;
         InitializeVaultTimeout();
         InitializeTray();
+        ApplyPreventScreenshots(DesktopPreferences.Read(DesktopPreferences.PreventScreenshots, fallback: false));
+        RestoreWindowBounds();
         try
         {
             ApplyAccountSnapshot(ApplyRestartTimeouts(RustCore.GetAccounts()));
@@ -211,10 +213,14 @@ public sealed partial class MainWindow : Window
         {
             settings.VaultTimeoutChanged = value => SaveVaultTimeout(settings, value);
             settings.ApplyTheme = ApplyDesktopTheme;
+            settings.ApplyPreventScreenshots = ApplyPreventScreenshots;
             settings.ChangeHelloUnlock = () => ChangeHelloUnlockAsync(settings);
+            settings.ChangePinUnlock = () => ChangePinUnlockAsync(settings);
+            settings.ShowFingerprint = () => ShowAccountFingerprintAsync(settings);
             settings.ExportVault = () => ExportVaultAsync(settings);
             settings.ImportVault = () => ImportVaultAsync(settings);
             settings.ShowHelloUnlock(ActiveAccount, _signInDialogOpen || _accountTransition);
+            settings.ShowPinUnlock(ActiveAccount, _signInDialogOpen || _accountTransition);
             settings.ShowVaultExport(ActiveAccount, _signInDialogOpen || _accountTransition);
             UpdateTimeoutControls(settings);
         }
@@ -329,6 +335,7 @@ public sealed partial class MainWindow : Window
         string? syncError = null;
         var allowLocalUnlock = reconnect is { State: VaultSessionState.Locked };
         var allowHello = allowLocalUnlock && reconnect!.HelloEnabled;
+        var allowPin = allowLocalUnlock && reconnect!.PinEnabled;
         var environment = reconnect is null ? LoginEnvironment.Load() : new LoginEnvironment(reconnect.ServerMode, reconnect.ServerUrl);
         var serverBox = new ComboBox
         {
@@ -364,11 +371,21 @@ public sealed partial class MainWindow : Window
         var accessHelp = new TextBlock
         {
             Text = "输入一次主密码即可解锁并连接服务器。断网时可选择只读离线解锁。" +
-                (allowHello ? " Windows Hello 仅解锁本机缓存，不会登录服务器。" : ""),
+                (allowPin && allowHello ? " PIN 码和 Windows Hello 仅解锁本机缓存，不会登录服务器。" :
+                 allowPin ? " PIN 码仅解锁本机缓存，不会登录服务器。" :
+                 allowHello ? " Windows Hello 仅解锁本机缓存，不会登录服务器。" : ""),
             TextWrapping = TextWrapping.Wrap,
             Visibility = allowLocalUnlock ? Visibility.Visible : Visibility.Collapsed,
         };
         var helloButton = new Button { Content = "Windows Hello", Visibility = allowHello ? Visibility.Visible : Visibility.Collapsed };
+        var pinBox = new PasswordBox { Header = "PIN 码（离线解锁）", PlaceholderText = "输入本机解锁 PIN 码" };
+        var pinButton = new Button { Content = "使用 PIN 离线解锁", IsEnabled = false };
+        var pinPanel = new StackPanel
+        {
+            Spacing = 8,
+            Visibility = allowPin ? Visibility.Visible : Visibility.Collapsed,
+            Children = { PasswordVisibility.WithToggle(pinBox), pinButton },
+        };
         var providerBox = new ComboBox { Header = "二步验证方式", Visibility = Visibility.Collapsed, HorizontalAlignment = HorizontalAlignment.Stretch };
         var tokenBox = new TextBox { Header = "验证码", PlaceholderText = "输入一次性验证码", Visibility = Visibility.Collapsed };
         var sendEmailButton = new Button { Content = "发送邮箱验证码", Visibility = Visibility.Collapsed, HorizontalAlignment = HorizontalAlignment.Left };
@@ -400,7 +417,7 @@ public sealed partial class MainWindow : Window
             content.Children.Add(new TextBlock { Text = $"{reconnect.Email} · {reconnect.ServerLabel}", TextWrapping = TextWrapping.Wrap });
         }
         foreach (var element in new UIElement[] { accessHelp, PasswordVisibility.WithToggle(passwordBox),
-            helloButton, deviceOtpBox, resendDeviceOtpButton, providerBox, tokenBox, sendEmailButton,
+            helloButton, pinPanel, deviceOtpBox, resendDeviceOtpButton, providerBox, tokenBox, sendEmailButton,
             rememberTwoFactorBox, rememberTwoFactorHelp, progress, statusText })
         {
             content.Children.Add(element);
@@ -444,6 +461,8 @@ public sealed partial class MainWindow : Window
             providerBox.IsEnabled = tokenBox.IsEnabled = rememberTwoFactorBox.IsEnabled = !value;
             deviceOtpBox.IsEnabled = sendEmailButton.IsEnabled = resendDeviceOtpButton.IsEnabled = !value;
             helloButton.IsEnabled = !value;
+            pinBox.IsEnabled = !value;
+            pinButton.IsEnabled = !value && allowPin && pinBox.Password.Length != 0;
             dialog.IsPrimaryButtonEnabled = !value && !unsupportedTwoFactor && (!allowLocalUnlock || passwordBox.Password.Length != 0);
             dialog.IsSecondaryButtonEnabled = allowLocalUnlock && !value && passwordBox.Password.Length != 0;
             dialog.CloseButtonText = value ? "取消请求" : "取消";
@@ -526,6 +545,7 @@ public sealed partial class MainWindow : Window
         serverUrlBox.TextChanged += (_, _) => ResetTwoFactor();
         emailBox.TextChanged += (_, _) => ResetTwoFactor();
         passwordBox.PasswordChanged += (_, _) => ResetTwoFactor();
+        pinBox.PasswordChanged += (_, _) => pinButton.IsEnabled = !busy && allowPin && pinBox.Password.Length != 0;
         dialog.CloseButtonClick += (_, args) =>
         {
             if (busy) { args.Cancel = true; RequestClose(); }
@@ -535,7 +555,50 @@ public sealed partial class MainWindow : Window
             if (busy) { args.Cancel = true; RequestClose(); }
         };
 
-        if (reconnect is not null) dialog.Opened += (_, _) => passwordBox.Focus(FocusState.Programmatic);
+        dialog.Opened += async (_, _) =>
+        {
+            if (allowHello && DesktopPreferences.Read(DesktopPreferences.AutoPromptHello, fallback: false))
+                await TryUnlockLocalAsync(hello: true);
+            else if (allowPin)
+                pinBox.Focus(FocusState.Programmatic);
+            else if (reconnect is not null)
+                passwordBox.Focus(FocusState.Programmatic);
+        };
+
+        async Task TryUnlockPinAsync()
+        {
+            if (busy || !allowPin || pinBox.Password.Length == 0) return;
+            var enteredPin = pinBox.Password;
+            var token = BeginRequest();
+            pinBox.Password = string.Empty;
+            statusText.Text = "正在验证 PIN 码…";
+            try
+            {
+                await Task.Run(() => RustCore.UnlockPin(reconnect!.Id, enteredPin, token));
+                opened = true;
+            }
+            catch (OperationCanceledException) { statusText.Text = "解锁已取消。"; }
+            catch (VaultException error)
+            {
+                if (error.Code is "pinRevoked" or "pinNotEnabled")
+                {
+                    allowPin = false;
+                    pinPanel.Visibility = Visibility.Collapsed;
+                }
+                statusText.Text = error.UserMessage;
+            }
+            catch (Exception error) when (IsCoreUnavailable(error)) { statusText.Text = "无法加载 Rust 核心，请修复应用安装。"; }
+            finally
+            {
+                enteredPin = string.Empty;
+                FinishRequest();
+                if (!_closed && !opened && !closingRequested)
+                {
+                    if (allowPin) pinBox.Focus(FocusState.Programmatic);
+                    else passwordBox.Focus(FocusState.Programmatic);
+                }
+            }
+        }
 
         async Task TryUnlockLocalAsync(bool hello)
         {
@@ -565,6 +628,13 @@ public sealed partial class MainWindow : Window
             await TryUnlockLocalAsync(hello: false);
         };
         helloButton.Click += async (_, _) => await TryUnlockLocalAsync(hello: true);
+        pinButton.Click += async (_, _) => await TryUnlockPinAsync();
+        pinBox.KeyDown += async (_, args) =>
+        {
+            if (args.Key != Windows.System.VirtualKey.Enter) return;
+            args.Handled = true;
+            await TryUnlockPinAsync();
+        };
 
         sendEmailButton.Click += async (_, _) =>
         {
@@ -753,6 +823,7 @@ public sealed partial class MainWindow : Window
                 requestCancellation.Dispose();
             }
             passwordBox.Password = string.Empty;
+            pinBox.Password = string.Empty;
             deviceOtpBox.Text = string.Empty;
             pendingDeviceOtp = string.Empty;
             tokenBox.Text = string.Empty;

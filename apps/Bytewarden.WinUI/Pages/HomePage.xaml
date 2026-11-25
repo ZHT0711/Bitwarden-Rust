@@ -6,6 +6,11 @@
     xmlns:interop="using:Bytewarden.WinUI.Interop"
     xmlns:controls="using:Bytewarden.WinUI.Controls">
     <Grid x:Name="VaultLayout" Padding="20,10,20,16" RowSpacing="10" RowDefinitions="Auto,*" SizeChanged="VaultLayout_SizeChanged">
+        <Grid.KeyboardAccelerators>
+            <KeyboardAccelerator Key="U" Modifiers="Control,Shift" Invoked="QuickCopyUsernameShortcut_Invoked" />
+            <KeyboardAccelerator Key="P" Modifiers="Control,Shift" Invoked="QuickCopyPasswordShortcut_Invoked" />
+            <KeyboardAccelerator Key="T" Modifiers="Control,Shift" Invoked="QuickCopyTotpShortcut_Invoked" />
+        </Grid.KeyboardAccelerators>
         <VisualStateManager.VisualStateGroups>
             <VisualStateGroup>
                 <VisualState x:Name="WideVault" />
@@ -58,11 +63,13 @@
                 <CommandBar.SecondaryCommands>
                     <AppBarButton x:Name="SelectItemsButton" Label="批量选择" Click="SelectItems_Click" IsEnabled="False" />
                     <AppBarButton x:Name="MoveItemsButton" Icon="Folder" Label="移动到文件夹" Click="MoveItems_Click" IsEnabled="False" />
+                    <AppBarButton x:Name="CloneItemButton" Icon="Copy" Label="克隆" Click="CloneItem_Click" IsEnabled="False" />
                     <AppBarButton x:Name="FavoriteItemButton" Icon="Favorite" Label="收藏" Tag="favorite" Click="ItemAction_Click" IsEnabled="False" />
                     <AppBarButton x:Name="ArchiveItemButton" Icon="Folder" Label="归档" Tag="archive" Click="ItemAction_Click" IsEnabled="False" />
                     <AppBarButton x:Name="TrashItemButton" Icon="Delete" Label="移至回收站" Tag="trash" Click="ItemAction_Click" IsEnabled="False" />
                     <AppBarButton x:Name="RestoreItemButton" Icon="Undo" Label="还原" Tag="restore" Click="ItemAction_Click" IsEnabled="False" Visibility="Collapsed" />
                     <AppBarButton x:Name="DeleteItemButton" Icon="Delete" Label="永久删除" Tag="delete" Click="ItemAction_Click" IsEnabled="False" Visibility="Collapsed" />
+                    <AppBarButton x:Name="EmptyTrashButton" Icon="Delete" Label="清空回收站" Click="EmptyTrash_Click" IsEnabled="False" Visibility="Collapsed" />
                 </CommandBar.SecondaryCommands>
             </CommandBar>
         </Grid>
@@ -157,8 +164,9 @@
         <Grid Grid.Row="1" ColumnSpacing="12" ColumnDefinitions="2*,3*">
             <Border x:Name="ListPane" SizeChanged="ListPane_SizeChanged" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
                 BorderThickness="1" CornerRadius="8">
-                <Grid>
+                <Grid RowDefinitions="*,Auto">
                     <ListView x:Name="VaultList" SelectionMode="Single" SelectionChanged="VaultList_SelectionChanged"
+                        ContextRequested="VaultList_ContextRequested"
                         AutomationProperties.Name="保险库条目" Padding="4" ScrollViewer.HorizontalScrollBarVisibility="Disabled"
                         HorizontalContentAlignment="Stretch">
                         <ListView.ItemContainerTransitions>
@@ -186,6 +194,14 @@
                             <Button x:Name="ConnectButton" Content="连接账户" Click="ConnectAccount_Click" HorizontalAlignment="Center" />
                         </StackPanel>
                     </ScrollViewer>
+                    <Border x:Name="QuickCopyBar" Grid.Row="1" Visibility="Collapsed" Padding="8,6"
+                        BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="0,1,0,0">
+                        <StackPanel Orientation="Horizontal" Spacing="6">
+                            <Button x:Name="QuickCopyUserButton" Content="复制用户名" Padding="8,3" Click="QuickCopyUser_Click" ToolTipService.ToolTip="复制用户名（Ctrl+Shift+U）" />
+                            <Button x:Name="QuickCopyPasswordButton" Content="复制密码" Padding="8,3" Click="QuickCopyPassword_Click" ToolTipService.ToolTip="复制密码（Ctrl+Shift+P）" />
+                            <Button x:Name="QuickCopyTotpButton" Content="复制验证码" Padding="8,3" Click="QuickCopyTotp_Click" ToolTipService.ToolTip="复制验证码（Ctrl+Shift+T）" />
+                        </StackPanel>
+                    </Border>
                 </Grid>
             </Border>
             <Border x:Name="DetailPane" Grid.Column="1" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"

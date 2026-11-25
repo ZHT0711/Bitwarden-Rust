@@ -7,9 +7,14 @@ using Windows.Storage;
 
 namespace Bytewarden.WinUI.Pages;
 
+public sealed record GeneratorHistoryItem(string Value, string Meta);
+
 public sealed partial class GeneratorPage : Page
 {
+    private const int MaxHistoryEntries = 100;
     private readonly DispatcherTimer _regenerationTimer;
+    private readonly List<GeneratorHistoryItem> _history = [];
+    private CancellationTokenSource? _usernameOperation;
     private bool _ready;
     private double _lastMinimumNumbers = 1;
     private double _lastMinimumSpecial = 1;
@@ -28,6 +33,8 @@ public sealed partial class GeneratorPage : Page
     public GeneratorPage()
     {
         InitializeComponent();
+        UsernameTypeChoice.SelectedIndex = 0;
+        ForwarderServiceChoice.SelectedIndex = 0;
         _regenerationTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(150) };
         _regenerationTimer.Tick += RegenerationTimer_Tick;
         RefreshSettingsScope();
@@ -48,7 +55,14 @@ public sealed partial class GeneratorPage : Page
     {
         PersistPendingSettings();
         _regenerationTimer.Stop();
+        CancelUsernameOperation();
         GeneratedPassword.Text = string.Empty;
+        PasswordStrengthLabel.Text = string.Empty;
+        PasswordStrengthLabel.Visibility = Visibility.Collapsed;
+        ForwarderApiKey.Password = string.Empty;
+        _history.Clear();
+        HistoryList.ItemsSource = null;
+        HistoryExpander.Visibility = Visibility.Collapsed;
     }
 
     public void RefreshSettingsScope() => RefreshSettingsScopeIfChanged();
@@ -59,7 +73,10 @@ public sealed partial class GeneratorPage : Page
         if (_settingsLoaded && _settingsScope == scope) return false;
         PersistPendingSettings();
         _regenerationTimer.Stop();
+        CancelUsernameOperation();
         GeneratedPassword.Text = string.Empty;
+        PasswordStrengthLabel.Text = string.Empty;
+        PasswordStrengthLabel.Visibility = Visibility.Collapsed;
         GeneratorNotice.IsOpen = false;
         _settingsScope = scope;
         try { _settings = GeneratorSettings.Load(ApplicationData.Current.LocalSettings.Values, scope); }
@@ -81,6 +98,7 @@ public sealed partial class GeneratorPage : Page
         IncludeNumber.IsOn = _settings.IncludeNumber;
         CredentialType.SelectedIndex = _settings.SelectedType;
         UpdateCredentialTypePresentation();
+        UpdateUsernameOptionVisibility();
         _settingsLoaded = _ready = true;
         return true;
     }
@@ -145,7 +163,8 @@ public sealed partial class GeneratorPage : Page
     private void Generate_Click(object sender, RoutedEventArgs e)
     {
         RefreshSettingsScope();
-        GenerateCurrent();
+        if (IsUsernameSelected) _ = GenerateUsernameAsync();
+        else GenerateCurrent();
     }
 
     private void GenerateCurrent()
@@ -153,9 +172,14 @@ public sealed partial class GeneratorPage : Page
         if (RefreshSettingsScopeIfChanged()) return;
         _regenerationTimer.Stop();
         PersistPendingSettings();
+        if (IsUsernameSelected)
+        {
+            _ = GenerateUsernameAsync();
+            return;
+        }
         try
         {
-            GeneratedPassword.Text = IsPassphraseSelected
+            var generated = IsPassphraseSelected
                 ? RustCore.GeneratePassphrase(
                     ToCount(PassphraseWords.Value),
                     WordSeparator.Text,
@@ -170,6 +194,9 @@ public sealed partial class GeneratorPage : Page
                     AvoidAmbiguous.IsOn,
                     ToCount(MinimumNumbers.Value),
                     ToCount(MinimumSpecial.Value));
+            GeneratedPassword.Text = generated;
+            UpdateStrength(generated);
+            RecordHistory(generated, IsPassphraseSelected ? "密码短语" : "密码");
             GeneratorNotice.Title = "已生成";
             GeneratorNotice.Severity = InfoBarSeverity.Success;
             GeneratorNotice.IsOpen = false;
@@ -177,6 +204,7 @@ public sealed partial class GeneratorPage : Page
         catch (Exception error) when (error is DllNotFoundException or EntryPointNotFoundException or BadImageFormatException or InvalidOperationException)
         {
             GeneratedPassword.Text = string.Empty;
+            PasswordStrengthLabel.Visibility = Visibility.Collapsed;
             GeneratorNotice.Title = "无法生成密码";
             GeneratorNotice.Severity = InfoBarSeverity.Error;
             GeneratorNotice.Message = error is InvalidOperationException
@@ -188,9 +216,169 @@ public sealed partial class GeneratorPage : Page
         }
     }
 
+    private async Task GenerateUsernameAsync()
+    {
+        CancelUsernameOperation();
+        var cancellation = _usernameOperation = new CancellationTokenSource();
+        var token = cancellation.Token;
+        var mode = (UsernameTypeChoice.SelectedItem as ComboBoxItem)?.Tag as string ?? "word";
+        var capitalize = UsernameCapitalize.IsOn;
+        var includeNumber = UsernameIncludeNumber.IsOn;
+        var subEmail = SubaddressEmail.Text.Trim();
+        var catchDomain = CatchallDomain.Text.Trim();
+        var useWebsite = UsernameUseWebsiteToggle.IsOn;
+        var website = UsernameWebsite.Text.Trim();
+        var service = (ForwarderServiceChoice.SelectedItem as ComboBoxItem)?.Tag as string ?? "addyIo";
+        var apiKey = ForwarderApiKey.Password;
+        var forwarderDomain = ForwarderDomain.Text.Trim();
+        var forwarderBaseUrl = ForwarderBaseUrl.Text.Trim();
+
+        if (mode == "subaddress" && string.IsNullOrEmpty(subEmail))
+        {
+            ShowUsernameError("请先填写基础邮箱地址。");
+            return;
+        }
+        if (mode == "catchall" && string.IsNullOrEmpty(catchDomain))
+        {
+            ShowUsernameError("请先填写邮箱域名。");
+            return;
+        }
+        if (mode == "forwarded" && string.IsNullOrEmpty(apiKey))
+        {
+            ShowUsernameError("请填写所选转发服务的 API Key / Token。");
+            return;
+        }
+        if (mode == "forwarded" && service is "addyIo" or "forwardEmail" && string.IsNullOrEmpty(forwarderDomain))
+        {
+            ShowUsernameError("该转发服务需要填写域名。");
+            return;
+        }
+
+        UsernameProgress.IsActive = true;
+        UsernameProgress.Visibility = Visibility.Visible;
+        GenerateButton.IsEnabled = false;
+        GeneratorNotice.IsOpen = false;
+        try
+        {
+            var generated = await Task.Run(() => mode switch
+            {
+                "subaddress" => RustCore.GenerateUsernameSubaddress(subEmail, useWebsite ? website : null, token),
+                "catchall" => RustCore.GenerateUsernameCatchall(catchDomain, useWebsite ? website : null, token),
+                "forwarded" => RustCore.GenerateUsernameForwarded(service, apiKey, forwarderDomain, forwarderBaseUrl, website, token),
+                _ => RustCore.GenerateUsernameWord(capitalize, includeNumber, token),
+            }, token);
+            if (!ReferenceEquals(_usernameOperation, cancellation) || token.IsCancellationRequested) return;
+            GeneratedPassword.Text = generated;
+            PasswordStrengthLabel.Visibility = Visibility.Collapsed;
+            RecordHistory(generated, "用户名");
+        }
+        catch (OperationCanceledException) { }
+        catch (VaultException error)
+        {
+            if (ReferenceEquals(_usernameOperation, cancellation))
+            {
+                ShowUsernameError(error.Code == "validation"
+                    ? "请检查转发服务配置、API Key 或域名参数。"
+                    : "生成用户名失败，请检查网络连接和服务端点后重试。");
+            }
+        }
+        catch (Exception error) when (error is DllNotFoundException or EntryPointNotFoundException or BadImageFormatException)
+        {
+            if (ReferenceEquals(_usernameOperation, cancellation))
+                ShowUsernameError("Rust 核心 DLL 未加载；请从仓库根目录构建应用。");
+        }
+        finally
+        {
+            apiKey = string.Empty;
+            if (ReferenceEquals(_usernameOperation, cancellation))
+            {
+                _usernameOperation = null;
+                UsernameProgress.IsActive = false;
+                UsernameProgress.Visibility = Visibility.Collapsed;
+                GenerateButton.IsEnabled = true;
+            }
+            cancellation.Dispose();
+        }
+    }
+
+    private void ShowUsernameError(string message)
+    {
+        GeneratorNotice.Title = "无法生成用户名";
+        GeneratorNotice.Severity = InfoBarSeverity.Error;
+        GeneratorNotice.Message = message;
+        GeneratorNotice.IsOpen = true;
+    }
+
+    private void CancelUsernameOperation()
+    {
+        _usernameOperation?.Cancel();
+        _usernameOperation = null;
+        if (UsernameProgress is not null)
+        {
+            UsernameProgress.IsActive = false;
+            UsernameProgress.Visibility = Visibility.Collapsed;
+        }
+        if (GenerateButton is not null) GenerateButton.IsEnabled = true;
+    }
+
+    private void UpdateStrength(string value)
+    {
+        if (IsUsernameSelected || string.IsNullOrEmpty(value))
+        {
+            PasswordStrengthLabel.Text = string.Empty;
+            PasswordStrengthLabel.Visibility = Visibility.Collapsed;
+            return;
+        }
+        try
+        {
+            var score = RustCore.CheckPasswordStrength(value);
+            if (score >= 0)
+            {
+                PasswordStrengthLabel.Text = $"密码强度：{HomePage.PasswordStrengthLabel(score)}";
+                PasswordStrengthLabel.Visibility = Visibility.Visible;
+            }
+            else
+            {
+                PasswordStrengthLabel.Visibility = Visibility.Collapsed;
+            }
+        }
+        catch (Exception error) when (error is DllNotFoundException or EntryPointNotFoundException or BadImageFormatException)
+        {
+            PasswordStrengthLabel.Visibility = Visibility.Collapsed;
+        }
+    }
+
+    private void RecordHistory(string value, string kind)
+    {
+        if (string.IsNullOrEmpty(value)) return;
+        if (_history.Count > 0 && _history[0].Value == value) return;
+        _history.Insert(0, new GeneratorHistoryItem(value, $"{kind} · {DateTime.Now:HH:mm:ss}"));
+        if (_history.Count > MaxHistoryEntries) _history.RemoveRange(MaxHistoryEntries, _history.Count - MaxHistoryEntries);
+        HistoryList.ItemsSource = null;
+        HistoryList.ItemsSource = _history.ToArray();
+        HistoryExpander.Visibility = Visibility.Visible;
+    }
+
+    private void ClearHistory_Click(object sender, RoutedEventArgs e)
+    {
+        _history.Clear();
+        HistoryList.ItemsSource = null;
+        HistoryExpander.Visibility = Visibility.Collapsed;
+    }
+
+    private void CopyHistory_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is Button { Tag: string value } && !string.IsNullOrEmpty(value))
+            CopyValue(value, "内容");
+    }
+
     private void Clear_Click(object sender, RoutedEventArgs e)
     {
-        ClearSensitiveState();
+        CancelUsernameOperation();
+        _regenerationTimer.Stop();
+        GeneratedPassword.Text = string.Empty;
+        PasswordStrengthLabel.Text = string.Empty;
+        PasswordStrengthLabel.Visibility = Visibility.Collapsed;
         GeneratorNotice.IsOpen = false;
     }
 
@@ -198,15 +386,20 @@ public sealed partial class GeneratorPage : Page
     {
         if (string.IsNullOrEmpty(GeneratedPassword.Text))
         {
-            GeneratorNotice.Title = IsPassphraseSelected ? "没有可复制的密码短语" : "没有可复制的密码";
-            GeneratorNotice.Message = IsPassphraseSelected ? "请先生成密码短语。" : "请先生成密码。";
+            GeneratorNotice.Title = IsPassphraseSelected ? "没有可复制的密码短语" : IsUsernameSelected ? "没有可复制的用户名" : "没有可复制的密码";
+            GeneratorNotice.Message = IsPassphraseSelected ? "请先生成密码短语。" : IsUsernameSelected ? "请先生成用户名。" : "请先生成密码。";
             GeneratorNotice.Severity = InfoBarSeverity.Warning;
             GeneratorNotice.IsOpen = true;
             return;
         }
 
-        try { ClipboardCleaner.Copy(GeneratedPassword.Text); }
-        catch (Exception error) when (error is System.Runtime.InteropServices.COMException or InvalidOperationException)
+        CopyValue(GeneratedPassword.Text, IsPassphraseSelected ? "密码短语" : IsUsernameSelected ? "用户名" : "密码");
+    }
+
+    private void CopyValue(string value, string label)
+    {
+        try { ClipboardCleaner.Copy(value); }
+        catch (Exception error) when (error is COMException or InvalidOperationException)
         {
             GeneratorNotice.Title = "无法复制";
             GeneratorNotice.Message = "剪贴板暂时不可用，请重试。";
@@ -214,10 +407,12 @@ public sealed partial class GeneratorPage : Page
             GeneratorNotice.IsOpen = true;
             return;
         }
+        var delay = DesktopPreferences.ReadClipboardDelay();
+        var clearNote = delay == 0
+            ? "未启用定时清除，锁定或退出时仍会尝试清除本应用拥有的剪贴板内容。"
+            : $"{delay} 秒后会清除本应用仍然拥有的剪贴板内容。";
         GeneratorNotice.Title = "已复制";
-        GeneratorNotice.Message = IsPassphraseSelected
-            ? "密码短语已复制。30 秒后会清除本应用仍然拥有的剪贴板内容。"
-            : "密码已复制。30 秒后会清除本应用仍然拥有的剪贴板内容。";
+        GeneratorNotice.Message = $"{label}已复制。{clearNote}";
         GeneratorNotice.Severity = InfoBarSeverity.Success;
         GeneratorNotice.IsOpen = true;
     }
@@ -226,21 +421,61 @@ public sealed partial class GeneratorPage : Page
         ? (uint)Math.Min(number, 128) : 0;
 
     private bool IsPassphraseSelected => CredentialType.SelectedIndex == 1;
+    private bool IsUsernameSelected => CredentialType.SelectedIndex == 2;
 
     private void CredentialType_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         if (!_ready) return;
         UpdateCredentialTypePresentation();
-        ScheduleRegeneration();
+        if (IsUsernameSelected)
+        {
+            _regenerationTimer.Stop();
+            GeneratedPassword.Text = string.Empty;
+            PasswordStrengthLabel.Visibility = Visibility.Collapsed;
+            if ((UsernameTypeChoice.SelectedItem as ComboBoxItem)?.Tag as string == "word")
+                _ = GenerateUsernameAsync();
+        }
+        else
+        {
+            CancelUsernameOperation();
+            ScheduleRegeneration();
+        }
     }
 
     private void UpdateCredentialTypePresentation()
     {
         var showPassphrase = IsPassphraseSelected;
-        PasswordOptions.Visibility = showPassphrase ? Visibility.Collapsed : Visibility.Visible;
+        var showUsername = IsUsernameSelected;
+        PasswordOptions.Visibility = !showPassphrase && !showUsername ? Visibility.Visible : Visibility.Collapsed;
         PassphraseOptions.Visibility = showPassphrase ? Visibility.Visible : Visibility.Collapsed;
-        GeneratedLabel.Text = showPassphrase ? "生成的密码短语" : "生成的密码";
-        GenerateButton.Content = showPassphrase ? "生成密码短语" : "生成密码";
+        UsernameOptions.Visibility = showUsername ? Visibility.Visible : Visibility.Collapsed;
+        GeneratedLabel.Text = showPassphrase ? "生成的密码短语" : showUsername ? "生成的用户名" : "生成的密码";
+        GenerateButton.Content = showPassphrase ? "生成密码短语" : showUsername ? "生成用户名" : "生成密码";
+        GeneratedPassword.PlaceholderText = showPassphrase ? "点击“生成密码短语”" : showUsername ? "点击“生成用户名”" : "点击“生成密码”";
+    }
+
+    private void UsernameTypeChoice_Changed(object sender, SelectionChangedEventArgs e) => UpdateUsernameOptionVisibility();
+    private void UsernameUseWebsiteToggle_Toggled(object sender, RoutedEventArgs e) => UpdateUsernameOptionVisibility();
+    private void ForwarderServiceChoice_Changed(object sender, SelectionChangedEventArgs e) => UpdateUsernameOptionVisibility();
+
+    private void UpdateUsernameOptionVisibility()
+    {
+        if (UsernameTypeChoice is null) return;
+        var mode = (UsernameTypeChoice.SelectedItem as ComboBoxItem)?.Tag as string ?? "word";
+        UsernameWordPanel.Visibility = mode == "word" ? Visibility.Visible : Visibility.Collapsed;
+        SubaddressEmail.Visibility = mode == "subaddress" ? Visibility.Visible : Visibility.Collapsed;
+        CatchallDomain.Visibility = mode == "catchall" ? Visibility.Visible : Visibility.Collapsed;
+        UsernameUseWebsiteToggle.Visibility = mode is "subaddress" or "catchall" ? Visibility.Visible : Visibility.Collapsed;
+        UsernameForwarderPanel.Visibility = mode == "forwarded" ? Visibility.Visible : Visibility.Collapsed;
+        UsernameWebsite.Visibility = mode == "forwarded" || (mode is "subaddress" or "catchall" && UsernameUseWebsiteToggle.IsOn)
+            ? Visibility.Visible : Visibility.Collapsed;
+        if (mode == "forwarded")
+        {
+            var service = (ForwarderServiceChoice.SelectedItem as ComboBoxItem)?.Tag as string ?? "addyIo";
+            ForwarderDomain.Visibility = service is "addyIo" or "forwardEmail" ? Visibility.Visible : Visibility.Collapsed;
+            ForwarderBaseUrl.Visibility = service is "addyIo" or "simpleLogin" ? Visibility.Visible : Visibility.Collapsed;
+            ForwarderBaseUrl.PlaceholderText = service == "simpleLogin" ? "https://app.simplelogin.io" : "https://app.addy.io";
+        }
     }
 
     private void PasswordOption_Toggled(object sender, RoutedEventArgs e)
@@ -300,7 +535,7 @@ public sealed partial class GeneratorPage : Page
 
     private void ScheduleRegeneration()
     {
-        if (!_ready)
+        if (!_ready || IsUsernameSelected)
         {
             return;
         }

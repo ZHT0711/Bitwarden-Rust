@@ -8,25 +8,35 @@ internal sealed class WindowsTrayIcon : IDisposable
     private const uint Add = 0, Delete = 2, SetVersion = 4, Version4 = 4;
     private const uint CallbackMessage = 0x8000 + 42;
     private const uint ContextMenu = 0x007B, Select = 0x0400, KeySelect = 0x0401;
-    private const uint TrayIconId = 1, OpenCommand = 1, ExitCommand = 2;
+    private const uint TrayIconId = 1, OpenCommand = 1, ExitCommand = 2, LockCommand = 3, LockAllCommand = 4;
     private const uint MenuFlags = 0x0100 | 0x0080 | 0x0002; // TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON
     private const nuint SubclassId = 2; // WindowsVaultEvents uses 1.
 
     private readonly nint _window;
     private readonly DispatcherQueue _dispatcher;
     private readonly Action _open, _exit, _unavailable;
+    private readonly Action? _lock, _lockAll;
     private readonly SubclassProc _callback;
     private readonly uint _taskbarCreated;
     private readonly nint _icon;
     private bool _attached, _registered, _disposed;
 
-    internal WindowsTrayIcon(nint window, DispatcherQueue dispatcher, Action open, Action exit, Action unavailable)
+    internal WindowsTrayIcon(
+        nint window,
+        DispatcherQueue dispatcher,
+        Action open,
+        Action exit,
+        Action unavailable,
+        Action? lockCurrent = null,
+        Action? lockAll = null)
     {
         _window = window;
         _dispatcher = dispatcher;
         _open = open;
         _exit = exit;
         _unavailable = unavailable;
+        _lock = lockCurrent;
+        _lockAll = lockAll;
         _callback = WindowProc;
         _taskbarCreated = RegisterWindowMessage("TaskbarCreated");
         _icon = LoadImage(0, Path.Combine(AppContext.BaseDirectory, "Assets", "AppIcon.ico"), 1, 0, 0, 0x0010 | 0x0040);
@@ -90,8 +100,10 @@ internal sealed class WindowsTrayIcon : IDisposable
         uint selected = 0;
         try
         {
-            if (!AppendMenu(menu, 0, OpenCommand, "打开 Bytewarden") ||
-                !AppendMenu(menu, 0, ExitCommand, "退出 Bytewarden")) return;
+            if (!AppendMenu(menu, 0, OpenCommand, "打开 Bytewarden")) return;
+            if (_lock is not null && !AppendMenu(menu, 0, LockCommand, "锁定当前账户")) return;
+            if (_lockAll is not null && !AppendMenu(menu, 0, LockAllCommand, "锁定全部账户")) return;
+            if (!AppendMenu(menu, 0, ExitCommand, "退出 Bytewarden")) return;
             SetForegroundWindow(_window);
             selected = TrackPopupMenuEx(menu, MenuFlags, x, y, _window, 0);
             // Required by the shell so the next tray popup dismisses correctly.
@@ -99,6 +111,8 @@ internal sealed class WindowsTrayIcon : IDisposable
         }
         finally { DestroyMenu(menu); }
         if (selected == OpenCommand) _open();
+        else if (selected == LockCommand) _lock?.Invoke();
+        else if (selected == LockAllCommand) _lockAll?.Invoke();
         else if (selected == ExitCommand) _exit();
     }
 

@@ -36,6 +36,10 @@ struct AccountSummary<'a> {
     needs_sign_in: bool,
     #[cfg(windows)]
     hello_enabled: bool,
+    #[cfg(windows)]
+    pin_enabled: bool,
+    #[cfg(windows)]
+    pin_persistent: bool,
 }
 
 impl AuthAccounts {
@@ -48,17 +52,25 @@ impl AuthAccounts {
         vault_success(
             &self
                 .iter()
-                .map(|session| AccountSummary {
-                    id: session.account_id,
-                    email: &session.email,
-                    server_mode: session.server_mode,
-                    server_url: &session.server_url,
-                    state: session.state,
-                    active: Some(session.account_id) == active,
-                    needs_sign_in: session.offline_only,
+                .map(|session| {
                     #[cfg(windows)]
-                    hello_enabled: session.unlock_data.is_some()
-                        && super::hello::is_enabled(session),
+                    let (pin_enabled, pin_persistent) = super::pin::status(session);
+                    AccountSummary {
+                        id: session.account_id,
+                        email: &session.email,
+                        server_mode: session.server_mode,
+                        server_url: &session.server_url,
+                        state: session.state,
+                        active: Some(session.account_id) == active,
+                        needs_sign_in: session.offline_only,
+                        #[cfg(windows)]
+                        hello_enabled: session.unlock_data.is_some()
+                            && super::hello::is_enabled(session),
+                        #[cfg(windows)]
+                        pin_enabled,
+                        #[cfg(windows)]
+                        pin_persistent,
+                    }
                 })
                 .collect::<Vec<_>>(),
         )
@@ -221,7 +233,10 @@ fn revoke_and_clear(session: &mut AuthSession) -> bool {
     session.unlock_data = None;
     session.state = SESSION_LOCKED;
     #[cfg(windows)]
-    return super::remove_cached_vault(session);
+    {
+        super::pin::clear_session(session);
+        super::remove_cached_vault(session)
+    }
     #[cfg(not(windows))]
     true
 }

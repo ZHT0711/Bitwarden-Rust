@@ -364,6 +364,59 @@ internal static class NativeLifecycle
             check(removed.Passkeys?.Length == 0 && removed.Totp is { Status: "ready" },
                 "saving passkey removal persists through sync and preserves the login TOTP");
 
+            check(RustCore.CheckPasswordStrength("123456", "alice") <= 1
+                && RustCore.CheckPasswordStrength("Correct-Horse-Battery-Staple-99!@", "alice") == 4,
+                "native password strength scores weak and strong passwords through ABI");
+            var generatedWord = RustCore.GenerateUsernameWord(true, true, CancellationToken.None);
+            check(generatedWord.Length > 4 && char.IsUpper(generatedWord[0]) && generatedWord[^4..].All(char.IsAsciiDigit),
+                "native username word generator honors capitalization and a four-digit suffix");
+            check(RustCore.GenerateUsernameSubaddress("user@example.invalid", "fixture", CancellationToken.None) == "user+fixture@example.invalid",
+                "native username subaddress accepts the website append variant");
+            check(RustCore.GenerateUsernameCatchall("example.invalid", "fixture", CancellationToken.None) == "fixture@example.invalid",
+                "native username catchall accepts the website append variant");
+            check(RustCore.GetAccountFingerprint().Split('-').Length == 5,
+                "account fingerprint phrase produces five hyphen-separated words");
+
+            var noteDraft = new VaultEditorData(
+                null, "Bulk note 1", 2, null, false, false, null, "Synthetic bulk body", [], [], [], true, false, false, false, false);
+            var bulk1 = RustCore.CreateVaultItem(noteDraft, CancellationToken.None).Id ?? throw new Exception("Bulk create 1 returned no id.");
+            var bulk2 = RustCore.CreateVaultItem(noteDraft with { Name = "Bulk note 2" }, CancellationToken.None).Id ?? throw new Exception("Bulk create 2 returned no id.");
+            string[] bulkIds = [bulk1, bulk2];
+            var bulkTrashed = RustCore.BulkVaultAction(bulkIds, "trash", string.Empty, CancellationToken.None);
+            check(bulkTrashed.Overview.Items.Count(candidate => bulkIds.Contains(candidate.Id) && candidate.Deleted) == 2,
+                "bulk trash moves all selected items to trash");
+            var bulkRestored = RustCore.BulkVaultAction(bulkIds, "restore", string.Empty, CancellationToken.None);
+            check(bulkRestored.Overview.Items.Count(candidate => bulkIds.Contains(candidate.Id) && !candidate.Deleted) == 2,
+                "bulk restore returns all selected items");
+            RustCore.BulkVaultAction(bulkIds, "trash", string.Empty, CancellationToken.None);
+            var bulkDeleted = RustCore.BulkVaultAction(bulkIds, "delete", string.Empty, CancellationToken.None);
+            check(bulkDeleted.Overview.Items.All(candidate => !bulkIds.Contains(candidate.Id)),
+                "bulk permanent delete removes all selected items");
+
+            var accountId = RustCore.GetAccounts().Single().Id;
+            RustCore.EnablePin(accountId, FixturePassword, "123456", requireMasterPasswordOnRestart: true, CancellationToken.None);
+            check(RustCore.GetAccounts().Single() is { PinEnabled: true, PinPersistent: false },
+                "session PIN enrollment is exposed on account summary");
+            check(RustCore.Lock(), "account locks for PIN unlock lifecycle");
+            ExpectCode(() => RustCore.UnlockPin(accountId, "000000", CancellationToken.None), "wrongPin",
+                "wrong PIN fails while preserving PIN enrollment");
+            RustCore.UnlockPin(accountId, "123456", CancellationToken.None);
+            check(RustCore.GetVaultOverview().Items.Any(candidate => candidate.Id == passkeyId),
+                "correct PIN unlocks the local vault without contacting the server");
+            check(RustCore.Lock(), "account locks for PIN lockout test");
+            for (var attempt = 1; attempt <= 4; attempt++)
+                ExpectCode(() => RustCore.UnlockPin(accountId, "000000", CancellationToken.None), "wrongPin",
+                    $"wrong PIN attempt {attempt} reports wrongPin");
+            ExpectCode(() => RustCore.UnlockPin(accountId, "000000", CancellationToken.None), "pinRevoked",
+                "fifth failed PIN attempt revokes PIN unlock");
+            check(!RustCore.GetAccounts().Single().PinEnabled,
+                "revoked PIN clears PinEnabled on account summary");
+            RustCore.Unlock(FixturePassword, CancellationToken.None);
+            RustCore.EnablePin(accountId, FixturePassword, "654321", requireMasterPasswordOnRestart: true, CancellationToken.None);
+            check(RustCore.GetAccounts().Single().PinEnabled, "PIN can be re-enabled after lockout");
+            RustCore.DisablePin(accountId);
+            check(!RustCore.GetAccounts().Single().PinEnabled, "disabling PIN clears PinEnabled on account summary");
+
             await Control("change-master-password-wrapper");
             RustCore.SyncVault(CancellationToken.None);
             check(RustCore.Lock(), "account can lock again after a complete write lifecycle");

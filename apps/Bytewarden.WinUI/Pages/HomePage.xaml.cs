@@ -57,7 +57,7 @@ public sealed partial class HomePage : Page
         if (_category == targetCategory && folderId is null) return;
         _category = targetCategory;
         UpdateCategoryHeader();
-        if (_selectingItems && _category == "trash") SetItemSelectionMode(false);
+        if (_selectingItems) SetItemSelectionMode(false);
         if (folderId is not null)
         {
             if (_folderChoices.TryGetValue(folderId, out var choice) && !ReferenceEquals(FolderFilter.SelectedItem, choice))
@@ -158,6 +158,7 @@ public sealed partial class HomePage : Page
             else if (child is TextBox textBox) textBox.Text = string.Empty;
             else if (child is Panel nested) ClearDetailInputs(nested);
             else if (child is Border { Child: Panel borderedPanel }) ClearDetailInputs(borderedPanel);
+            else if (child is Expander { Content: Panel expandedPanel }) ClearDetailInputs(expandedPanel);
         }
     }
 
@@ -410,13 +411,30 @@ public sealed partial class HomePage : Page
             DetailPanel.Children.Add(section);
         }
         var bodyStrong = (Style)Application.Current.Resources["BodyStrongTextBlockStyle"];
+        var captionStyle = (Style)Application.Current.Resources["CaptionTextBlockStyle"];
         foreach (var field in detail.Fields)
         {
             var panel = new StackPanel { Spacing = 6 };
-            var labelRow = new Grid { ColumnSpacing = 8 };
+            var labelRow = new Grid { ColumnSpacing = 6 };
             labelRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            if (field.LaunchUri is { Length: > 0 } launchUri)
+                labelRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             labelRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             labelRow.Children.Add(new TextBlock { Text = field.Label, Style = bodyStrong, VerticalAlignment = VerticalAlignment.Center });
+            var copyColumn = 1;
+            if (field.LaunchUri is { Length: > 0 } targetUri)
+            {
+                var launch = new Button { Content = "打开", Padding = new Thickness(10, 3, 10, 3) };
+                Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(launch, $"打开{field.Label}");
+                launch.Click += async (_, _) =>
+                {
+                    if (Uri.TryCreate(targetUri, UriKind.Absolute, out var uri))
+                        await Windows.System.Launcher.LaunchUriAsync(uri);
+                };
+                Grid.SetColumn(launch, 1);
+                labelRow.Children.Add(launch);
+                copyColumn = 2;
+            }
             var copy = new Button { Content = "复制", Padding = new Thickness(10, 3, 10, 3) };
             Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(copy, $"复制{field.Label}");
             copy.Click += (_, _) =>
@@ -425,7 +443,7 @@ public sealed partial class HomePage : Page
                 catch (Exception error) when (error is System.Runtime.InteropServices.COMException or InvalidOperationException)
                 { copy.Content = "剪贴板暂时不可用"; }
             };
-            Grid.SetColumn(copy, 1);
+            Grid.SetColumn(copy, copyColumn);
             labelRow.Children.Add(copy);
             panel.Children.Add(labelRow);
             if (field.Sensitive) panel.Children.Add(PasswordVisibility.WithToggle(new PasswordBox { Password = field.Value }, field.Label));
@@ -435,16 +453,109 @@ public sealed partial class HomePage : Page
                 Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(value, field.Label);
                 panel.Children.Add(value);
             }
+            if (detail.ItemType == 1 && field.Sensitive && field.Label == "密码")
+            {
+                var metaRow = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10 };
+                if (detail.PasswordStrength is int score)
+                {
+                    metaRow.Children.Add(new TextBlock
+                    {
+                        Text = $"密码强度：{PasswordStrengthLabel(score)}",
+                        Style = captionStyle,
+                        Opacity = 0.85,
+                        VerticalAlignment = VerticalAlignment.Center,
+                    });
+                }
+                var checkButton = new Button { Content = "检查泄露", Padding = new Thickness(10, 3, 10, 3) };
+                var exposedText = new TextBlock { Style = captionStyle, TextWrapping = TextWrapping.Wrap, VerticalAlignment = VerticalAlignment.Center };
+                var pwValue = field.Value;
+                var detailVersion = _version;
+                var detailToken = _operation?.Token ?? CancellationToken.None;
+                checkButton.Click += async (_, _) => await CheckExposedAsync(pwValue, checkButton, exposedText, detailVersion, detailToken);
+                metaRow.Children.Add(checkButton);
+                metaRow.Children.Add(exposedText);
+                panel.Children.Add(metaRow);
+            }
             DetailPanel.Children.Add(panel);
         }
         ShowAttachmentDetails(detail);
+        if (detail.PasswordHistory is { Length: > 0 } history)
+        {
+            var historyPanel = new StackPanel { Spacing = 8 };
+            foreach (var entry in history)
+            {
+                var entryRow = new StackPanel { Spacing = 4 };
+                var rowHeader = new Grid { ColumnSpacing = 8 };
+                rowHeader.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+                rowHeader.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+                rowHeader.Children.Add(new TextBlock
+                {
+                    Text = $"曾使用于 {entry.LastUsedDate.ToLocalTime():yyyy-MM-dd HH:mm:ss}",
+                    Style = captionStyle,
+                    Opacity = 0.78,
+                    VerticalAlignment = VerticalAlignment.Center,
+                });
+                var copyHistory = new Button { Content = "复制", Padding = new Thickness(10, 3, 10, 3) };
+                var historyPw = entry.Password;
+                copyHistory.Click += (_, _) =>
+                {
+                    try { ClipboardCleaner.Copy(historyPw); copyHistory.Content = "已复制"; }
+                    catch (Exception error) when (error is System.Runtime.InteropServices.COMException or InvalidOperationException)
+                    { copyHistory.Content = "剪贴板暂时不可用"; }
+                };
+                Grid.SetColumn(copyHistory, 1);
+                rowHeader.Children.Add(copyHistory);
+                entryRow.Children.Add(rowHeader);
+                entryRow.Children.Add(PasswordVisibility.WithToggle(new PasswordBox { Password = entry.Password }, "历史密码"));
+                historyPanel.Children.Add(entryRow);
+            }
+            DetailPanel.Children.Add(new Expander
+            {
+                Header = $"密码历史（{history.Length}）",
+                Content = historyPanel,
+                HorizontalAlignment = HorizontalAlignment.Stretch,
+                HorizontalContentAlignment = HorizontalAlignment.Stretch,
+            });
+        }
+        var dates = new List<string>(3);
+        if (detail.CreationDate is { } created) dates.Add($"创建时间 {created.ToLocalTime():yyyy-MM-dd HH:mm:ss}");
+        dates.Add($"修改时间 {detail.RevisionDate.ToLocalTime():yyyy-MM-dd HH:mm:ss}");
+        if (detail.PasswordRevisionDate is { } pwUpdated) dates.Add($"密码更新时间 {pwUpdated.ToLocalTime():yyyy-MM-dd HH:mm:ss}");
         DetailPanel.Children.Add(new TextBlock
         {
-            Text = $"修改时间 {detail.RevisionDate.ToLocalTime():yyyy-MM-dd HH:mm:ss}",
+            Text = string.Join("\n", dates),
             TextWrapping = TextWrapping.Wrap,
-            Style = (Style)Application.Current.Resources["CaptionTextBlockStyle"],
+            Style = captionStyle,
             Opacity = 0.72,
         });
+    }
+
+    internal static string PasswordStrengthLabel(int score) => score switch
+    {
+        0 => "极弱",
+        1 => "较弱",
+        2 => "一般",
+        3 => "强",
+        4 => "非常强",
+        _ => "未知",
+    };
+
+    private async Task CheckExposedAsync(string password, Button button, TextBlock status, int version, CancellationToken token)
+    {
+        button.IsEnabled = false;
+        status.Text = "正在检查泄露状态…";
+        try
+        {
+            var count = await Task.Run(() => RustCore.CheckPasswordExposed(password, token), token);
+            if (!IsCurrent(version, token)) return;
+            status.Text = count == 0
+                ? "未在已知数据泄露中发现此密码。"
+                : $"警告：此密码已在 {count:N0} 次已知数据泄露中出现，建议立即更换。";
+        }
+        catch (OperationCanceledException) { }
+        catch (VaultException error) { if (IsCurrent(version, token)) status.Text = error.UserMessage; }
+        catch (Exception error) when (IsCoreUnavailable(error)) { if (IsCurrent(version, token)) status.Text = "Rust 核心不可用。"; }
+        finally { if (IsCurrent(version, token)) button.IsEnabled = true; }
     }
 
     private bool IsCurrent(int version, CancellationToken token) => _loaded && version == _version && !token.IsCancellationRequested;

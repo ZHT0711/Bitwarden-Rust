@@ -4,6 +4,7 @@
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
     xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:local="using:Bytewarden.WinUI.Pages"
     xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
     mc:Ignorable="d">
     <Grid Padding="20,10,20,16" RowSpacing="12">
@@ -14,14 +15,15 @@
 
         <StackPanel Orientation="Horizontal" Spacing="10" VerticalAlignment="Center">
             <TextBlock Style="{StaticResource SubtitleTextBlockStyle}" Text="密码生成器" VerticalAlignment="Center" />
-            <TextBlock Style="{StaticResource CaptionTextBlockStyle}" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="使用 Bitwarden Rust SDK 生成密码和密码短语。" VerticalAlignment="Center" Margin="0,2,0,0" TextTrimming="CharacterEllipsis" />
+            <TextBlock Style="{StaticResource CaptionTextBlockStyle}" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="使用 Bitwarden Rust SDK 生成密码、密码短语与用户名。" VerticalAlignment="Center" Margin="0,2,0,0" TextTrimming="CharacterEllipsis" />
         </StackPanel>
 
         <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
             <StackPanel MaxWidth="720" Spacing="16">
                 <Border Padding="24" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1" CornerRadius="8">
-                    <Grid RowSpacing="16">
+                    <Grid RowSpacing="12">
                         <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
                             <RowDefinition Height="Auto" />
                             <RowDefinition Height="Auto" />
                             <RowDefinition Height="Auto" />
@@ -31,9 +33,11 @@
                             <Button Grid.Column="1" Content="复制" Click="Copy_Click" />
                         </Grid>
                         <TextBox Grid.Row="1" x:Name="GeneratedPassword" FontFamily="Consolas" FontSize="18" IsReadOnly="True" PlaceholderText="点击“生成密码”" TextWrapping="Wrap" />
-                        <StackPanel Grid.Row="2" Orientation="Horizontal" Spacing="10">
+                        <TextBlock Grid.Row="2" x:Name="PasswordStrengthLabel" Style="{StaticResource CaptionTextBlockStyle}" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Visibility="Collapsed" />
+                        <StackPanel Grid.Row="3" Orientation="Horizontal" Spacing="10">
                             <Button x:Name="GenerateButton" Content="生成密码" Click="Generate_Click" />
                             <Button Content="清空" Click="Clear_Click" />
+                            <ProgressRing x:Name="UsernameProgress" Width="20" Height="20" IsActive="False" Visibility="Collapsed" />
                         </StackPanel>
                     </Grid>
                 </Border>
@@ -43,39 +47,40 @@
                         <RadioButtons x:Name="CredentialType" Header="生成类型" SelectionChanged="CredentialType_SelectionChanged">
                             <x:String>密码</x:String>
                             <x:String>密码短语</x:String>
+                            <x:String>用户名</x:String>
                         </RadioButtons>
                         <StackPanel x:Name="PasswordOptions" Spacing="16">
-                        <TextBlock Style="{StaticResource SubtitleTextBlockStyle}" Text="密码选项" />
-                        <StackPanel Spacing="6">
-                            <Grid ColumnDefinitions="*,Auto">
-                                <TextBlock Text="长度" />
-                                <TextBlock x:Name="LengthLabel" Grid.Column="1" Text="14" />
+                            <TextBlock Style="{StaticResource SubtitleTextBlockStyle}" Text="密码选项" />
+                            <StackPanel Spacing="6">
+                                <Grid ColumnDefinitions="*,Auto">
+                                    <TextBlock Text="长度" />
+                                    <TextBlock x:Name="LengthLabel" Grid.Column="1" Text="14" />
+                                </Grid>
+                                <Slider x:Name="LengthSlider" Maximum="128" Minimum="5" StepFrequency="1" Value="14" ValueChanged="LengthSlider_ValueChanged" />
+                            </StackPanel>
+                            <Grid ColumnSpacing="32">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
+                                <StackPanel Spacing="10">
+                                    <ToggleSwitch x:Name="Uppercase" Header="大写字母" IsOn="True" Toggled="PasswordOption_Toggled" />
+                                    <ToggleSwitch x:Name="Lowercase" Header="小写字母" IsOn="True" Toggled="PasswordOption_Toggled" />
+                                    <ToggleSwitch x:Name="Numbers" Header="数字" IsOn="True" Toggled="PasswordOption_Toggled" />
+                                </StackPanel>
+                                <StackPanel Grid.Column="1" Spacing="10">
+                                    <ToggleSwitch x:Name="Special" Header="特殊字符 !@#$%^&amp;*" IsOn="False" Toggled="PasswordOption_Toggled" />
+                                    <ToggleSwitch x:Name="AvoidAmbiguous" Header="避免易混淆字符" IsOn="False" Toggled="PasswordOption_Toggled" />
+                                </StackPanel>
                             </Grid>
-                            <Slider x:Name="LengthSlider" Maximum="128" Minimum="5" StepFrequency="1" Value="14" ValueChanged="LengthSlider_ValueChanged" />
-                        </StackPanel>
-                        <Grid ColumnSpacing="32">
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="*" />
-                                <ColumnDefinition Width="*" />
-                            </Grid.ColumnDefinitions>
-                            <StackPanel Spacing="10">
-                                <ToggleSwitch x:Name="Uppercase" Header="大写字母" IsOn="True" Toggled="PasswordOption_Toggled" />
-                                <ToggleSwitch x:Name="Lowercase" Header="小写字母" IsOn="True" Toggled="PasswordOption_Toggled" />
-                                <ToggleSwitch x:Name="Numbers" Header="数字" IsOn="True" Toggled="PasswordOption_Toggled" />
-                            </StackPanel>
-                            <StackPanel Grid.Column="1" Spacing="10">
-                                <ToggleSwitch x:Name="Special" Header="特殊字符 !@#$%^&amp;*" IsOn="False" Toggled="PasswordOption_Toggled" />
-                                <ToggleSwitch x:Name="AvoidAmbiguous" Header="避免易混淆字符" IsOn="False" Toggled="PasswordOption_Toggled" />
-                            </StackPanel>
-                        </Grid>
-                        <Grid ColumnSpacing="16">
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="*" />
-                                <ColumnDefinition Width="*" />
-                            </Grid.ColumnDefinitions>
-                            <NumberBox x:Name="MinimumNumbers" Header="最少数字" Minimum="0" Maximum="9" SpinButtonPlacementMode="Compact" Value="1" ValueChanged="PasswordOption_ValueChanged" />
-                            <NumberBox x:Name="MinimumSpecial" Grid.Column="1" Header="最少特殊字符" Minimum="0" Maximum="9" SpinButtonPlacementMode="Compact" Value="0" ValueChanged="PasswordOption_ValueChanged" />
-                        </Grid>
+                            <Grid ColumnSpacing="16">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
+                                <NumberBox x:Name="MinimumNumbers" Header="最少数字" Minimum="0" Maximum="9" SpinButtonPlacementMode="Compact" Value="1" ValueChanged="PasswordOption_ValueChanged" />
+                                <NumberBox x:Name="MinimumSpecial" Grid.Column="1" Header="最少特殊字符" Minimum="0" Maximum="9" SpinButtonPlacementMode="Compact" Value="0" ValueChanged="PasswordOption_ValueChanged" />
+                            </Grid>
                         </StackPanel>
                         <StackPanel x:Name="PassphraseOptions" Spacing="16" Visibility="Collapsed">
                             <TextBlock Style="{StaticResource SubtitleTextBlockStyle}" Text="密码短语选项" />
@@ -84,9 +89,58 @@
                             <ToggleSwitch x:Name="CapitalizeWords" Header="每个单词首字母大写" IsOn="False" Toggled="PassphraseOption_Toggled" />
                             <ToggleSwitch x:Name="IncludeNumber" Header="包含一个数字" IsOn="False" Toggled="PassphraseOption_Toggled" />
                         </StackPanel>
+                        <StackPanel x:Name="UsernameOptions" Spacing="14" Visibility="Collapsed">
+                            <TextBlock Style="{StaticResource SubtitleTextBlockStyle}" Text="用户名选项" />
+                            <ComboBox x:Name="UsernameTypeChoice" Header="用户名类型" HorizontalAlignment="Stretch" SelectionChanged="UsernameTypeChoice_Changed">
+                                <ComboBoxItem Content="随机词" Tag="word" />
+                                <ComboBoxItem Content="加号邮箱别名（+subaddress）" Tag="subaddress" />
+                                <ComboBoxItem Content="域名 Catch-all 邮箱" Tag="catchall" />
+                                <ComboBoxItem Content="转发邮箱别名服务" Tag="forwarded" />
+                            </ComboBox>
+                            <StackPanel x:Name="UsernameWordPanel" Spacing="10">
+                                <ToggleSwitch x:Name="UsernameCapitalize" Header="首字母大写" IsOn="True" />
+                                <ToggleSwitch x:Name="UsernameIncludeNumber" Header="附加随机数字" IsOn="True" />
+                            </StackPanel>
+                            <TextBox x:Name="SubaddressEmail" Header="基础邮箱" PlaceholderText="name@example.com" Visibility="Collapsed" />
+                            <TextBox x:Name="CatchallDomain" Header="邮箱域名" PlaceholderText="example.com" Visibility="Collapsed" />
+                            <ToggleSwitch x:Name="UsernameUseWebsiteToggle" Header="使用网站名称而非随机字符" IsOn="False" Toggled="UsernameUseWebsiteToggle_Toggled" Visibility="Collapsed" />
+                            <StackPanel x:Name="UsernameForwarderPanel" Spacing="10" Visibility="Collapsed">
+                                <ComboBox x:Name="ForwarderServiceChoice" Header="转发服务商" HorizontalAlignment="Stretch" SelectionChanged="ForwarderServiceChoice_Changed">
+                                    <ComboBoxItem Content="Addy.io" Tag="addyIo" />
+                                    <ComboBoxItem Content="DuckDuckGo" Tag="duckDuckGo" />
+                                    <ComboBoxItem Content="Firefox Relay" Tag="firefox" />
+                                    <ComboBoxItem Content="Fastmail" Tag="fastmail" />
+                                    <ComboBoxItem Content="ForwardEmail" Tag="forwardEmail" />
+                                    <ComboBoxItem Content="SimpleLogin" Tag="simpleLogin" />
+                                </ComboBox>
+                                <PasswordBox x:Name="ForwarderApiKey" Header="API Key / Token" PasswordRevealMode="Peek" />
+                                <TextBox x:Name="ForwarderDomain" Header="域名" PlaceholderText="example.com" Visibility="Collapsed" />
+                                <TextBox x:Name="ForwarderBaseUrl" Header="自托管或服务 Base URL" PlaceholderText="https://app.addy.io" Visibility="Collapsed" />
+                            </StackPanel>
+                            <TextBox x:Name="UsernameWebsite" Header="网站名称（可选）" PlaceholderText="example.com" Visibility="Collapsed" />
+                        </StackPanel>
                         <InfoBar x:Name="GeneratorNotice" IsOpen="False" Severity="Error" Title="无法生成密码" />
                     </StackPanel>
                 </Border>
+
+                <Expander x:Name="HistoryExpander" Header="生成历史记录（仅保留本次会话）" HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch" Visibility="Collapsed">
+                    <StackPanel Spacing="10">
+                        <Button Content="清空历史记录" Click="ClearHistory_Click" HorizontalAlignment="Left" />
+                        <ListView x:Name="HistoryList" MaxHeight="260" SelectionMode="None" HorizontalContentAlignment="Stretch">
+                            <ListView.ItemTemplate>
+                                <DataTemplate x:DataType="local:GeneratorHistoryItem">
+                                    <Grid Padding="4,6" ColumnSpacing="10" ColumnDefinitions="*,Auto,Auto">
+                                        <StackPanel Spacing="2">
+                                            <TextBlock Text="{x:Bind Value}" FontFamily="Consolas" TextTrimming="CharacterEllipsis" />
+                                            <TextBlock Text="{x:Bind Meta}" Style="{StaticResource CaptionTextBlockStyle}" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                        </StackPanel>
+                                        <Button Grid.Column="2" Content="复制" Tag="{x:Bind Value}" Click="CopyHistory_Click" VerticalAlignment="Center" />
+                                    </Grid>
+                                </DataTemplate>
+                            </ListView.ItemTemplate>
+                        </ListView>
+                    </StackPanel>
+                </Expander>
             </StackPanel>
         </ScrollViewer>
     </Grid>

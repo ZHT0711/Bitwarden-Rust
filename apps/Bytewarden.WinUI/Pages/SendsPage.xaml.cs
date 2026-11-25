@@ -125,8 +125,10 @@ public sealed partial class SendsPage : Page
     private void RenderRows()
     {
         var selected = (SendList.SelectedItem as SendSummary)?.Id;
-        var rows = _items is null ? [] : _search.Length == 0 ? _items :
-            _items.Where(item => item.Name.Contains(_search, StringComparison.OrdinalIgnoreCase)).ToArray();
+        var kindFilter = SendTypeFilter?.SelectedIndex ?? 0;
+        var rows = _items is null ? [] : _items.Where(item =>
+            (kindFilter == 0 || (kindFilter == 1 && item.Kind == 0) || (kindFilter == 2 && item.Kind == 1)) &&
+            (_search.Length == 0 || item.Name.Contains(_search, StringComparison.OrdinalIgnoreCase))).ToArray();
         SendList.ItemsSource = rows;
         if (selected is not null) SendList.SelectedItem = rows.FirstOrDefault(item => item.Id == selected);
         SendCount.Text = $"{rows.Length} 个 Send";
@@ -139,8 +141,13 @@ public sealed partial class SendsPage : Page
             _ => "登录",
         };
         EmptyMessage.Text = !_online ? "Send 需要已解锁并在线的账户。" : _items is null ? "刷新以加载 Send。" :
-            _search.Length == 0 ? "还没有 Send。" : "没有匹配的 Send。";
+            _search.Length != 0 ? "没有匹配的 Send。" : kindFilter != 0 ? "此类型下没有 Send。" : "还没有 Send。";
         UpdateCommands();
+    }
+
+    private void SendTypeFilter_Changed(object sender, SelectionChangedEventArgs e)
+    {
+        if (SendList is not null) RenderRows();
     }
 
     private void UpdateCommands()

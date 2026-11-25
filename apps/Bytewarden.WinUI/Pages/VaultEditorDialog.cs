@@ -239,10 +239,64 @@ internal sealed class VaultEditorDialog
         var values = _draftTypes.GetValueOrDefault(kind) ?? [];
         foreach (var schema in Schemas.For(kind))
         {
-            var input = new InputField(schema.Label, values.GetValueOrDefault(schema.Key) ?? string.Empty, schema.Secret, schema.Multiline, schema.Date);
-            AutomationProperties.SetAutomationId(input.Element, $"VaultEditor_{schema.Key}");
+            var choices = Schemas.Choices(kind, schema.Key);
+            var input = new InputField(schema.Label, values.GetValueOrDefault(schema.Key) ?? string.Empty,
+                schema.Secret, schema.Multiline, schema.Date, choices);
+            AutomationProperties.SetAutomationId(input.AutomationTarget, $"VaultEditor_{schema.Key}");
             _inputs[schema.Key] = input;
             _typeFields.Children.Add(input.Element);
+        }
+        if (kind == 1 && _inputs.TryGetValue("username", out var userInput) && _inputs.TryGetValue("password", out var passwordInput))
+        {
+            userInput.AttachAction("生成随机用户名", () =>
+            {
+                try
+                {
+                    userInput.WriteText(RustCore.GenerateUsernameWord(true, true, CancellationToken.None));
+                }
+                catch (Exception error) when (error is VaultException or DllNotFoundException or EntryPointNotFoundException or BadImageFormatException) { }
+            });
+            var strengthLabel = new TextBlock
+            {
+                Style = (Style)Application.Current.Resources["CaptionTextBlockStyle"],
+                Opacity = 0.85,
+                VerticalAlignment = VerticalAlignment.Center,
+            };
+            void UpdateStrength()
+            {
+                var pw = passwordInput.Read();
+                if (string.IsNullOrEmpty(pw))
+                {
+                    strengthLabel.Text = string.Empty;
+                    return;
+                }
+                try
+                {
+                    var score = RustCore.CheckPasswordStrength(pw, userInput.Read());
+                    strengthLabel.Text = score >= 0 ? $"强度：{HomePage.PasswordStrengthLabel(score)}" : string.Empty;
+                }
+                catch (Exception error) when (error is DllNotFoundException or EntryPointNotFoundException or BadImageFormatException)
+                {
+                    strengthLabel.Text = string.Empty;
+                }
+            }
+            passwordInput.AttachPasswordChanged(UpdateStrength);
+            userInput.AttachTextChanged(UpdateStrength);
+            passwordInput.AttachAction("生成密码", () =>
+            {
+                try
+                {
+                    var settings = GeneratorSettings.Load(Windows.Storage.ApplicationData.Current.LocalSettings.Values, AccountSettingsScope.Current);
+                    var generated = settings.SelectedType == 1
+                        ? RustCore.GeneratePassphrase((uint)settings.PassphraseWords, settings.WordSeparator, settings.CapitalizeWords, settings.IncludeNumber)
+                        : RustCore.GeneratePassword((uint)settings.PasswordLength, settings.Uppercase, settings.Lowercase, settings.Numbers,
+                            settings.Special, settings.AvoidAmbiguous, (uint)settings.MinimumNumbers, (uint)settings.MinimumSpecial);
+                    passwordInput.WritePassword(generated);
+                    UpdateStrength();
+                }
+                catch (Exception error) when (error is InvalidOperationException or DllNotFoundException or EntryPointNotFoundException or BadImageFormatException) { }
+            }, strengthLabel);
+            UpdateStrength();
         }
         _uriSection.Visibility = kind == 1 ? Visibility.Visible : Visibility.Collapsed;
     }
@@ -270,20 +324,46 @@ internal sealed class VaultEditorDialog
     private sealed class InputField
     {
         internal FrameworkElement Element { get; }
+        internal FrameworkElement AutomationTarget { get; }
+        private readonly StackPanel _container;
         private readonly TextBox? _text;
         private readonly PasswordBox? _password;
+        private readonly ComboBox? _combo;
         private readonly ToggleSwitch? _reveal;
-        internal InputField(string label, string value, bool secret, bool multiline, bool date = false)
+        internal InputField(string label, string value, bool secret, bool multiline, bool date = false, (string Value, string Label)[]? choices = null)
         {
+            _container = new StackPanel { Spacing = 6 };
+            if (choices is not null)
+            {
+                _combo = new ComboBox { Header = label, HorizontalAlignment = HorizontalAlignment.Stretch };
+                foreach (var (optionValue, optionLabel) in choices)
+                    _combo.Items.Add(new ComboBoxItem { Content = optionLabel, Tag = optionValue });
+                if (!string.IsNullOrEmpty(value) && !_combo.Items.OfType<ComboBoxItem>().Any(item => string.Equals(item.Tag as string, value, StringComparison.Ordinal)))
+                    _combo.Items.Add(new ComboBoxItem { Content = value, Tag = value });
+                _combo.SelectedItem = _combo.Items.OfType<ComboBoxItem>().FirstOrDefault(item => string.Equals(item.Tag as string, value, StringComparison.Ordinal))
+                    ?? _combo.Items.FirstOrDefault();
+                AutomationTarget = _combo;
+                Element = _combo;
+                return;
+            }
             if (!secret)
             {
                 _text = new TextBox { Header = label, Text = value, AcceptsReturn = multiline, TextWrapping = multiline ? TextWrapping.Wrap : TextWrapping.NoWrap,
                     MinHeight = multiline ? 100 : 0, MaxHeight = multiline ? 240 : double.PositiveInfinity, PlaceholderText = date ? "yyyy-MM-dd" : string.Empty };
-                Element = _text; return;
+                AutomationTarget = _text;
+                _container.Children.Add(_text);
+                Element = _container;
+                return;
             }
             _password = new PasswordBox { Header = label, Password = value, PasswordRevealMode = PasswordRevealMode.Peek };
-            if (!multiline) { Element = PasswordVisibility.WithToggle(_password); return; }
-            var panel = new StackPanel { Spacing = 6 };
+            if (!multiline)
+            {
+                var toggled = PasswordVisibility.WithToggle(_password);
+                AutomationTarget = toggled;
+                _container.Children.Add(toggled);
+                Element = _container;
+                return;
+            }
             _text = new TextBox { Header = label, AcceptsReturn = true, TextWrapping = TextWrapping.Wrap, MinHeight = 120, MaxHeight = 260, Visibility = Visibility.Collapsed };
             _reveal = new ToggleSwitch { Header = $"明文编辑{label}", IsOn = false, OnContent = "显示", OffContent = "隐藏" };
             _reveal.Toggled += (_, _) =>
@@ -291,10 +371,46 @@ internal sealed class VaultEditorDialog
                 if (_reveal.IsOn) { _text.Text = _password.Password; _text.Visibility = Visibility.Visible; _password.Visibility = Visibility.Collapsed; }
                 else { _password.Password = _text.Text; _text.Text = string.Empty; _text.Visibility = Visibility.Collapsed; _password.Visibility = Visibility.Visible; }
             };
-            panel.Children.Add(_password); panel.Children.Add(_text); panel.Children.Add(_reveal); Element = panel;
+            _container.Children.Add(_password);
+            _container.Children.Add(_text);
+            _container.Children.Add(_reveal);
+            AutomationTarget = _container;
+            Element = _container;
         }
-        internal string Read() => _password is null || _reveal?.IsOn == true ? _text?.Text ?? string.Empty : _password.Password;
-        internal void Clear() { if (_text is not null) _text.Text = string.Empty; if (_password is not null) _password.Password = string.Empty; }
+        internal void AttachAction(string buttonLabel, Action onClick, UIElement? trailing = null)
+        {
+            var row = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10 };
+            var button = new Button { Content = buttonLabel, Padding = new Thickness(10, 3, 10, 3) };
+            button.Click += (_, _) => onClick();
+            row.Children.Add(button);
+            if (trailing is not null) row.Children.Add(trailing);
+            _container.Children.Add(row);
+        }
+        internal void AttachTextChanged(Action onChanged)
+        {
+            if (_text is not null) _text.TextChanged += (_, _) => onChanged();
+        }
+        internal void AttachPasswordChanged(Action onChanged)
+        {
+            if (_password is not null) _password.PasswordChanged += (_, _) => onChanged();
+        }
+        internal void WriteText(string value)
+        {
+            if (_text is not null) _text.Text = value;
+        }
+        internal void WritePassword(string value)
+        {
+            if (_password is not null) _password.Password = value;
+        }
+        internal string Read() => _combo is not null
+            ? (_combo.SelectedItem as ComboBoxItem)?.Tag as string ?? string.Empty
+            : _password is null || _reveal?.IsOn == true ? _text?.Text ?? string.Empty : _password.Password;
+        internal void Clear()
+        {
+            if (_text is not null) _text.Text = string.Empty;
+            if (_password is not null) _password.Password = string.Empty;
+            if (_combo is not null) _combo.SelectedIndex = -1;
+        }
     }
 
     private sealed class UriRow
@@ -402,6 +518,17 @@ internal sealed class VaultEditorDialog
             7 => [new("firstName", "名"), new("middleName", "中间名"), new("lastName", "姓"), new("dateOfBirth", "出生日期", false, false, true), new("licenseNumber", "驾照号码", true), new("issuingCountry", "签发国家"), new("issuingState", "签发省 / 州"), new("issueDate", "签发日期", false, false, true), new("expirationDate", "到期日期", false, false, true), new("issuingAuthority", "签发机构"), new("licenseClass", "准驾类型")],
             8 => [new("surname", "姓"), new("givenName", "名"), new("dateOfBirth", "出生日期", false, false, true), new("sex", "性别"), new("birthPlace", "出生地"), new("nationality", "国籍"), new("issuingCountry", "签发国家"), new("passportNumber", "护照号码", true), new("passportType", "护照类型"), new("nationalIdentificationNumber", "国民身份号码", true), new("issuingAuthority", "签发机构"), new("issueDate", "签发日期", false, false, true), new("expirationDate", "到期日期", false, false, true)],
             _ => [],
+        };
+        internal static (string Value, string Label)[]? Choices(int type, string key) => (type, key) switch
+        {
+            (3, "brand") => [("", "-- 请选择 --"), ("Visa", "Visa"), ("Mastercard", "Mastercard"), ("Amex", "Amex"),
+                ("Discover", "Discover"), ("Diners Club", "Diners Club"), ("JCB", "JCB"), ("Maestro", "Maestro"),
+                ("UnionPay", "UnionPay"), ("RuPay", "RuPay"), ("Other", "Other")],
+            (3, "expMonth") => [("", "-- 请选择 --"), ("01", "01 - 一月"), ("02", "02 - 二月"), ("03", "03 - 三月"),
+                ("04", "04 - 四月"), ("05", "05 - 五月"), ("06", "06 - 六月"), ("07", "07 - 七月"), ("08", "08 - 八月"),
+                ("09", "09 - 九月"), ("10", "10 - 十月"), ("11", "11 - 十一月"), ("12", "12 - 十二月")],
+            (4, "title") => [("", "-- 请选择 --"), ("Mr", "Mr"), ("Mrs", "Mrs"), ("Ms", "Ms"), ("Mx", "Mx"), ("Dr", "Dr")],
+            _ => null,
         };
         internal static (string, int)[] Links(int type) => type switch
         {

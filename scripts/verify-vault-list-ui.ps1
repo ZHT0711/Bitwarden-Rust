@@ -26,12 +26,9 @@ if ($MeasureVault -and ($IncludeFolders -or $IncludeClipboardStress)) {
     throw 'Complete-vault pressure mode is separate; do not combine it with regression switches.'
 }
 $root = Split-Path $PSScriptRoot -Parent
-$winAppExe = (Get-Command winapp -CommandType Application -ErrorAction Stop).Source
-$pythonPath = (Get-Command $PythonExe -CommandType Application -ErrorAction Stop).Source
-$pythonProbe = & $pythonPath -c 'import sys; print("bytewarden-fixture-python3" if sys.version_info >= (3, 10) else "unsupported")' | Out-String
-if ($LASTEXITCODE -ne 0 -or $pythonProbe.Trim() -ne 'bytewarden-fixture-python3') {
-    throw 'A working Python 3.10+ interpreter is required. Pass -PythonExe with its full path; a Windows Store execution alias alone is not enough.'
-}
+$winAppExe = (Get-Command winapp -CommandType Application -TotalCount 1 -ErrorAction Stop).Source
+. (Join-Path $PSScriptRoot 'fixture-python.ps1')
+$pythonPath = Resolve-FixturePython $PythonExe
 $packagePath = (Resolve-Path (Join-Path $root $Package)).Path
 $fixturePath = (Resolve-Path (Join-Path $root $Fixture)).Path
 if ($CheckLinkedFields) {

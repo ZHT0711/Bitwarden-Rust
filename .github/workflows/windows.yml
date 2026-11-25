@@ -5,15 +5,25 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   windows:
-    runs-on: windows-latest
+    runs-on: windows-2025
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
       - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
         with:
           dotnet-version: 10.0.x
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        id: python
+        with:
+          python-version: '3.12'
+          architecture: x64
       - name: Prepare Rust
         id: rust-toolchain
         shell: pwsh
@@ -71,9 +81,13 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Managed filters and release native HTTP lifecycle
         shell: pwsh
+        env:
+          FIXTURE_PYTHON: ${{ steps.python.outputs.python-path }}
         run: |
           $ErrorActionPreference = 'Stop'
-          python tests/fixture_server.py --self-test
+          . ./scripts/fixture-python.ps1
+          $python = Resolve-FixturePython $env:FIXTURE_PYTHON
+          & $python tests/fixture_server.py --self-test
           if ($LASTEXITCODE) { throw "Fixture server self-tests failed with exit code $LASTEXITCODE." }
           $work = Join-Path $env:GITHUB_WORKSPACE 'work'
           $portFile = Join-Path $work 'ci-port.txt'
@@ -84,7 +98,6 @@ jobs:
           $baseUrl = $null
           $ready = $false
           try {
-            $python = (Get-Command python -ErrorAction Stop).Source
             $server = Start-Process -FilePath $python -ArgumentList @(
               '-u', 'tests/fixture_server.py', '--fixture', 'work/ci-fixture.json',
               '--port-file', 'work/ci-port.txt', '--peer'
@@ -113,7 +126,7 @@ jobs:
             if (-not $ready) { throw 'Fixture server readiness timed out after 30 seconds.' }
             $server.Refresh()
             if ($server.HasExited) { throw 'Fixture server exited before the native lifecycle checks.' }
-            dotnet run --project tests/Bytewarden.Interop.Tests -- target/release/bytewarden_core.dll $baseUrl
+            dotnet run --project tests/Bytewarden.Interop.Tests -c Release -- target/release/bytewarden_core.dll $baseUrl
             if ($LASTEXITCODE) { throw "Managed/native lifecycle checks failed with exit code $LASTEXITCODE." }
           } catch {
             if (-not $ready) {
@@ -147,11 +160,28 @@ jobs:
           }
       - name: Release native linked fields
         shell: pwsh
-        run: ./scripts/verify-linked-fields-native.ps1
-      - name: Build unsigned x64 MSIX preview
-        run: dotnet build apps/Bytewarden.WinUI/Bytewarden.WinUI.csproj -c Release -p:Platform=x64 -p:GenerateAppxPackageOnBuild=true -p:AppxPackageSigningEnabled=false --nologo
+        env:
+          FIXTURE_PYTHON: ${{ steps.python.outputs.python-path }}
+        run: ./scripts/verify-linked-fields-native.ps1 -PythonExe $env:FIXTURE_PYTHON
+      - name: Build and verify unsigned x64 MSIX preview
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $library = 'target/release/bytewarden_core.dll'
+          $testedHash = (Get-FileHash -LiteralPath $library -Algorithm SHA256).Hash
+          $packageDir = Join-Path $env:GITHUB_WORKSPACE 'work/ci-packages'
+          dotnet build apps/Bytewarden.WinUI/Bytewarden.WinUI.csproj -c Release -p:Platform=x64 -p:GenerateAppxPackageOnBuild=true -p:AppxPackageSigningEnabled=false "-p:AppxPackageDir=$packageDir/" --nologo
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $packages = @(Get-ChildItem -Path "$packageDir/*/Bytewarden.WinUI_*_x64.msix" -File)
+          if ($packages.Count -ne 1) { throw "Expected one Bytewarden x64 MSIX; found $($packages.Count)." }
+          $preview = ./scripts/verify-preview-package.ps1 -Package $packages[0].FullName -Library $library
+          if ($preview.LibrarySha256 -ne $testedHash) { throw 'Packaging changed the native DLL after interop tests.' }
+          @("## Unsigned x64 development preview", "- Package: $($preview.FileName)", "- Version: $($preview.PackageVersion)", "- MSIX SHA-256: $($preview.PackageSha256)", "- Tested native DLL SHA-256: $($preview.LibrarySha256)") |
+            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+          "path=$($packages[0].FullName)" | Add-Content -LiteralPath $env:GITHUB_OUTPUT
+        id: preview
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: Bytewarden-unsigned-msix-x64
-          path: apps/Bytewarden.WinUI/AppPackages/**/*.msix
+          path: ${{ steps.preview.outputs.path }}
           if-no-files-found: error

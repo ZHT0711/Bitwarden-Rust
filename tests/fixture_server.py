@@ -1013,6 +1013,35 @@ class FixtureHandler(BaseHTTPRequestHandler):
                 state.folders[folder_id] = updated
             self.reply(updated)
             return
+        if path in ("/api/ciphers/delete", "/api/ciphers/restore"):
+            ids = value.get("ids")
+            if not isinstance(ids, list) or not 1 <= len(ids) <= 500 or not all(isinstance(key, str) for key in ids):
+                self.fail("Invalid synthetic cipher batch.")
+                return
+            norm_ids = [key.lower() for key in ids]
+            permission = "delete" if path == "/api/ciphers/delete" else "restore"
+            with state.lock:
+                for key in norm_ids:
+                    cipher = state.ciphers.get(key)
+                    if cipher is None:
+                        self.fail("Synthetic cipher not found.", 404)
+                        return
+                    if not cipher["permissions"].get(permission, False):
+                        self.fail(f"Synthetic {permission} permission denied.", 403)
+                        return
+                revision = state.revision()
+                updated_items = []
+                for key in dict.fromkeys(norm_ids):
+                    updated = copy.deepcopy(state.ciphers[key])
+                    updated["revisionDate"] = revision
+                    updated["deletedDate"] = revision if path == "/api/ciphers/delete" else None
+                    state.ciphers[key] = updated
+                    updated_items.append(updated)
+            if path == "/api/ciphers/delete":
+                self.reply(None, 204)
+            else:
+                self.reply({"object": "list", "data": updated_items})
+            return
         match = re.fullmatch(r"/api/ciphers/([0-9a-fA-F-]{36})(?:/(partial|delete|restore|archive|unarchive))?", path)
         if not match:
             self.fail("Fixture route not found.", 404)
@@ -1143,6 +1172,29 @@ class FixtureHandler(BaseHTTPRequestHandler):
                 for cipher in state.ciphers.values():
                     if cipher.get("folderId") in deleted:
                         cipher["folderId"] = None
+            self.reply(None, 204)
+            return
+        if path == "/api/ciphers":
+            body = self.body()
+            value = self.json_body(body) if body is not None else None
+            if value is None:
+                return
+            ids = value.get("ids")
+            if not isinstance(ids, list) or not 1 <= len(ids) <= 500 or not all(isinstance(key, str) for key in ids):
+                self.fail("Invalid synthetic cipher batch.")
+                return
+            norm_ids = [key.lower() for key in ids]
+            with state.lock:
+                for key in norm_ids:
+                    cipher = state.ciphers.get(key)
+                    if cipher is None:
+                        self.fail("Synthetic cipher not found.", 404)
+                        return
+                    if not cipher["permissions"].get("delete", False):
+                        self.fail("Synthetic delete permission denied.", 403)
+                        return
+                for key in dict.fromkeys(norm_ids):
+                    del state.ciphers[key]
             self.reply(None, 204)
             return
         match = re.fullmatch(r"/api/ciphers/([0-9a-fA-F-]{36})", path)
@@ -1277,6 +1329,23 @@ def self_test() -> bool:
             self.assertIsNone(self.request("PUT", path + "/restore")[1]["deletedDate"])
             self.assertEqual(self.request("DELETE", path)[0], 204)
             self.assertEqual(self.request("GET", "/control/snapshot")[1]["cipherCount"], 0)
+
+        def test_bulk_trash_restore_and_permanent_delete(self):
+            first = self.create(name="first-bulk-item")
+            second = self.create(name="second-bulk-item")
+            ids = [first["id"], second["id"]]
+            self.assertEqual(self.request("PUT", "/api/ciphers/delete", {"ids": ids})[0], 204)
+            for item_id in ids:
+                self.assertIsNotNone(self.request("GET", "/api/ciphers/" + item_id)[1]["deletedDate"])
+            status, restored = self.request("PUT", "/api/ciphers/restore", {"ids": ids})
+            self.assertEqual(status, 200)
+            self.assertEqual(restored["object"], "list")
+            self.assertEqual([entry["id"] for entry in restored["data"]], ids)
+            for entry in restored["data"]:
+                self.assertIsNone(entry["deletedDate"])
+            self.assertEqual(self.request("DELETE", "/api/ciphers", {"ids": ids})[0], 204)
+            self.assertEqual(self.request("GET", "/control/snapshot")[1]["cipherCount"], 0)
+            self.assertEqual(self.request("PUT", "/api/ciphers/delete", {"ids": [str(uuid.uuid4())]})[0], 404)
 
         def test_folder_create_edit_delete_preserves_and_uncategorizes_ciphers(self):
             created_name = "encrypted-folder-name"

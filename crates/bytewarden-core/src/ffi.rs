@@ -37,6 +37,8 @@ mod hello_window;
 mod http_tests;
 #[cfg(windows)]
 mod passkeys;
+#[cfg(windows)]
+mod pin;
 mod remembered_two_factor;
 mod sends;
 
@@ -95,6 +97,8 @@ pub(super) struct AuthSession {
     open_detail: Option<OpenDetail>,
     offline_only: bool,
     send_write_uncertain: bool,
+    #[cfg(windows)]
+    pin_enrollment: Option<pin::PinEnrollment>,
 }
 
 struct OpenDetail {
@@ -250,6 +254,7 @@ pub(super) fn restore_persisted_sessions(limit: usize) -> Vec<AuthSession> {
                 open_detail: None,
                 offline_only: true,
                 send_write_uncertain: false,
+                pin_enrollment: None,
             })
         })
         .take(limit)
@@ -454,6 +459,9 @@ fn runtime() -> Option<&'static tokio::runtime::Runtime> {
         .as_ref()
 }
 
+#[cfg(test)]
+pub(in crate::ffi) static AUTH_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 fn auth_client() -> &'static Mutex<AuthAccounts> {
     AUTH_CLIENT.get_or_init(|| Mutex::new(AuthAccounts::default()))
 }
@@ -578,6 +586,8 @@ fn auth_client_for_server<'a>(
             open_detail: None,
             offline_only: false,
             send_write_uncertain: false,
+            #[cfg(windows)]
+            pin_enrollment: None,
         });
     }
 
@@ -1220,8 +1230,18 @@ fn complete_vault_unlock(
     request_id: u64,
     initialize: impl FnOnce(&AuthSession, &PasswordLoginUnlockData) -> Result<(), String>,
 ) -> *mut c_char {
+    match complete_vault_unlock_raw(request_id, initialize) {
+        Ok(()) => vault_success(&true),
+        Err(code) => vault_error(&code),
+    }
+}
+
+fn complete_vault_unlock_raw(
+    request_id: u64,
+    initialize: impl FnOnce(&AuthSession, &PasswordLoginUnlockData) -> Result<(), String>,
+) -> Result<(), String> {
     let Some(runtime) = runtime() else {
-        return vault_error("internal");
+        return Err("internal".to_owned());
     };
     let mut guard = auth_client()
         .lock()
@@ -1231,10 +1251,10 @@ fn complete_vault_unlock(
         .as_mut()
         .filter(|_| bw_auth_session_state() == SESSION_LOCKED)
     else {
-        return vault_error("unlockUnavailable");
+        return Err("unlockUnavailable".to_owned());
     };
     if session.unlock_data.is_none() {
-        return vault_error("unlockUnavailable");
+        return Err("unlockUnavailable".to_owned());
     }
     let result = catch_unwind(AssertUnwindSafe(|| {
         runtime.block_on(auth_request::run(request_id, async {
@@ -1268,7 +1288,7 @@ fn complete_vault_unlock(
         Ok(Ok(Ok(()))) if auth_request::is_current(request_id) => {
             session.state = SESSION_UNLOCKED;
             guard.publish_state();
-            return vault_success(&true);
+            return Ok(());
         }
         Ok(Ok(Ok(()))) | Ok(Err(RequestError::Cancelled)) => "cancelled".to_owned(),
         Ok(Err(RequestError::TimedOut)) => "timedOut".to_owned(),
@@ -1277,9 +1297,9 @@ fn complete_vault_unlock(
     };
     if !session.clear_vault_keys() {
         guard.remove_active();
-        return vault_error("internal");
+        return Err("internal".to_owned());
     }
-    vault_error(&code)
+    Err(code)
 }
 
 fn vault_access_error() -> *mut c_char {
@@ -1350,8 +1370,11 @@ pub extern "C" fn bw_vault_sync(request_id: u64) -> *mut c_char {
         // Sync can discover key rotation before rejecting other data or being cancelled.
         // Revocation must not depend on installing the replacement overview.
         #[cfg(windows)]
-        if session.unlock_data.is_none() && !remove_cached_vault(session) {
-            return vault_error("cacheRevocationFailed");
+        if session.unlock_data.is_none() {
+            pin::clear_session(session);
+            if !remove_cached_vault(session) {
+                return vault_error("cacheRevocationFailed");
+            }
         }
         match result {
             Ok(Ok(Ok(cache))) if auth_request::is_current(request_id) => {
@@ -1614,6 +1637,11 @@ enum VaultWriteCommand {
         revision: String,
         password: Zeroizing<String>,
     },
+    BulkAction {
+        ids: Vec<CipherId>,
+        action: String,
+        password: Zeroizing<String>,
+    },
 }
 
 fn perform_vault_write(command: VaultWriteCommand, request_id: u64) -> *mut c_char {
@@ -1655,6 +1683,7 @@ fn perform_vault_write(command: VaultWriteCommand, request_id: u64) -> *mut c_ch
                 | VaultWriteCommand::Update(..)
                 | VaultWriteCommand::Import { .. }
                 | VaultWriteCommand::Action { .. }
+                | VaultWriteCommand::BulkAction { .. }
         );
         // Catch inside the session guard: a panic after sending a write must force reconciliation.
         let result = catch_unwind(AssertUnwindSafe(|| {
@@ -1730,6 +1759,16 @@ fn perform_vault_write(command: VaultWriteCommand, request_id: u64) -> *mut c_ch
                             .action(&session.client, &id, &action, &revision, &password)
                             .await
                     }
+                    VaultWriteCommand::BulkAction {
+                        ids,
+                        action,
+                        password,
+                    } => {
+                        session
+                            .vault
+                            .bulk_action(&session.client, ids, &action, &password)
+                            .await
+                    }
                 }
             };
             if upload || importing {
@@ -1759,8 +1798,11 @@ fn perform_vault_write(command: VaultWriteCommand, request_id: u64) -> *mut c_ch
             session.vault.mark_write_uncertain();
         }
         #[cfg(windows)]
-        if importing && session.unlock_data.is_none() && !remove_cached_vault(session) {
-            return vault_error("cacheRevocationFailed");
+        if importing && session.unlock_data.is_none() {
+            pin::clear_session(session);
+            if !remove_cached_vault(session) {
+                return vault_error("cacheRevocationFailed");
+            }
         }
         #[cfg(windows)]
         cache_write.finish(
@@ -1952,6 +1994,191 @@ pub unsafe extern "C" fn bw_vault_action(
     .unwrap_or_else(|_| vault_error("internal"))
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct VaultBulkActionRequest {
+    ids: Vec<CipherId>,
+    action: String,
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn bw_vault_bulk_action(
+    json: *const c_char,
+    password: *const c_char,
+    request_id: u64,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let (Some(json), Some(password)) =
+            (unsafe { read_utf8(json) }, unsafe { read_utf8(password) })
+        else {
+            return vault_error("validation");
+        };
+        let password = Zeroizing::new(password);
+        let Ok(args) = serde_json::from_str::<VaultBulkActionRequest>(&json) else {
+            return vault_error("validation");
+        };
+        perform_vault_write(
+            VaultWriteCommand::BulkAction {
+                ids: args.ids,
+                action: args.action,
+                password,
+            },
+            request_id,
+        )
+    }))
+    .unwrap_or_else(|_| vault_error("internal"))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn bw_password_strength(
+    password: *const c_char,
+    username: *const c_char,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(password) = (unsafe { read_utf8(password) }) else {
+            return -1;
+        };
+        let password = Zeroizing::new(password);
+        if password.is_empty() {
+            return -1;
+        }
+        let username = unsafe { read_utf8(username) }.filter(|value| !value.is_empty());
+        let Some(runtime) = runtime() else {
+            return -1;
+        };
+        let details = bitwarden_vault::CipherLoginDetails {
+            id: Default::default(),
+            password: password.to_string(),
+            username,
+        };
+        let options = bitwarden_vault::CipherRiskOptions {
+            password_map: None,
+            check_exposed: false,
+            hibp_base_url: None,
+        };
+        use bitwarden_vault::VaultClientExt;
+        runtime
+            .block_on(
+                Client::new(None)
+                    .vault()
+                    .cipher_risk()
+                    .compute_risk(vec![details], options),
+            )
+            .ok()
+            .and_then(|results| results.into_iter().next())
+            .map_or(-1, |result| i32::from(result.password_strength))
+    }))
+    .unwrap_or(-1)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn bw_check_password_exposed(
+    password: *const c_char,
+    request_id: u64,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(password) = (unsafe { read_utf8(password) }) else {
+            return vault_error("validation");
+        };
+        let password = Zeroizing::new(password);
+        if password.is_empty() {
+            return vault_error("validation");
+        }
+        let Some(runtime) = runtime() else {
+            return vault_error("internal");
+        };
+        let details = bitwarden_vault::CipherLoginDetails {
+            id: Default::default(),
+            password: password.to_string(),
+            username: None,
+        };
+        let options = bitwarden_vault::CipherRiskOptions {
+            password_map: None,
+            check_exposed: true,
+            hibp_base_url: None,
+        };
+        use bitwarden_vault::{ExposedPasswordResult, VaultClientExt};
+        match runtime.block_on(auth_request::run(
+            request_id,
+            Client::new(None)
+                .vault()
+                .cipher_risk()
+                .compute_risk(vec![details], options),
+        )) {
+            Ok(Ok(results)) if auth_request::is_current(request_id) => {
+                match results.into_iter().next().map(|r| r.exposed_result) {
+                    Some(ExposedPasswordResult::Found(count)) => vault_success(&count),
+                    Some(ExposedPasswordResult::Error(_)) => vault_error("hibpError"),
+                    _ => vault_error("validation"),
+                }
+            }
+            Ok(Ok(_)) | Err(RequestError::Cancelled) => vault_error("cancelled"),
+            Err(RequestError::TimedOut) => vault_error("timedOut"),
+            Ok(Err(_)) => vault_error("hibpError"),
+        }
+    }))
+    .unwrap_or_else(|_| vault_error("internal"))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn bw_generate_username(json: *const c_char, request_id: u64) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(json) = (unsafe { read_utf8(json) }) else {
+            return vault_error("validation");
+        };
+        let json = Zeroizing::new(json);
+        if json.len() > 16_384 {
+            return vault_error("validation");
+        }
+        let Ok(request) =
+            serde_json::from_str::<bitwarden_generators::UsernameGeneratorRequest>(&json)
+        else {
+            return vault_error("validation");
+        };
+        let Some(runtime) = runtime() else {
+            return vault_error("internal");
+        };
+        match runtime.block_on(auth_request::run(request_id, generator().username(request))) {
+            Ok(Ok(value)) if auth_request::is_current(request_id) => vault_success(&value),
+            Ok(Ok(_)) | Err(RequestError::Cancelled) => vault_error("cancelled"),
+            Err(RequestError::TimedOut) => vault_error("timedOut"),
+            Ok(Err(bitwarden_generators::UsernameError::InvalidApiKey)) => {
+                vault_error("validation")
+            }
+            Ok(Err(_)) => vault_error("network"),
+        }
+    }))
+    .unwrap_or_else(|_| vault_error("internal"))
+}
+
+#[no_mangle]
+pub extern "C" fn bw_vault_fingerprint() -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let guard = auth_client()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(session) = guard
+            .active
+            .as_ref()
+            .filter(|_| bw_auth_session_state() == SESSION_UNLOCKED)
+        else {
+            return vault_access_error();
+        };
+        let Some(user_id) = session.vault.user_id() else {
+            return vault_error("notSynced");
+        };
+        match session
+            .client
+            .platform()
+            .user_fingerprint(user_id.to_string())
+        {
+            Ok(phrase) => vault_success(&phrase),
+            Err(_) => vault_error("decryptionFailed"),
+        }
+    }))
+    .unwrap_or_else(|_| vault_error("internal"))
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn bw_string_free(value: *mut c_char) {
     if value.is_null() {
@@ -2109,6 +2336,9 @@ mod tests {
 
     #[test]
     fn auth_logout_clears_in_memory_session_state() {
+        let _guard = super::AUTH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         super::SESSION_STATE.store(
             super::SESSION_UNLOCKED,
             std::sync::atomic::Ordering::Release,
@@ -2171,5 +2401,161 @@ mod tests {
                 .api_url,
             "http://localhost:8080/api"
         );
+    }
+
+    unsafe fn take_ffi_json(ptr: *mut std::ffi::c_char) -> serde_json::Value {
+        let text = unsafe { std::ffi::CStr::from_ptr(ptr) }
+            .to_str()
+            .expect("FFI string is valid UTF-8")
+            .to_owned();
+        unsafe { super::bw_string_free(ptr) };
+        serde_json::from_str(&text).expect("FFI result is JSON")
+    }
+
+    #[test]
+    fn password_strength_scores_weak_and_strong_passwords() {
+        let empty = std::ffi::CString::new("").unwrap();
+        let weak = std::ffi::CString::new("123456").unwrap();
+        let strong = std::ffi::CString::new("Correct-Horse-Battery-Staple-99!@").unwrap();
+        let user = std::ffi::CString::new("alice").unwrap();
+        unsafe {
+            assert_eq!(
+                super::bw_password_strength(std::ptr::null(), user.as_ptr()),
+                -1
+            );
+            assert_eq!(
+                super::bw_password_strength(empty.as_ptr(), user.as_ptr()),
+                -1
+            );
+            assert!((0..=1).contains(&super::bw_password_strength(weak.as_ptr(), user.as_ptr())));
+            assert_eq!(
+                super::bw_password_strength(strong.as_ptr(), user.as_ptr()),
+                4
+            );
+        }
+    }
+
+    #[test]
+    fn username_generator_supports_word_subaddress_and_catchall() {
+        let _guard = super::AUTH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (payload, check) in [
+            (
+                r#"{"word":{"capitalize":true,"include_number":true}}"#,
+                Box::new(|value: &str| {
+                    !value.is_empty() && value.chars().any(|c| c.is_ascii_digit())
+                }) as Box<dyn Fn(&str) -> bool>,
+            ),
+            (
+                r#"{"subaddress":{"type":"random","email":"user@example.com"}}"#,
+                Box::new(|value: &str| {
+                    value.starts_with("user+") && value.ends_with("@example.com")
+                }),
+            ),
+            (
+                r#"{"catchall":{"type":"random","domain":"example.com"}}"#,
+                Box::new(|value: &str| {
+                    value.ends_with("@example.com") && value.len() > "@example.com".len()
+                }),
+            ),
+        ] {
+            let json = std::ffi::CString::new(payload).unwrap();
+            let request_id = crate::auth_request::begin();
+            let response =
+                unsafe { take_ffi_json(super::bw_generate_username(json.as_ptr(), request_id)) };
+            assert_eq!(response["ok"], true, "failed payload {payload}: {response}");
+            let generated = response["data"].as_str().unwrap();
+            assert!(
+                check(generated),
+                "unexpected generated username {generated}"
+            );
+        }
+        let invalid = std::ffi::CString::new("{invalid").unwrap();
+        let request_id = crate::auth_request::begin();
+        let response =
+            unsafe { take_ffi_json(super::bw_generate_username(invalid.as_ptr(), request_id)) };
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["error"], "validation");
+    }
+
+    #[test]
+    fn vault_fingerprint_requires_unlocked_synced_session_and_returns_five_words() {
+        struct SessionReset;
+        impl Drop for SessionReset {
+            fn drop(&mut self) {
+                super::accounts::bw_auth_logout_all();
+            }
+        }
+
+        let _guard = super::AUTH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _reset = SessionReset;
+        super::accounts::bw_auth_logout_all();
+        let signed_out = unsafe { take_ffi_json(super::bw_vault_fingerprint()) };
+        assert_eq!(signed_out["error"], "notAuthenticated");
+
+        let runtime = super::runtime().expect("runtime");
+        let client = runtime.block_on(Client::init_test_account(
+            bw_sdk_core::client::test_accounts::test_bitwarden_com_account(),
+        ));
+        let user_id = client.internal.get_user_id().unwrap();
+        let sync_response = bitwarden_api_api::models::SyncResponseModel {
+            profile: Some(Box::new(bitwarden_api_api::models::ProfileResponseModel {
+                id: Some(user_id.to_string().parse().unwrap()),
+                organizations: Some(vec![]),
+                ..Default::default()
+            })),
+            ciphers: Some(vec![]),
+            folders: Some(vec![]),
+            ..Default::default()
+        };
+        let vault = runtime
+            .block_on(crate::vault::VaultCache::from_response(
+                &client,
+                sync_response,
+                &mut None,
+            ))
+            .unwrap();
+        let server = auth_server(0, "").unwrap();
+        let device_identifier = "11111111-1111-4111-8111-111111111111".to_owned();
+        let middleware =
+            std::sync::Arc::new(super::DeviceLoginMiddleware::new(device_identifier.clone()));
+        {
+            let mut accounts = super::auth_client().lock().unwrap();
+            accounts.active = Some(super::AuthSession {
+                account_id: uuid::Uuid::new_v4(),
+                email: "fingerprint@example.invalid".to_owned(),
+                server_mode: 0,
+                server_url: String::new(),
+                state: super::SESSION_UNLOCKED,
+                server,
+                device_identifier,
+                client,
+                device_login_middleware: middleware,
+                unlock_data: None,
+                vault,
+                open_detail: None,
+                offline_only: false,
+                send_write_uncertain: false,
+                #[cfg(windows)]
+                pin_enrollment: None,
+            });
+            super::SESSION_STATE.store(
+                super::SESSION_UNLOCKED,
+                std::sync::atomic::Ordering::Release,
+            );
+        }
+        let response = unsafe { take_ffi_json(super::bw_vault_fingerprint()) };
+        assert_eq!(
+            response["ok"], true,
+            "unexpected fingerprint error: {response}"
+        );
+        let phrase = response["data"].as_str().unwrap();
+        assert_eq!(phrase.split('-').count(), 5, "unexpected phrase {phrase}");
+        assert_eq!(super::accounts::bw_auth_lock(), 1);
+        let locked = unsafe { take_ffi_json(super::bw_vault_fingerprint()) };
+        assert_eq!(locked["error"], "locked");
     }
 }

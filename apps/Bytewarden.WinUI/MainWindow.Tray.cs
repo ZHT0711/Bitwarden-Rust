@@ -10,12 +10,16 @@ public sealed partial class MainWindow
     private bool _exitPrepared;
     private bool _exitReady;
     private bool _hiddenToTray;
+    private Windows.Graphics.RectInt32? _lastNormalBounds;
+    private bool _windowMaximized;
+    private bool _restoreMaximized;
 
     private void InitializeTray()
     {
         _tray = new WindowsTrayIcon(WinRT.Interop.WindowNative.GetWindowHandle(this), DispatcherQueue,
-            ShowMainWindow, ExitFromTray, RestoreIfTrayUnavailable);
+            ShowMainWindow, ExitFromTray, RestoreIfTrayUnavailable, LockFromTray, LockAllFromTray);
         AppWindow.Closing += OnWindowClosing;
+        AppWindow.Changed += OnWindowChanged;
     }
 
     internal void Launch(bool startup)
@@ -33,8 +37,15 @@ public sealed partial class MainWindow
             _hiddenToTray = false;
             AppWindow.Show();
         }
-        if (AppWindow.Presenter is OverlappedPresenter { State: OverlappedPresenterState.Minimized } presenter)
-            presenter.Restore();
+        if (AppWindow.Presenter is OverlappedPresenter presenter)
+        {
+            if (presenter.State == OverlappedPresenterState.Minimized) presenter.Restore();
+            if (_restoreMaximized)
+            {
+                _restoreMaximized = false;
+                presenter.Maximize();
+            }
+        }
         Activate();
     }
 
@@ -42,6 +53,19 @@ public sealed partial class MainWindow
     {
         // Never hide the only window without first making the restore command reachable.
         if (_tray?.TryRegister() != true) return false;
+        if (AppWindow.Presenter is OverlappedPresenter presenter)
+        {
+            if (presenter.State == OverlappedPresenterState.Restored)
+            {
+                _lastNormalBounds = new Windows.Graphics.RectInt32(
+                    AppWindow.Position.X, AppWindow.Position.Y, AppWindow.Size.Width, AppWindow.Size.Height);
+                _windowMaximized = false;
+            }
+            else if (presenter.State == OverlappedPresenterState.Maximized)
+            {
+                _windowMaximized = true;
+            }
+        }
         _hiddenToTray = true;
         AppWindow.Hide();
         return true;
@@ -77,6 +101,53 @@ public sealed partial class MainWindow
         }
     }
 
+    private void OnWindowChanged(AppWindow sender, AppWindowChangedEventArgs args)
+    {
+        if (sender.Presenter is not OverlappedPresenter presenter) return;
+        if (args.DidPresenterChange || args.DidPositionChange || args.DidSizeChange)
+        {
+            if (presenter.State == OverlappedPresenterState.Maximized)
+            {
+                _windowMaximized = true;
+            }
+            else if (presenter.State == OverlappedPresenterState.Restored)
+            {
+                _windowMaximized = false;
+                if (sender.IsVisible)
+                {
+                    _lastNormalBounds = new Windows.Graphics.RectInt32(
+                        sender.Position.X, sender.Position.Y, sender.Size.Width, sender.Size.Height);
+                }
+            }
+        }
+        if (args.DidPresenterChange
+            && presenter.State == OverlappedPresenterState.Minimized
+            && !_hiddenToTray
+            && !_exiting
+            && !_closed
+            && DesktopPreferences.Read(DesktopPreferences.MinimizeToTray, fallback: false))
+        {
+            TryHideToTray();
+        }
+    }
+
+    private async void LockFromTray()
+    {
+        if (_closed || _exiting || ActiveAccount is not { State: VaultSessionState.Unlocked }) return;
+        await ChangeAccountsAsync(() => { RustCore.Lock(); return RustCore.GetAccounts(); });
+    }
+
+    private async void LockAllFromTray()
+    {
+        if (_closed || _exiting) return;
+        var targets = _accounts
+            .Where(account => account.State == VaultSessionState.Unlocked)
+            .Select(account => new VaultAccountTimeout(account.Id, LogOut: false))
+            .ToArray();
+        if (targets.Length == 0) return;
+        await ChangeAccountsAsync(() => RustCore.ApplyAccountTimeouts(targets, interrupt: true));
+    }
+
     private void RestoreIfTrayUnavailable()
     {
         if (_hiddenToTray) ShowMainWindow();
@@ -91,6 +162,7 @@ public sealed partial class MainWindow
     private void DisposeTray()
     {
         AppWindow.Closing -= OnWindowClosing;
+        AppWindow.Changed -= OnWindowChanged;
         _tray?.Dispose();
         _tray = null;
     }

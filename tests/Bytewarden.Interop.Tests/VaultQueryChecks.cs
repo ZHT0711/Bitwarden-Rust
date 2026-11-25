@@ -54,10 +54,19 @@ internal static class VaultQueryChecks
         var invisible = source.Concat([a with { Id = "trash", Deleted = true }, b with { Id = "archive", Archived = true }]);
         check(VaultQuery.Apply(VaultQuery.Sort(invisible, VaultSort.RevisionNewest), "vault", "*", "mail").Length == 2,
             "sorted search excludes trash and archived items");
+        var hosted = b with { Id = "h", Name = "Corp Portal", Subtitle = "carol@example.invalid", WebsiteHost = "accounts.example.com" };
+        VaultItem[] withHosts = [a, b, c, hosted];
+        check(Ids(VaultQuery.Apply(withHosts, "vault", "*", "accounts.example")).SequenceEqual(["h"]), "metadata search matches WebsiteHost");
+        check(Ids(VaultQuery.Apply(withHosts, "vault", "*", ">name:alpha")).SequenceEqual(["a", "c"]), "advanced prefix >name: matches item names");
+        check(Ids(VaultQuery.Apply(withHosts, "vault", "*", ">subtitle:alice")).SequenceEqual(["a"]), "advanced prefix >subtitle: matches subtitles");
+        check(Ids(VaultQuery.Apply(withHosts, "vault", "*", ">uri:accounts.example")).SequenceEqual(["h"]), "advanced prefix >uri: matches website hosts");
+        check(Ids(VaultQuery.Apply(withHosts, "vault", "*", ">name:alpha -name:bank")).SequenceEqual(["a"]), "advanced prefix supports term negation");
+        check(VaultQuery.Apply(withHosts, "vault", "*", ">password:secret").Length == 0, "unknown advanced search prefixes match nothing without inspecting secrets");
         var large = Enumerable.Range(0, 10_000).Select(index => a with
         {
             Id = index.ToString(CultureInfo.InvariantCulture), Name = "Synthetic metadata",
             Subtitle = $"user{index % 100}@example.invalid",
+            WebsiteHost = index % 100 == 42 ? "accounts.example.com" : "other.example.com",
         }).ToArray();
         for (var warmup = 0; warmup < 10; warmup++) _ = VaultQuery.Apply(large, "vault", "*", "synthetic user42");
         var allocatedBefore = GC.GetAllocatedBytesForCurrentThread();
@@ -65,6 +74,12 @@ internal static class VaultQueryChecks
         var allocated = GC.GetAllocatedBytesForCurrentThread() - allocatedBefore;
         check(largeResult.Length == 100 && ReferenceEquals(largeResult[0], large[42]), "10000-item AND search keeps exact metadata objects and source order");
         check(allocated < 32_768, "10000-item metadata search avoids per-row closure/delegate allocations");
+        for (var warmup = 0; warmup < 10; warmup++) _ = VaultQuery.Apply(large, "vault", "*", ">name:synthetic uri:accounts.example -subtitle:other");
+        var advancedBefore = GC.GetAllocatedBytesForCurrentThread();
+        var advancedLargeResult = VaultQuery.Apply(large, "vault", "*", ">name:synthetic uri:accounts.example -subtitle:other");
+        var advancedAllocated = GC.GetAllocatedBytesForCurrentThread() - advancedBefore;
+        check(advancedLargeResult.Length == 100 && ReferenceEquals(advancedLargeResult[0], large[42]), "10000-item advanced > search keeps exact metadata objects and order");
+        check(advancedAllocated < 32_768, "10000-item advanced > search avoids per-row allocations");
     }
 
     internal static void Measure()

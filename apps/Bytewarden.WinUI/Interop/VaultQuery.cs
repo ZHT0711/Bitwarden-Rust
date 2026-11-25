@@ -7,17 +7,21 @@ internal enum VaultSort { NameAscending, NameDescending, RevisionNewest, Revisio
 
 internal static class VaultQuery
 {
+    private readonly record struct AdvancedTerm(bool Negate, byte Field, string Value);
+
     // Only list metadata is searched. Filtering must never open a secret detail or bypass reprompt.
     internal static VaultItem[] Apply(IEnumerable<VaultItem> source, string category, string folder, string query)
     {
         var type = category switch { "logins" => 1, "notes" => 2, "cards" => 3, "identities" => 4,
             "ssh" => 5, "bankaccounts" => 6, "licenses" => 7, "passports" => 8, _ => 0 };
-        var terms = SearchTerms(query);
+        var isAdvanced = query.StartsWith('>');
+        var advanced = isAdvanced ? ParseAdvancedTerms(query.AsSpan(1)) : [];
+        var terms = isAdvanced ? [] : SearchTerms(query);
         var isTrash = category == "trash";
         var isArchived = category == "archived";
         var isFavorites = category == "favorites";
         var allFolders = folder == "*";
-        var hasTerms = terms.Length > 0;
+        var hasTerms = isAdvanced ? advanced.Length > 0 : terms.Length > 0;
 
         if (source is VaultItem[] array)
         {
@@ -34,7 +38,7 @@ internal static class VaultQuery
                         (!isFavorites || item.Favorite) &&
                         (type == 0 || item.ItemType == type) &&
                         (allFolders || (item.FolderId ?? "") == folder) &&
-                        (!hasTerms || MatchesMetadata(item, terms)))
+                        (!hasTerms || (isAdvanced ? MatchesAdvanced(item, advanced) : MatchesMetadata(item, terms))))
                     {
                         if (buffer is not null) buffer[matchCount++] = item;
                         else matchCount++;
@@ -65,7 +69,7 @@ internal static class VaultQuery
                 (!isFavorites || item.Favorite) &&
                 (type == 0 || item.ItemType == type) &&
                 (allFolders || (item.FolderId ?? "") == folder) &&
-                (!hasTerms || MatchesMetadata(item, terms)))
+                (!hasTerms || (isAdvanced ? MatchesAdvanced(item, advanced) : MatchesMetadata(item, terms))))
             {
                 filtered.Add(item);
             }
@@ -81,9 +85,77 @@ internal static class VaultQuery
         {
             var term = terms[index];
             if (!item.Name.Contains(term, StringComparison.OrdinalIgnoreCase) &&
-                !item.Subtitle.Contains(term, StringComparison.OrdinalIgnoreCase)) return false;
+                !item.Subtitle.Contains(term, StringComparison.OrdinalIgnoreCase) &&
+                !(item.WebsiteHost is { Length: > 0 } host && host.Contains(term, StringComparison.OrdinalIgnoreCase)))
+                return false;
         }
         return true;
+    }
+
+    private static bool MatchesAdvanced(VaultItem item, AdvancedTerm[] terms)
+    {
+        for (var index = 0; index < terms.Length; index++)
+        {
+            var term = terms[index];
+            if (term.Field == 4) return false;
+            var matched = term.Field switch
+            {
+                1 => item.Name.Contains(term.Value, StringComparison.OrdinalIgnoreCase),
+                2 => item.Subtitle.Contains(term.Value, StringComparison.OrdinalIgnoreCase),
+                3 => item.WebsiteHost is { Length: > 0 } host && host.Contains(term.Value, StringComparison.OrdinalIgnoreCase),
+                _ => item.Name.Contains(term.Value, StringComparison.OrdinalIgnoreCase) ||
+                    item.Subtitle.Contains(term.Value, StringComparison.OrdinalIgnoreCase) ||
+                    (item.WebsiteHost is { Length: > 0 } anyHost && anyHost.Contains(term.Value, StringComparison.OrdinalIgnoreCase)),
+            };
+            if (term.Negate ? matched : !matched) return false;
+        }
+        return true;
+    }
+
+    private static AdvancedTerm[] ParseAdvancedTerms(ReadOnlySpan<char> span)
+    {
+        var raw = SearchTerms(span.ToString());
+        if (raw.Length == 0) return [];
+        var result = new List<AdvancedTerm>(raw.Length);
+        for (var index = 0; index < raw.Length; index++)
+        {
+            var token = raw[index];
+            var negate = false;
+            if (token.Length > 1 && token[0] == '-')
+            {
+                negate = true;
+                token = token[1..];
+            }
+            var colon = token.IndexOf(':');
+            if (colon > 0)
+            {
+                var prefix = token[..colon];
+                var value = token[(colon + 1)..];
+                if (prefix.Equals("name", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (value.Length > 0) result.Add(new(negate, 1, value));
+                    continue;
+                }
+                if (prefix.Equals("subtitle", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (value.Length > 0) result.Add(new(negate, 2, value));
+                    continue;
+                }
+                if (prefix.Equals("uri", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (value.Length > 0) result.Add(new(negate, 3, value));
+                    continue;
+                }
+                if (!prefix.Equals("http", StringComparison.OrdinalIgnoreCase) &&
+                    !prefix.Equals("https", StringComparison.OrdinalIgnoreCase))
+                {
+                    result.Add(new(false, 4, string.Empty));
+                    continue;
+                }
+            }
+            if (token.Length > 0) result.Add(new(negate, 0, token));
+        }
+        return result.Count == 0 ? [] : result.ToArray();
     }
 
     internal static VaultItem[] Sort(IEnumerable<VaultItem> source, VaultSort sort) => sort switch

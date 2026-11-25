@@ -167,10 +167,27 @@ pub(crate) struct EncryptedVaultState {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct DisplayField {
     label: String,
     value: String,
     sensitive: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    launch_uri: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PasswordHistoryEntry {
+    password: String,
+    last_used_date: String,
+}
+
+impl Drop for PasswordHistoryEntry {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.password.zeroize();
+    }
 }
 
 #[derive(Serialize)]
@@ -180,6 +197,13 @@ pub(crate) struct VaultDetail {
     item_type: u8,
     fields: Vec<DisplayField>,
     pub(crate) revision_date: String,
+    creation_date: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    password_revision_date: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    password_history: Vec<PasswordHistoryEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) password_strength: Option<u8>,
     restricted: bool,
     password_hidden: bool,
     attachments: usize,
@@ -302,6 +326,10 @@ impl VaultCache {
         self.write_started = false;
     }
 
+    pub(crate) fn user_id(&self) -> Option<Uuid> {
+        self.user_id
+    }
+
     pub(crate) fn overview(&self) -> Result<&VaultOverview, VaultError> {
         self.overview.as_ref().ok_or(VaultError::NotFound)
     }
@@ -322,7 +350,7 @@ impl VaultCache {
         Self::from_response(client, response, unlock_data).await
     }
 
-    async fn from_response(
+    pub(crate) async fn from_response(
         client: &Client,
         response: SyncResponseModel,
         unlock_data: &mut Option<PasswordLoginUnlockData>,
@@ -652,12 +680,44 @@ impl VaultCache {
             .await
             .map_err(|_| VaultError::DecryptionFailed)?;
         let totp = self.take_totp(&mut view);
+        let password_strength = if view.view_password && !view.partial {
+            if let Some(pw) = view
+                .login
+                .as_ref()
+                .and_then(|login| login.password.as_deref())
+                .filter(|pw| !pw.is_empty())
+            {
+                let details = bitwarden_vault::CipherLoginDetails {
+                    id: Default::default(),
+                    password: pw.to_owned(),
+                    username: view.login.as_ref().and_then(|login| login.username.clone()),
+                };
+                let options = bitwarden_vault::CipherRiskOptions {
+                    password_map: None,
+                    check_exposed: false,
+                    hibp_base_url: None,
+                };
+                client
+                    .vault()
+                    .cipher_risk()
+                    .compute_risk(vec![details], options)
+                    .await
+                    .ok()
+                    .and_then(|results| results.into_iter().next())
+                    .map(|result| result.password_strength)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let mut detail = display_detail(view);
         if self.local_read_only {
             detail.can_upload_attachments = false;
             detail.can_delete_attachments = false;
         }
         detail.totp = totp;
+        detail.password_strength = password_strength;
         Ok(detail)
     }
 
@@ -737,17 +797,82 @@ fn website_host(value: &str) -> Option<String> {
     .then(|| host.to_owned())
 }
 
+fn launchable_uri(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let has_http_scheme = trimmed.len() >= 7
+        && (trimmed[..7].eq_ignore_ascii_case("http://")
+            || (trimmed.len() >= 8 && trimmed[..8].eq_ignore_ascii_case("https://")));
+    let url = if has_http_scheme {
+        url::Url::parse(trimmed).ok()?
+    } else if trimmed.contains("://") {
+        return None;
+    } else if let Some((prefix, _)) = trimmed.split_once(':') {
+        if !prefix.contains('.') && !prefix.eq_ignore_ascii_case("localhost") {
+            return None;
+        }
+        url::Url::parse(&format!("https://{trimmed}")).ok()?
+    } else {
+        url::Url::parse(&format!("https://{trimmed}")).ok()?
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    match url.host()? {
+        url::Host::Ipv4(_) | url::Host::Ipv6(_) => Some(url.into()),
+        url::Host::Domain(domain)
+            if has_http_scheme
+                || domain.contains('.')
+                || domain.eq_ignore_ascii_case("localhost") =>
+        {
+            Some(url.into())
+        }
+        url::Host::Domain(_) => None,
+    }
+}
+
 fn display_detail(view: CipherView) -> VaultDetail {
     let mut fields = Vec::new();
     let passkeys = passkey_summaries(&view);
-    // Explicit projections keep cipher keys, passkey private material and password history out of FFI.
+    let allow_secrets = view.view_password && !view.partial;
+    let password_revision_date = if allow_secrets {
+        view.login
+            .as_ref()
+            .and_then(|login| login.password_revision_date)
+            .map(|date| date.to_rfc3339())
+    } else {
+        None
+    };
+    let password_history = if allow_secrets {
+        view.password_history
+            .iter()
+            .flatten()
+            .map(|entry| PasswordHistoryEntry {
+                password: entry.password.clone(),
+                last_used_date: entry.last_used_date.to_rfc3339(),
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // Explicit projections keep cipher keys, passkey private material and password history out of FFI
+    // unless secrets are explicitly authorized and never in editor/overview projections.
     if let Some(login) = &view.login {
         add_field(&mut fields, "用户名", login.username.as_deref(), false);
         if view.view_password {
             add_field(&mut fields, "密码", login.password.as_deref(), true);
         }
         for uri in login.uris.iter().flatten() {
-            add_field(&mut fields, "网站", uri.uri.as_deref(), false);
+            if let Some(raw_uri) = uri.uri.as_deref().filter(|value| !value.is_empty()) {
+                fields.push(DisplayField {
+                    label: "网站".to_owned(),
+                    value: raw_uri.to_owned(),
+                    sensitive: false,
+                    launch_uri: launchable_uri(raw_uri),
+                });
+            }
         }
     }
     append_object(
@@ -878,6 +1003,10 @@ fn display_detail(view: CipherView) -> VaultDetail {
         item_type: view.r#type as u8,
         fields,
         revision_date: view.revision_date.to_rfc3339(),
+        creation_date: view.creation_date.to_rfc3339(),
+        password_revision_date,
+        password_history,
+        password_strength: None,
         restricted: view.partial,
         password_hidden: !view.view_password,
         attachments: attachment_files.len() + attachment_failures,
@@ -898,6 +1027,7 @@ fn add_field(fields: &mut Vec<DisplayField>, label: &str, value: Option<&str>, s
             label: label.to_owned(),
             value: value.to_owned(),
             sensitive,
+            launch_uri: None,
         });
     }
 }
@@ -1261,5 +1391,101 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(cache.overview().unwrap().items[0].name, "Synthetic login");
+    }
+
+    #[test]
+    fn launchable_uri_accepts_only_http_and_https_uris() {
+        for valid in [
+            "https://example.com/login",
+            "http://localhost:8080/auth",
+            "example.com",
+            "127.0.0.1:8080",
+        ] {
+            assert!(
+                launchable_uri(valid).is_some(),
+                "expected launchable URI for {valid}"
+            );
+        }
+        for rejected in [
+            "",
+            "   ",
+            "javascript:alert(1)",
+            "file:///C:/Windows/System32/calc.exe",
+            "androidapp://com.example.app",
+            "mailto:user@example.com",
+            "https://user pass@example.com",
+            "localhostonly",
+        ] {
+            assert!(
+                launchable_uri(rejected).is_none(),
+                "unexpectedly accepted launch URI {rejected}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn detail_projects_history_dates_and_strength_only_when_authorized() {
+        let client = Client::init_test_account(test_bitwarden_com_account()).await;
+        let mut authorized_view = test_view();
+        authorized_view
+            .login
+            .as_mut()
+            .unwrap()
+            .password_revision_date = Some("2026-11-19T12:34:56Z".parse().unwrap());
+        authorized_view.password_history = Some(
+            serde_json::from_value(json!([{
+                "password": "older-synthetic-password",
+                "lastUsedDate": "2026-11-18T00:00:00Z"
+            }]))
+            .unwrap(),
+        );
+        let authorized_id = authorized_view.id.unwrap().to_string();
+
+        let mut hidden_view = test_view();
+        hidden_view.view_password = false;
+        hidden_view.login.as_mut().unwrap().password_revision_date =
+            Some("2026-11-19T12:34:56Z".parse().unwrap());
+        hidden_view.password_history = authorized_view.password_history.clone();
+        let hidden_id = hidden_view.id.unwrap().to_string();
+
+        let mut partial_view = test_view();
+        partial_view.partial = true;
+        partial_view.password_history = authorized_view.password_history.clone();
+        let partial_projection = display_detail(partial_view);
+        assert!(partial_projection.password_history.is_empty());
+        assert!(partial_projection.password_revision_date.is_none());
+
+        let mut response = response_for(&client, authorized_view).await;
+        let hidden_cipher = client
+            .vault()
+            .ciphers()
+            .encrypt(hidden_view)
+            .await
+            .unwrap()
+            .cipher;
+        let hidden_raw: CipherDetailsResponseModel =
+            serde_json::from_value(serde_json::to_value(hidden_cipher).unwrap()).unwrap();
+        response.ciphers.as_mut().unwrap().push(hidden_raw);
+
+        let cache = VaultCache::from_response(&client, response, &mut None)
+            .await
+            .unwrap();
+        let detail = cache.detail(&client, &authorized_id, "").await.unwrap();
+        assert!(!detail.creation_date.is_empty());
+        assert!(detail.password_revision_date.is_some());
+        assert_eq!(detail.password_history.len(), 1);
+        assert_eq!(
+            detail.password_history[0].password,
+            "older-synthetic-password"
+        );
+        assert!(detail.password_strength.is_some());
+        assert!(detail.fields.iter().any(|field| {
+            field.label == "网站" && field.launch_uri.as_deref() == Some("https://example.invalid/")
+        }));
+
+        let restricted = cache.detail(&client, &hidden_id, "").await.unwrap();
+        assert!(restricted.password_history.is_empty());
+        assert!(restricted.password_revision_date.is_none());
+        assert!(restricted.password_strength.is_none());
     }
 }

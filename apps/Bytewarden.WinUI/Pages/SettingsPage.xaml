@@ -23,6 +23,7 @@
                     <ToggleSwitch x:Name="StartupToggle" Header="登录 Windows 时启动" IsEnabled="False" Toggled="StartupToggle_Toggled" />
                     <ToggleSwitch x:Name="StartHiddenToggle" Header="自启动时隐藏到系统托盘" Toggled="DesktopOption_Toggled" />
                     <ToggleSwitch x:Name="KeepInTrayToggle" Header="关闭窗口后留在系统托盘" Toggled="DesktopOption_Toggled" />
+                    <ToggleSwitch x:Name="MinimizeToTrayToggle" Header="最小化窗口时隐藏到系统托盘" Toggled="DesktopOption_Toggled" />
                     <TextBlock Text="要彻底退出，请右键点击系统托盘中的 Bytewarden 图标并选择退出。" TextWrapping="Wrap" />
                     <TextBlock x:Name="StartupStatus" TextWrapping="Wrap" AutomationProperties.LiveSetting="Polite" />
                 </StackPanel>
@@ -36,6 +37,7 @@
                         <ComboBoxItem Content="深色" />
                     </ComboBox>
                     <ToggleSwitch x:Name="WebsiteIconsToggle" Header="显示网站图标" />
+                    <ToggleSwitch x:Name="QuickCopyActionsToggle" Header="在列表显示快捷复制操作" Toggled="QuickCopyActions_Toggled" />
                     <TextBlock x:Name="ThemeStatus" TextWrapping="Wrap" AutomationProperties.LiveSetting="Polite" />
                 </StackPanel>
             </Border>
@@ -52,10 +54,15 @@
                     <TextBlock Style="{StaticResource BodyStrongTextBlockStyle}" Text="安全" />
                     <ComboBox x:Name="ClipboardDelayChoice" Header="自动清除剪贴板" Width="280" HorizontalAlignment="Left" SelectionChanged="ClipboardDelay_Changed" />
                     <ToggleSwitch x:Name="MinimizeOnCopyToggle" Header="复制后最小化窗口" Toggled="MinimizeOnCopy_Toggled" />
+                    <ToggleSwitch x:Name="PreventScreenshotsToggle" Header="禁止截屏与录屏" Toggled="PreventScreenshots_Toggled" />
                     <TextBlock Text="仅清除本应用仍拥有的内容。锁定、切换账户和退出时仍会尝试清除。" TextWrapping="Wrap" />
                     <TextBlock x:Name="ClipboardStatus" TextWrapping="Wrap" AutomationProperties.LiveSetting="Polite" />
+                    <Button x:Name="PinUnlockButton" Content="启用 PIN 解锁" IsEnabled="False" Click="PinUnlock_Click" AutomationProperties.AutomationId="PinUnlockSettings" />
+                    <TextBlock x:Name="PinUnlockStatus" TextWrapping="Wrap" AutomationProperties.LiveSetting="Polite" />
                     <Button x:Name="HelloUnlockButton" Content="启用 Windows Hello 解锁" IsEnabled="False" Click="HelloUnlock_Click" AutomationProperties.AutomationId="HelloUnlockSettings" />
                     <TextBlock x:Name="HelloUnlockStatus" TextWrapping="Wrap" AutomationProperties.LiveSetting="Polite" />
+                    <ToggleSwitch x:Name="AutoPromptHelloToggle" Header="锁定时自动弹出 Windows Hello" Toggled="AutoPromptHello_Toggled" />
+                    <Button x:Name="ViewFingerprintButton" Content="查看账户指纹短语" IsEnabled="False" Click="ViewFingerprint_Click" />
                     <Button x:Name="RegisterPasskeysButton" Content="注册 Windows 通行密钥提供程序" Click="RegisterPasskeys_Click" AutomationProperties.AutomationId="RegisterPasskeysButton" />
                     <Button Content="打开 Windows 通行密钥设置" Click="OpenPasskeySettings_Click" />
                     <TextBlock x:Name="PasskeyStatus" TextWrapping="Wrap" />

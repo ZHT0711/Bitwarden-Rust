@@ -6,9 +6,8 @@
     <RootNamespace>Bytewarden.WinUI</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon Condition="Exists('Assets\AppIcon.ico')">Assets\AppIcon.ico</ApplicationIcon>
-    <Platforms>x86;x64;ARM64</Platforms>
-    <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == ''">win-$([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString().ToLowerInvariant())</RuntimeIdentifier>
-    <PublishProfile Condition="Exists('Properties\PublishProfiles\win-$(Platform).pubxml')">win-$(Platform).pubxml</PublishProfile>
+    <Platforms>x64</Platforms>
+    <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == ''">win-x64</RuntimeIdentifier>
     <UseWinUI>true</UseWinUI>
     <WinUISDKReferences>false</WinUISDKReferences>
     <WindowsPackageType>MSIX</WindowsPackageType>
@@ -68,9 +67,9 @@
 
   <!-- Publish Properties -->
   <PropertyGroup>
-    <PublishReadyToRun Condition="'$(Configuration)' == 'Debug'">False</PublishReadyToRun>
-    <PublishReadyToRun Condition="'$(Configuration)' != 'Debug'">True</PublishReadyToRun>
-    <PublishTrimmed Condition="'$(Configuration)' == 'Debug'">False</PublishTrimmed>
-    <PublishTrimmed Condition="'$(Configuration)' != 'Debug'">True</PublishTrimmed>
+    <!-- Release MSIX carries the .NET runtime. Do not depend on a local .pubxml. -->
+    <SelfContained Condition="'$(Configuration)' == 'Release' And '$(SelfContained)' == ''">true</SelfContained>
+    <PublishReadyToRun Condition="'$(Configuration)' == 'Release' And '$(SelfContained)' == 'true' And '$(PublishReadyToRun)' == ''">true</PublishReadyToRun>
+    <PublishTrimmed Condition="'$(Configuration)' == 'Release' And '$(SelfContained)' == 'true' And '$(PublishTrimmed)' == ''">true</PublishTrimmed>
   </PropertyGroup>
 </Project>

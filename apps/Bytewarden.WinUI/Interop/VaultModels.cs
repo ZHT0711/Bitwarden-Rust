@@ -15,9 +15,12 @@ internal sealed record VaultDetail(string Name, int ItemType, DisplayField[] Fie
     bool Restricted, bool PasswordHidden, int Attachments, VaultTotp? Totp = null, ulong? TotpRequestId = null,
     VaultPasskey[]? Passkeys = null, VaultAttachment[]? AttachmentFiles = null,
     int AttachmentFailures = 0, ulong? AttachmentRequestId = null,
-    bool CanUploadAttachments = false, bool CanDeleteAttachments = false);
+    bool CanUploadAttachments = false, bool CanDeleteAttachments = false,
+    DateTimeOffset? CreationDate = null, DateTimeOffset? PasswordRevisionDate = null,
+    PasswordHistoryEntry[]? PasswordHistory = null, int? PasswordStrength = null);
 internal sealed record VaultAttachment(string Id, string Name, ulong? Size, bool CanDownload);
-internal sealed record DisplayField(string Label, string Value, bool Sensitive);
+internal sealed record DisplayField(string Label, string Value, bool Sensitive, string? LaunchUri = null);
+internal sealed record PasswordHistoryEntry(string Password, DateTimeOffset LastUsedDate);
 internal sealed record VaultTotp(string Status, TotpCode? Value);
 internal sealed record TotpCode(string Code, uint Period, long ValidFrom, long ValidUntil);
 internal sealed record VaultPasskey(string RelyingParty, string? UserName, DateTimeOffset CreatedAt)
@@ -43,6 +46,10 @@ internal sealed class VaultException(string code) : Exception(code)
         "decryptionFailed" => "无法解密保险库数据，请重新登录后重试。",
         "passwordRequired" => "此条目需要重新验证主密码。",
         "wrongPassword" => "主密码验证失败，请重试。",
+        "wrongPin" => "PIN 码不正确，请重试。",
+        "pinNotEnabled" => "此账户未启用 PIN 解锁，请使用主密码。",
+        "pinRevoked" => "连续输入错误次数过多，PIN 解锁已停用，请使用主密码解锁。",
+        "hibpError" => "无法检查密码泄露状态，请检查网络连接后重试。",
         "helloNotEnabled" => "此账户未启用 Windows Hello 解锁，请使用主密码。",
         "helloUnavailable" => "Windows Hello 不可用。请检查 Windows 的登录选项，或用主密码解锁。",
         "helloCancelled" => "已取消 Windows Hello 验证。你仍可使用主密码。",

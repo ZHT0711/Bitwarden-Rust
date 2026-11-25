@@ -12,6 +12,15 @@ internal static class DesktopPreferences
     private const string VaultSort = "Desktop.VaultSort";
     private const string ClipboardDelay = "Desktop.ClipboardSeconds";
     internal const string MinimizeOnCopy = "Desktop.MinimizeOnCopy";
+    internal const string ShowQuickCopyActions = "Desktop.ShowQuickCopyActions";
+    internal const string PreventScreenshots = "Desktop.PreventScreenshots";
+    internal const string MinimizeToTray = "Desktop.MinimizeToTray";
+    internal const string AutoPromptHello = "Desktop.AutoPromptHello";
+    private const string WindowX = "Desktop.WindowX";
+    private const string WindowY = "Desktop.WindowY";
+    private const string WindowWidth = "Desktop.WindowWidth";
+    private const string WindowHeight = "Desktop.WindowHeight";
+    private const string WindowMaximized = "Desktop.WindowMaximized";
     internal static readonly IReadOnlyList<int> ClipboardChoices = Array.AsReadOnly(new[] { 0, 10, 20, 30, 60, 120, 300 });
     internal const int DefaultClipboardSeconds = 30;
 
@@ -41,6 +50,40 @@ internal static class DesktopPreferences
     }
 
     internal static bool TrySaveClipboardDelay(int seconds) => ClipboardChoices.Contains(seconds) && TrySaveValue(ClipboardDelay, seconds);
+
+    internal static (int X, int Y, int Width, int Height, bool Maximized)? ReadWindowBounds()
+    {
+        try
+        {
+            var values = ApplicationData.Current.LocalSettings.Values;
+            if (values.TryGetValue(WindowX, out var rawX) && rawX is int x &&
+                values.TryGetValue(WindowY, out var rawY) && rawY is int y &&
+                values.TryGetValue(WindowWidth, out var rawW) && rawW is int width && width >= 320 &&
+                values.TryGetValue(WindowHeight, out var rawH) && rawH is int height && height >= 240)
+            {
+                var maximized = values.TryGetValue(WindowMaximized, out var rawMax) && rawMax is true;
+                return (x, y, width, height, maximized);
+            }
+        }
+        catch (Exception error) when (error is COMException or InvalidOperationException) { }
+        return null;
+    }
+
+    internal static bool TrySaveWindowBounds(int x, int y, int width, int height, bool maximized)
+    {
+        if (width < 320 || height < 240) return false;
+        try
+        {
+            var values = ApplicationData.Current.LocalSettings.Values;
+            values[WindowX] = x;
+            values[WindowY] = y;
+            values[WindowWidth] = width;
+            values[WindowHeight] = height;
+            values[WindowMaximized] = maximized;
+            return true;
+        }
+        catch (Exception error) when (error is COMException or InvalidOperationException) { return false; }
+    }
 
     private static T ReadValue<T>(string key, T fallback)
     {

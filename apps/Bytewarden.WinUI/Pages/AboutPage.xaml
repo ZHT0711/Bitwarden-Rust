@@ -4,7 +4,6 @@
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
     xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
-    xmlns:local="using:Bytewarden.WinUI.Pages"
     xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
     mc:Ignorable="d">
 
@@ -14,10 +13,31 @@
             <RowDefinition Height="*" />
         </Grid.RowDefinitions>
         <TextBlock Style="{StaticResource SubtitleTextBlockStyle}" Text="关于 Bytewarden" />
-        <StackPanel Grid.Row="1" Spacing="8">
-            <TextBlock Text="WinUI 3 桌面客户端原型" />
-            <TextBlock Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="目标对照版本：Bitwarden Desktop 2026.11.0；本机安装版本：2026.10.4.0。" />
-            <TextBlock Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="密码登录、部分二步验证、保险库同步和解密由官方 Rust SDK 处理。会话仅驻留内存；条目写入、离线解锁和完整桌面功能仍在开发中。" TextWrapping="Wrap" />
-        </StackPanel>
+        <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+            <StackPanel MaxWidth="680" Spacing="12">
+                <Border Padding="20" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1" CornerRadius="8">
+                    <StackPanel Spacing="6">
+                        <TextBlock Style="{StaticResource BodyStrongTextBlockStyle}" Text="Bytewarden（WinUI 3 / Rust）" />
+                        <TextBlock x:Name="AppVersionText" TextWrapping="Wrap" />
+                        <TextBlock x:Name="CoreVersionText" Foreground="{ThemeResource TextFillColorSecondaryBrush}" TextWrapping="Wrap" />
+                        <TextBlock x:Name="EnvironmentText" Foreground="{ThemeResource TextFillColorSecondaryBrush}" TextWrapping="Wrap" />
+                        <Button Content="复制版本信息" Click="CopyVersionInfo_Click" />
+                        <TextBlock x:Name="CopyStatusText" AutomationProperties.LiveSetting="Polite" TextWrapping="Wrap" />
+                        <TextBlock Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="基于官方 Bitwarden Rust SDK 构建的 Windows 兼容桌面客户端重写工程；采用 GPL-3.0 开源许可。" TextWrapping="Wrap" />
+                    </StackPanel>
+                </Border>
+                <Border Padding="20" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1" CornerRadius="8">
+                    <StackPanel Spacing="8">
+                        <TextBlock Style="{StaticResource BodyStrongTextBlockStyle}" Text="项目资源与反馈" />
+                        <HyperlinkButton Content="项目主页与中文文档" NavigateUri="https://github.com/ZHT0711/Bytewarden" Padding="0" />
+                        <HyperlinkButton Content="English documentation" NavigateUri="https://github.com/ZHT0711/Bytewarden/blob/main/README.en.md" Padding="0" />
+                        <HyperlinkButton Content="构建状态与预览包" NavigateUri="https://github.com/ZHT0711/Bytewarden/actions/workflows/windows.yml" Padding="0" />
+                        <HyperlinkButton Content="反馈问题或建议" NavigateUri="https://github.com/ZHT0711/Bytewarden/issues" Padding="0" />
+                        <TextBlock Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="提交问题时可附上版本信息，请勿填写账户、密码或保险库内容。" TextWrapping="Wrap" />
+                        <TextBlock Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="本项目与 Bitwarden, Inc. 无任何关联。当前仍为开发预览阶段，请务必定期备份重要保险库数据。" TextWrapping="Wrap" />
+                    </StackPanel>
+                </Border>
+            </StackPanel>
+        </ScrollViewer>
     </Grid>
 </Page>

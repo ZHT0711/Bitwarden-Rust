@@ -361,7 +361,9 @@ pub(crate) fn entries() -> impl Iterator<Item = ([u8; 32], Zeroizing<Vec<u8>>)> 
 pub(crate) fn remove(identity: &str) -> bool {
     configured_root().is_none_or(|root| {
         let snapshot_revoked = revoke_at(&root, &account_digest(identity));
-        remove_hello_at(&root, identity) && snapshot_revoked
+        let hello_revoked = remove_hello_at(&root, identity);
+        let pin_revoked = remove_pin_at(&root, identity);
+        hello_revoked && pin_revoked && snapshot_revoked
     })
 }
 
@@ -449,6 +451,45 @@ fn remove_hello_at(root: &Path, identity: &str) -> bool {
 
 pub(crate) fn remove_hello(identity: &str) -> bool {
     configured_root().is_some_and(|root| remove_hello_at(&root, identity))
+}
+
+fn pin_paths(root: &Path, identity: &str) -> (PathBuf, PathBuf, [u8; 32]) {
+    let digest = account_digest(&format!("PinUnlock/v1\n{identity}"));
+    let path = cache_path(root, &digest);
+    (
+        path.with_extension("pin"),
+        path.with_extension("pin-revoked"),
+        digest,
+    )
+}
+
+pub(crate) fn load_pin(identity: &str) -> Option<Zeroizing<Vec<u8>>> {
+    let root = configured_root()?;
+    let (path, marker, digest) = pin_paths(&root, identity);
+    load_protected_bounded(&path, &digest, &marker, 16 * 1024)
+        .ok()
+        .flatten()
+}
+
+pub(crate) fn save_pin(identity: &str, enrollment: &[u8]) -> bool {
+    configured_root().is_some_and(|root| {
+        let (path, marker, digest) = pin_paths(&root, identity);
+        save_protected_at(&path, &digest, enrollment).is_ok() && remove_if_present(&marker).is_ok()
+    })
+}
+
+fn remove_pin_at(root: &Path, identity: &str) -> bool {
+    let (path, marker, digest) = pin_paths(root, identity);
+    if remove_if_present(&path).is_ok() {
+        let _ = remove_if_present(&marker);
+        return true;
+    }
+    fs::symlink_metadata(&marker).is_ok()
+        || save_protected_at(&marker, &digest, b"Bytewarden/revoked-pin/v1").is_ok()
+}
+
+pub(crate) fn remove_pin(identity: &str) -> bool {
+    configured_root().is_none_or(|root| remove_pin_at(&root, identity))
 }
 
 #[no_mangle]
@@ -583,6 +624,43 @@ mod tests {
         );
         drop(held);
         assert!(remove_hello_at(root, identity));
+        assert!(!path.exists() && !marker.exists());
+    }
+
+    #[test]
+    fn pin_revocation_is_independent_of_the_snapshot_and_fails_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let identity = "https://api.bitwarden.com\nuser@example.invalid";
+        save_at(root, identity, b"snapshot").unwrap();
+        let (path, marker, digest) = pin_paths(root, identity);
+        save_protected_at(&path, &digest, b"sealed pin").unwrap();
+        assert_eq!(
+            load_protected_bounded(&path, &digest, &marker, 16 * 1024)
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            b"sealed pin"
+        );
+        let other_id = "https://api.bitwarden.eu\nuser@example.invalid";
+        assert_ne!(pin_paths(root, other_id).2, digest);
+        assert_ne!(hello_paths(root, identity).2, digest);
+        let held = OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&path)
+            .unwrap();
+        assert!(remove_pin_at(root, identity));
+        assert!(path.exists() && marker.is_file());
+        assert!(load_protected_bounded(&path, &digest, &marker, 16 * 1024)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            load_at(root, identity).unwrap().unwrap().as_slice(),
+            b"snapshot"
+        );
+        drop(held);
+        assert!(remove_pin_at(root, identity));
         assert!(!path.exists() && !marker.exists());
     }
 

@@ -17,7 +17,7 @@ internal static class ClipboardCleaner
 
     internal static void Initialize(IntPtr window) => _native = new NativeClipboardClearAccess(window);
 
-    internal static void Copy(string value)
+    internal static void Copy(string value, bool allowMinimize = true)
     {
         if (_native is null || _shuttingDown || _stopped) throw new InvalidOperationException("Clipboard access is unavailable.");
         var package = new DataPackage();
@@ -32,7 +32,7 @@ internal static class ClipboardCleaner
         _owner = owner;
         var seconds = DesktopPreferences.ReadClipboardDelay();
         if (seconds > 0) Schedule(owner, TimeSpan.FromSeconds(seconds), () => ClearOwned(owner));
-        Copied?.Invoke();
+        if (allowMinimize) Copied?.Invoke();
     }
 
     internal static void ClearOwned(string? expectedOwner = null) => _ = ClearOwnedAsync(expectedOwner);

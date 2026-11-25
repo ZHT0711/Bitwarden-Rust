@@ -118,6 +118,98 @@ impl VaultCache {
         })
     }
 
+    pub(crate) async fn bulk_action(
+        &mut self,
+        client: &Client,
+        ids: Vec<bitwarden_vault::CipherId>,
+        action: &str,
+        password: &str,
+    ) -> Result<VaultMutationResult, VaultError> {
+        self.write_started = false;
+        self.ensure_synced()?;
+        let selected: HashSet<String> = ids.iter().map(ToString::to_string).collect();
+        if ids.is_empty()
+            || ids.len() > 500
+            || selected.len() != ids.len()
+            || !matches!(action, "trash" | "restore" | "delete")
+        {
+            return Err(VaultError::Validation);
+        }
+        let mut previous_ciphers = Vec::with_capacity(ids.len());
+        let mut reprompt_cipher = None;
+        for id in &ids {
+            let cipher = self.find_cipher(&id.to_string())?;
+            if cipher.partial_data.is_some() {
+                return Err(VaultError::PermissionDenied);
+            }
+            let deleted = cipher.deleted_date.is_some();
+            match action {
+                "trash"
+                    if !deleted
+                        && cipher
+                            .permissions
+                            .as_ref()
+                            .map_or(cipher.edit, |p| p.delete) => {}
+                "restore"
+                    if deleted
+                        && cipher
+                            .permissions
+                            .as_ref()
+                            .map_or(cipher.edit, |p| p.restore) => {}
+                "delete"
+                    if deleted
+                        && cipher
+                            .permissions
+                            .as_ref()
+                            .map_or(cipher.edit, |p| p.delete) => {}
+                _ => return Err(VaultError::PermissionDenied),
+            }
+            if reprompt_cipher.is_none() && cipher.reprompt as u8 != 0 {
+                reprompt_cipher = Some(cipher.clone());
+            }
+            previous_ciphers.push(cipher);
+        }
+        if let Some(cipher) = reprompt_cipher.as_ref() {
+            self.check_reprompt(client, cipher, password).await?;
+        }
+        self.activate(client);
+        self.write_started = true;
+        match action {
+            "trash" => client
+                .vault()
+                .ciphers()
+                .soft_delete_many(ids, None)
+                .await
+                .map_err(|_| self.uncertain())?,
+            "restore" => {
+                client
+                    .vault()
+                    .ciphers()
+                    .restore_many(ids)
+                    .await
+                    .map_err(|_| self.uncertain())?;
+                for previous in &previous_ciphers {
+                    self.secure_metadata_cache(previous).await?;
+                }
+            }
+            "delete" => client
+                .vault()
+                .ciphers()
+                .delete_many(ids, None)
+                .await
+                .map_err(|_| self.uncertain())?,
+            _ => unreachable!(),
+        }
+        self.rebuild_overview(client)
+            .await
+            .map_err(|_| self.uncertain())?;
+        self.write_started = false;
+        Ok(VaultMutationResult {
+            overview: self.overview()?.clone(),
+            id: None,
+        })
+    }
+
     fn validate_folder_name(name: &str) -> Result<(), VaultError> {
         if name.trim().is_empty() {
             return Err(VaultError::Validation);

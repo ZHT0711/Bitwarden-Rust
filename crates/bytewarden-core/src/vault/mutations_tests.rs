@@ -1480,3 +1480,138 @@ async fn favorite_omitted_security_metadata_preserves_hidden_fields_and_reprompt
     assert!(editor.values.is_empty());
     assert!(editor.notes.is_none());
 }
+
+#[tokio::test]
+async fn bulk_action_trashes_restores_and_deletes_with_validation_reprompt_and_permissions() {
+    use bitwarden_api_api::models::{
+        CipherMiniResponseModel, CipherMiniResponseModelListResponseModel,
+    };
+
+    let restore_items = Arc::new(Mutex::new(Vec::<CipherMiniResponseModel>::new()));
+    let capture = restore_items.clone();
+    let client = Client::init_test_account_with_api_client(
+        test_bitwarden_com_account(),
+        ApiClient::new_mocked(move |mock| {
+            mock.ciphers_api
+                .expect_put_delete_many()
+                .times(2)
+                .returning(|request| {
+                    assert_eq!(request.unwrap().ids.len(), 2);
+                    Ok(())
+                });
+            mock.ciphers_api
+                .expect_put_restore_many()
+                .times(1)
+                .returning(move |request| {
+                    assert_eq!(request.unwrap().ids.len(), 2);
+                    let mut items = capture.lock().unwrap().clone();
+                    for item in &mut items {
+                        item.deleted_date = None;
+                        item.revision_date = Some(NEXT_REVISION.to_owned());
+                    }
+                    Ok(CipherMiniResponseModelListResponseModel {
+                        data: Some(items),
+                        ..Default::default()
+                    })
+                });
+            mock.ciphers_api
+                .expect_delete_many()
+                .times(1)
+                .returning(|request| {
+                    assert_eq!(request.unwrap().ids.len(), 2);
+                    Ok(())
+                });
+        }),
+    )
+    .await;
+
+    let first = seed_view();
+    let mut second = seed_view();
+    second.id = Some(uuid::Uuid::new_v4().to_string().parse().unwrap());
+    second.reprompt = CipherRepromptType::Password;
+
+    let mut read_only = seed_view();
+    read_only.id = Some(uuid::Uuid::new_v4().to_string().parse().unwrap());
+    read_only.edit = false;
+    read_only.permissions =
+        Some(serde_json::from_value(json!({"delete":false,"restore":false})).unwrap());
+
+    let id1 = first.id.unwrap();
+    let id2 = second.id.unwrap();
+    let id_ro = read_only.id.unwrap();
+    let mut cache = seeded_cache(&client, vec![first, second, read_only], false).await;
+
+    *restore_items.lock().unwrap() = vec![id1, id2]
+        .into_iter()
+        .map(|id| {
+            serde_json::from_value(
+                serde_json::to_value(cache.find_cipher(&id.to_string()).unwrap()).unwrap(),
+            )
+            .unwrap()
+        })
+        .collect();
+
+    assert!(matches!(
+        cache.bulk_action(&client, vec![], "trash", "").await,
+        Err(VaultError::Validation)
+    ));
+    assert!(matches!(
+        cache
+            .bulk_action(&client, vec![id1, id1], "trash", "")
+            .await,
+        Err(VaultError::Validation)
+    ));
+    assert!(matches!(
+        cache.bulk_action(&client, vec![id1], "archive", "").await,
+        Err(VaultError::Validation)
+    ));
+    assert!(matches!(
+        cache
+            .bulk_action(
+                &client,
+                vec![uuid::Uuid::new_v4().to_string().parse().unwrap()],
+                "trash",
+                ""
+            )
+            .await,
+        Err(VaultError::NotFound)
+    ));
+    assert!(matches!(
+        cache
+            .bulk_action(&client, vec![id1, id_ro], "trash", "asdfasdfasdf")
+            .await,
+        Err(VaultError::PermissionDenied)
+    ));
+    assert!(matches!(
+        cache
+            .bulk_action(&client, vec![id1, id2], "trash", "")
+            .await,
+        Err(VaultError::PasswordRequired)
+    ));
+
+    let trashed = cache
+        .bulk_action(&client, vec![id1, id2], "trash", "asdfasdfasdf")
+        .await
+        .unwrap();
+    assert_eq!(
+        trashed.overview.items.iter().filter(|i| i.deleted).count(),
+        2
+    );
+
+    let restored = cache
+        .bulk_action(&client, vec![id1, id2], "restore", "asdfasdfasdf")
+        .await
+        .unwrap();
+    assert!(restored.overview.items.iter().all(|i| !i.deleted));
+
+    cache
+        .bulk_action(&client, vec![id1, id2], "trash", "asdfasdfasdf")
+        .await
+        .unwrap();
+    let deleted = cache
+        .bulk_action(&client, vec![id1, id2], "delete", "asdfasdfasdf")
+        .await
+        .unwrap();
+    assert_eq!(deleted.overview.items.len(), 1);
+    assert_eq!(deleted.overview.items[0].id, id_ro.to_string());
+}

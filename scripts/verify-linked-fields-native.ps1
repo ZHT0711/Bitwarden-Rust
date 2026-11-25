@@ -7,11 +7,8 @@ param(
 # Public SDK fixture only. The host removes the isolated cache after the native process exits,
 # because the Rust cache's exclusive writer lock deliberately lasts for the process lifetime.
 $ErrorActionPreference = 'Stop'
-$pythonPath = (Get-Command $PythonExe -CommandType Application -ErrorAction Stop).Source
-$probe = & $pythonPath -c 'import sys; print("bytewarden-fixture-python3" if sys.version_info >= (3, 10) else "unsupported")' | Out-String
-if ($LASTEXITCODE -ne 0 -or $probe.Trim() -ne 'bytewarden-fixture-python3') {
-    throw 'A working Python 3.10+ interpreter is required. Pass -PythonExe with its full path; a Windows Store execution alias alone is not enough.'
-}
+. (Join-Path $PSScriptRoot 'fixture-python.ps1')
+$pythonPath = Resolve-FixturePython $PythonExe
 $root = Split-Path $PSScriptRoot -Parent
 $libraryPath = (Resolve-Path (Join-Path $root $Library)).Path
 $fixturePath = (Resolve-Path (Join-Path $root $Fixture)).Path

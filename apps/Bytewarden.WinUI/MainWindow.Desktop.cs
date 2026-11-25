@@ -1,12 +1,20 @@
+using System.Runtime.InteropServices;
 using Bytewarden.WinUI.Interop;
 using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using Windows.Graphics;
 
 namespace Bytewarden.WinUI;
 
 public sealed partial class MainWindow
 {
+    private const uint WdaNone = 0x0;
+    private const uint WdaExcludeFromCapture = 0x11;
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool SetWindowDisplayAffinity(nint hwnd, uint affinity);
+
     private double _windowWidth = 1200;
 
     private void WindowRoot_SizeChanged(object sender, SizeChangedEventArgs args)
@@ -32,6 +40,57 @@ public sealed partial class MainWindow
         SignInButton.Padding = compactButtons && signedIn ? new Thickness(8, 0, 8, 0) : new Thickness(10, 0, 10, 0);
     }
 
+    private void ApplyPreventScreenshots(bool enabled)
+    {
+        try
+        {
+            SetWindowDisplayAffinity(
+                WinRT.Interop.WindowNative.GetWindowHandle(this),
+                enabled ? WdaExcludeFromCapture : WdaNone);
+        }
+        catch (EntryPointNotFoundException) { }
+    }
+
+    private void RestoreWindowBounds()
+    {
+        try
+        {
+            if (DesktopPreferences.ReadWindowBounds() is not { } saved) return;
+            var rect = new RectInt32(saved.X, saved.Y, saved.Width, saved.Height);
+            var workArea = DisplayArea.GetFromRect(rect, DisplayAreaFallback.Nearest).WorkArea;
+            var width = Math.Clamp(rect.Width, 320, Math.Max(320, workArea.Width));
+            var height = Math.Clamp(rect.Height, 240, Math.Max(240, workArea.Height));
+            var x = Math.Clamp(rect.X, workArea.X, Math.Max(workArea.X, workArea.X + workArea.Width - width));
+            var y = Math.Clamp(rect.Y, workArea.Y, Math.Max(workArea.Y, workArea.Y + workArea.Height - height));
+            var clamped = new RectInt32(x, y, width, height);
+            AppWindow.MoveAndResize(clamped);
+            _lastNormalBounds = clamped;
+            _windowMaximized = saved.Maximized;
+            _restoreMaximized = saved.Maximized;
+        }
+        catch (Exception error) when (error is COMException or InvalidOperationException) { }
+    }
+
+    private void SaveWindowBounds()
+    {
+        try
+        {
+            if (AppWindow.Presenter is OverlappedPresenter presenter)
+            {
+                if (_lastNormalBounds is null && presenter.State == OverlappedPresenterState.Restored)
+                {
+                    _lastNormalBounds = new RectInt32(
+                        AppWindow.Position.X, AppWindow.Position.Y, AppWindow.Size.Width, AppWindow.Size.Height);
+                }
+                if (AppWindow.IsVisible)
+                    _windowMaximized = presenter.State == OverlappedPresenterState.Maximized;
+            }
+            if (_lastNormalBounds is { } bounds)
+                DesktopPreferences.TrySaveWindowBounds(bounds.X, bounds.Y, bounds.Width, bounds.Height, _windowMaximized);
+        }
+        catch (Exception error) when (error is COMException or InvalidOperationException) { }
+    }
+
     private void ApplyDesktopTheme(int theme) => WindowRoot.RequestedTheme = theme switch
     {
         1 => ElementTheme.Light,
@@ -52,6 +111,7 @@ public sealed partial class MainWindow
         if (_exitPrepared) return;
         _exitPrepared = true;
         _closed = true; // Logical shutdown: late account/dialog continuations must not reauthorize UI.
+        SaveWindowBounds();
         WindowRoot.IsHitTestVisible = false;
         NavView.IsEnabled = false;
         AccountSettingsScope.SignedOut -= Pages.GeneratorPage.ResetSavedAlgorithm;

@@ -4,6 +4,8 @@
   <img alt="Bytewarden Logo" src="docs/assets/bytewarden-banner-light.png" width="460" />
 </picture>
 
+**简体中文（默认）** · [![Switch to English](https://img.shields.io/badge/README-English-005AA4?style=flat-square)](README.en.md)
+
 以 Rust 为安全与业务核心、以 WinUI 3 为 Windows 桌面界面的 Bitwarden 兼容客户端重写工程[[免责声明](#免责声明)]。目标是逐项复刻官方最新 MSIX 桌面端，完成桌面端后再优化 Firefox 扩展联动。
 
 ---
@@ -117,7 +119,7 @@ winapp run apps/Bytewarden.WinUI/Bytewarden.WinUI.csproj --no-build -p Platform=
 
 ### 自动化测试与压力验收
 
-GitHub Actions 执行 Rust 格式 / 测试 / Clippy、C# 筛选及实际 DLL 互操作检查，并构建未签名 x64 MSIX 开发包。未签名包不能直接作为正式签名安装包分发。
+[Windows CI](https://github.com/ZHT0711/Bytewarden/actions/workflows/windows.yml) 执行 Rust 格式 / 测试 / Clippy、模拟服务自检、C# 筛选和 Release DLL 互操作检查，并核对 MSIX 内的 DLL 与已测 DLL 一致。成功运行的 **Artifacts** 中提供 `Bytewarden-unsigned-msix-x64`，运行摘要列出 SHA-256。Release MSIX 自带 .NET 运行时，不依赖本机 `.pubxml`；它仍是未签名开发包，不是正式安装包。交互式桌面 UI 验收在本机单独运行。
 
 可重复的生成器、大库写入投影、列表元数据搜索、文件夹索引与实际文件夹 UI / 进程资源测量见 [性能测量](docs/PERFORMANCE.md)。文件夹索引避免超长缺失父路径的逐级前缀切片；另以最新 MSIX 独立验证万级平面 / 分支、千层真实链及 8,192 段缺失路径，共 110 项具名压力检查（包含编辑 / 移动下拉和短窗口正文 / 锁定动作）。UIA 端到端耗时和真实进程内存按各自范围记录，不等同于帧率、长期常驻、10,000 条目 UI 或真实服务验收。
 
@@ -182,7 +184,7 @@ dotnet run --project tests/Bytewarden.Interop.Tests -c Release -- --clipboard-na
 
 ## 反馈与交流
 
-遇到问题、崩溃或有改进建议？欢迎先检索已有记录，再前往 [GitHub Issues](https://github.com/ZHT0711/Bytewarden/issues) 提交新反馈。
+遇到问题、崩溃或有改进建议？请先检索 [GitHub Issues](https://github.com/ZHT0711/Bytewarden/issues)，再提交复现步骤。桌面端「关于 → 复制版本信息」只复制应用版本、Rust 核心版本和 Windows / 架构信息。请勿附上主密码、令牌或保险库数据。
 
 <br>
 
