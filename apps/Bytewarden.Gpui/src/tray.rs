@@ -499,7 +499,7 @@ mod windows {
         format!("{hash:016x}")
     }
 
-    fn current_scope_tag() -> String {
+    pub(crate) fn current_scope_tag() -> String {
         let local = std::env::var("LOCALAPPDATA").ok();
         profile_scope_tag(local.as_deref())
     }
@@ -1065,9 +1065,14 @@ mod windows {
 
 #[cfg(windows)]
 pub(crate) use windows::{
-    SingleInstance, Tray, apply_screen_capture_protection, restore_window_to_front,
-    window_hwnd_usize,
+    SingleInstance, Tray, apply_screen_capture_protection, current_scope_tag,
+    restore_window_to_front, window_hwnd_usize,
 };
+
+#[cfg(not(windows))]
+pub(crate) fn current_scope_tag() -> String {
+    "default".into()
+}
 
 #[cfg(not(windows))]
 pub(crate) struct Tray;

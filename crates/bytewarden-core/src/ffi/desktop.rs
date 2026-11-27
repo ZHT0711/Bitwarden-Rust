@@ -412,6 +412,24 @@ impl Request {
         }
     }
 
+    pub fn verify_hello(self, account: &str, hwnd: usize) -> Result<(), Error> {
+        #[cfg(windows)]
+        {
+            let account = argument(account)?;
+            let window =
+                hello_window::window_id(hwnd).map_err(|_| Error::from_code("helloUnavailable"))?;
+            read::<bool>(unsafe {
+                hello::bw_hello_verify_for_window(ptr(&account), window, self.0)
+            })
+            .map(|_| ())
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (self, account, hwnd);
+            Err(Error::from_code("helloUnavailable"))
+        }
+    }
+
     pub fn sync(self) -> Result<Overview, Error> {
         vault_sync(self.0, Overview::clone).map_err(Error)
     }

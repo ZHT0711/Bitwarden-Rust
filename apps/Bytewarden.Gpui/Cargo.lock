@@ -1575,6 +1575,7 @@ dependencies = [
  "image",
  "raw-window-handle",
  "rqrr",
+ "serde",
  "serde_json",
  "unicode-segmentation",
  "uuid",

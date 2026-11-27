@@ -412,6 +412,53 @@ pub unsafe extern "C" fn bw_hello_unlock_for_window(
     .unwrap_or_else(|_| vault_error("internal"))
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn bw_hello_verify_for_window(
+    account: *const c_char,
+    window: u64,
+    request_id: u64,
+) -> *mut c_char {
+    run_boolean(|| {
+        let id = unsafe { account_id(account) }?;
+        let (identity, enrollment, store) = {
+            let guard = auth_client()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let session = guard
+                .active
+                .as_ref()
+                .filter(|s| s.account_id == id && s.state == SESSION_UNLOCKED)
+                .ok_or("unlockUnavailable")?;
+            if !auth_request::is_current(request_id) {
+                return Err("cancelled");
+            }
+            (
+                local_cache_identity(session),
+                load(session)?,
+                session.client.internal.get_key_store().clone(),
+            )
+        };
+        let secret = prompt(
+            window,
+            &identity,
+            &enrollment.binding,
+            &enrollment.challenge,
+            false,
+            request_id,
+        )?;
+        if !auth_request::is_current(request_id) {
+            return Err("cancelled");
+        }
+        let envelope = SecretProtectedKeyEnvelope::try_from(&enrollment.envelope)
+            .map_err(|_| "helloFailed")?;
+        let mut ctx = store.context_mut();
+        let _ = envelope
+            .unseal(&secret, NAMESPACE, &mut ctx)
+            .map_err(|_| "helloFailed")?;
+        Ok(())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

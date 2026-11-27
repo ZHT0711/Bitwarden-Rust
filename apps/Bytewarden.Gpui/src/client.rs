@@ -518,6 +518,7 @@ impl VaultPreview {
             )
         }));
         self.invalidate_query();
+        self.broadcast_browser_state();
     }
 
     pub(crate) fn mark_write_uncertain(&mut self, error: &Error) {
@@ -593,6 +594,7 @@ impl VaultPreview {
         self.client.show_accounts = false;
         self.close_form(cx);
         self.invalidate_query();
+        self.broadcast_browser_state();
     }
 
     pub(crate) fn close_form(&mut self, cx: &mut Context<Self>) {
@@ -1176,6 +1178,7 @@ impl VaultPreview {
         self.client.write_guard = false;
         self.invalidate_query();
         self.session_notice();
+        self.broadcast_browser_state();
     }
 
     pub fn request_sync(&mut self, cx: &mut Context<Self>) {

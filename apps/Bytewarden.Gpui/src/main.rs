@@ -1,6 +1,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod backup;
+mod browser_bridge;
 mod client;
 mod clipboard;
 mod detail_tools;
@@ -105,6 +106,7 @@ struct VaultPreview {
     tray: Option<tray::Tray>,
     single_instance: Option<tray::SingleInstance>,
     passkeys: passkeys::PasskeyState,
+    browser_bridge: browser_bridge::BrowserBridgeState,
     clipboard: clipboard::Clipboard,
     clipboard_generation: u64,
     confirm_attachment: Option<String>,
@@ -277,6 +279,7 @@ impl VaultPreview {
             tray: None,
             single_instance: None,
             passkeys: passkeys::PasskeyState::default(),
+            browser_bridge: browser_bridge::BrowserBridgeState::default(),
             clipboard: clipboard::Clipboard::default(),
             clipboard_generation: 0,
             confirm_attachment: None,
@@ -349,6 +352,7 @@ impl VaultPreview {
         view.initialize_timeouts(window, cx);
         view.observe_generator(cx);
         view.start_passkey_provider(window, cx);
+        view.sync_browser_bridge_service(window, cx);
         view.initialize(cx);
         view
     }
@@ -360,6 +364,7 @@ impl VaultPreview {
         self.closing = true;
         self.stop_timeouts();
         self.stop_passkey_provider(cx);
+        self.stop_browser_bridge(cx);
         self.favicon_cache.clear();
         self.selection.clear();
         self.selection_password
@@ -1815,6 +1820,8 @@ impl Render for VaultPreview {
                     cx.notify();
                 } else if this.passkeys.has_modal() {
                     this.clear_passkey_modal(true, cx);
+                } else if this.browser_bridge.has_modal() {
+                    this.cancel_browser_approval(cx);
                 } else if this.folders.has_form() && this.client.ready() {
                     this.folders.dismiss_form();
                     cx.notify();
@@ -1855,6 +1862,8 @@ impl Render for VaultPreview {
                     this.submit_command_palette(window, cx);
                 } else if this.selection.pending.is_some() || this.selection.active {
                     // Selection changes require the explicit confirmation button.
+                } else if this.browser_bridge.has_modal() {
+                    this.approve_browser_request(cx);
                 } else if this.client.editor.is_some() {
                     this.save_editor(cx);
                 } else {
@@ -2077,6 +2086,17 @@ impl Render for VaultPreview {
                     cx,
                 ))
             })
+            // Centered Modal for Firefox Browser Autofill approval / reprompt.
+            .when(self.browser_bridge.has_modal(), |root| {
+                root.child(self.render_modal_overlay(
+                    1.,
+                    self.render_browser_approval_modal(cx),
+                    |this, _, cx| {
+                        this.cancel_browser_approval(cx);
+                    },
+                    cx,
+                ))
+            })
             // Command Palette (`Ctrl+K`).
             .when(self.ui.palette_open || palette_p > 0.02, |root| {
                 root.child(self.render_command_palette(palette_p, cx))
@@ -2123,6 +2143,9 @@ fn bind_shortcuts(cx: &mut App) {
 mod native_auth_memory_probe;
 
 fn main() {
+    if browser_bridge::maybe_run_native_messaging_cli() {
+        return;
+    }
     let startup_requested =
         std::env::args_os().any(|argument| argument == std::ffi::OsStr::new("--start-in-tray"));
     let Some(single_instance) = tray::SingleInstance::acquire_or_activate(startup_requested) else {

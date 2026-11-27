@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Bytewarden</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <img src="icons/icon.svg" alt="" class="brand-logo" />
+        <div class="brand-text">
+          <span class="brand-title">Bytewarden</span>
+          <span id="status-sub" class="brand-sub">正在连接桌面端…</span>
+        </div>
+      </div>
+      <div id="unlocked-actions" class="top-actions hidden">
+        <button id="btn-sync" class="icon-btn" title="同步保险库">
+          <svg viewBox="0 0 16 16" fill="none"><path d="M13.5 8a5.5 5.5 0 0 1-9.38 3.89M2.5 8a5.5 5.5 0 0 1 9.38-3.89M13.5 3v2.6h-2.6M2.5 13v-2.6h2.6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+        <button id="btn-lock" class="icon-btn" title="立即锁定桌面端与浏览器">
+          <svg viewBox="0 0 16 16" fill="none"><rect x="3.2" y="7.2" width="9.6" height="6.6" rx="1.8" stroke="currentColor" stroke-width="1.4"/><path d="M5.2 7.2V5.3a2.8 2.8 0 1 1 5.6 0v1.9" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <!-- Offline / Unregistered State -->
+    <section id="view-offline" class="state-card hidden">
+      <div class="state-icon">⚡</div>
+      <h2 id="offline-title">桌面端尚未运行</h2>
+      <p id="offline-desc">浏览器扩展不常驻任何密码库副本，所有加解密均由轻量级原生桌面端实时完成。</p>
+      <button id="btn-launch-desktop" class="primary-btn">启动 Bytewarden 桌面端</button>
+    </section>
+
+    <!-- Locked / SignedOut State -->
+    <section id="view-locked" class="state-card hidden">
+      <div class="state-icon">🔒</div>
+      <h2 id="locked-title">保险库已锁定</h2>
+      <p id="locked-desc">解锁桌面端后即可在 Firefox 一键自动填充与搜索。</p>
+      <div class="btn-stack">
+        <button id="btn-hello-unlock" class="primary-btn hidden">Windows Hello 解锁</button>
+        <button id="btn-open-desktop-unlock" class="secondary-btn">在桌面端解锁</button>
+      </div>
+    </section>
+
+    <!-- Unlocked Workspace -->
+    <main id="view-unlocked" class="workspace hidden">
+      <nav class="segmented">
+        <button class="seg-btn active" data-tab="vault">密码库</button>
+        <button class="seg-btn" data-tab="generator">生成器</button>
+        <button class="seg-btn" data-tab="create">+ 新增</button>
+      </nav>
+
+      <!-- Tab 1: Vault Match & Search -->
+      <section id="tab-vault" class="tab-pane">
+        <div class="search-wrap">
+          <svg class="search-icon" viewBox="0 0 16 16" fill="none"><circle cx="7.2" cy="7.2" r="4.6" stroke="currentColor" stroke-width="1.4"/><path d="M10.7 10.7L13.6 13.6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+          <input id="search-input" type="text" placeholder="搜索名称、用户名或域名…" autocomplete="off" />
+          <button id="search-clear" class="clear-btn hidden" type="button" title="清空">×</button>
+        </div>
+
+        <div id="vault-scroll" class="list-scroll">
+          <div id="section-tab-matches" class="group hidden">
+            <div class="group-label">当前网站匹配</div>
+            <div id="list-tab-matches" class="item-list"></div>
+          </div>
+
+          <div id="section-results" class="group hidden">
+            <div id="results-label" class="group-label">搜索结果</div>
+            <div id="list-results" class="item-list"></div>
+          </div>
+
+          <div id="vault-empty" class="empty-hint hidden">没有找到匹配的登录项</div>
+        </div>
+      </section>
+
+      <!-- Tab 2: Native Rust Password Generator -->
+      <section id="tab-generator" class="tab-pane hidden">
+        <div class="gen-box">
+          <div id="gen-output" class="gen-output">点击刷新生成</div>
+          <div class="gen-actions">
+            <button id="btn-gen-refresh" class="secondary-btn sm">重新生成</button>
+            <button id="btn-gen-copy" class="primary-btn sm">复制密码</button>
+            <button id="btn-gen-fill" class="secondary-btn sm">填入网页</button>
+          </div>
+        </div>
+
+        <div class="form-card">
+          <label class="row-toggle">
+            <span>生成助记词短语</span>
+            <input id="gen-passphrase" type="checkbox" />
+          </label>
+          <div id="gen-pw-controls">
+            <div class="slider-row">
+              <span>长度：<strong id="gen-len-val">20</strong></span>
+              <input id="gen-length" type="range" min="8" max="64" value="20" />
+            </div>
+            <div class="chips-row">
+              <label class="chip"><input id="gen-upper" type="checkbox" checked /> A-Z</label>
+              <label class="chip"><input id="gen-lower" type="checkbox" checked /> a-z</label>
+              <label class="chip"><input id="gen-num" type="checkbox" checked /> 0-9</label>
+              <label class="chip"><input id="gen-sym" type="checkbox" checked /> !@#$</label>
+            </div>
+          </div>
+          <div id="gen-phrase-controls" class="hidden">
+            <div class="slider-row">
+              <span>单词数：<strong id="gen-words-val">4</strong></span>
+              <input id="gen-words" type="range" min="3" max="10" value="4" />
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Tab 3: Save New Login to Desktop -->
+      <section id="tab-create" class="tab-pane hidden">
+        <div class="form-card">
+          <div class="field">
+            <label>名称</label>
+            <input id="new-name" type="text" placeholder="例如 GitHub" />
+          </div>
+          <div class="field">
+            <label>用户名 / 邮箱</label>
+            <input id="new-username" type="text" placeholder="name@example.com" autocomplete="off" />
+          </div>
+          <div class="field">
+            <div class="field-head">
+              <label>密码</label>
+              <button id="btn-new-gen" type="button" class="link-btn">随机生成</button>
+            </div>
+            <input id="new-password" type="password" placeholder="输入或生成强密码" autocomplete="off" />
+          </div>
+          <div class="field">
+            <label>网址 (URI)</label>
+            <input id="new-uri" type="text" placeholder="https://example.com" />
+          </div>
+          <div class="btn-row">
+            <button id="btn-read-form" type="button" class="secondary-btn">读取当前网页输入</button>
+            <button id="btn-save-login" type="button" class="primary-btn">保存到保险库</button>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <div id="toast" class="toast hidden"></div>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,67 @@
+{
+  "manifest_version": 3,
+  "name": "Bytewarden",
+  "version": "0.2.0",
+  "description": "与 Bytewarden 原生桌面端实时联动的极速、零内存常驻密码填充扩展。",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "bytewarden@zht0711.github.io",
+      "strict_min_version": "128.0",
+      "data_collection_permissions": {
+        "required": ["none"]
+      }
+    }
+  },
+  "icons": {
+    "16": "icons/icon.svg",
+    "32": "icons/icon.svg",
+    "48": "icons/icon.svg",
+    "96": "icons/icon.svg",
+    "128": "icons/icon.svg"
+  },
+  "permissions": [
+    "nativeMessaging",
+    "activeTab",
+    "tabs",
+    "contextMenus",
+    "clipboardWrite",
+    "storage"
+  ],
+  "host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "background": {
+    "scripts": ["background.js"]
+  },
+  "action": {
+    "default_title": "Bytewarden",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon.svg",
+      "32": "icons/icon.svg"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ],
+  "commands": {
+    "autofill-active": {
+      "suggested_key": {
+        "default": "Alt+Shift+L"
+      },
+      "description": "使用 Bytewarden 自动填充当前页面登录项"
+    },
+    "_execute_action": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+Y"
+      },
+      "description": "打开 Bytewarden 扩展弹窗"
+    }
+  }
+}

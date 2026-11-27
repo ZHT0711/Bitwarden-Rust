@@ -15,6 +15,8 @@ pub struct Settings {
     pub clipboard_seconds: u64,
     pub auto_prompt_hello: bool,
     pub prevent_screenshots: bool,
+    pub browser_integration: bool,
+    pub browser_biometric_gate: bool,
     pub sort: Sort,
     pub website_icons: bool,
     pub keep_in_tray: bool,
@@ -37,6 +39,8 @@ impl Default for Settings {
             clipboard_seconds: 30,
             auto_prompt_hello: false,
             prevent_screenshots: false,
+            browser_integration: true,
+            browser_biometric_gate: false,
             sort: Sort::default(),
             website_icons: true,
             keep_in_tray: true,
@@ -77,6 +81,8 @@ impl Settings {
                 "sort" => settings.sort = Sort::parse(value),
                 "auto_prompt_hello" => settings.auto_prompt_hello = value == "true",
                 "prevent_screenshots" => settings.prevent_screenshots = value == "true",
+                "browser_integration" => settings.browser_integration = value != "false",
+                "browser_biometric_gate" => settings.browser_biometric_gate = value == "true",
                 "website_icons" => settings.website_icons = value != "false",
                 "keep_in_tray" => settings.keep_in_tray = value != "false",
                 "start_hidden" => settings.start_hidden = value != "false",
@@ -202,12 +208,14 @@ impl Settings {
 
     fn serialized(&self) -> String {
         let mut out = format!(
-            "theme={}\nanimations={}\nclipboard_seconds={}\nauto_prompt_hello={}\nprevent_screenshots={}\nsort={}\nwebsite_icons={}\nkeep_in_tray={}\nstart_hidden={}\nminimize_after_copy={}\nlist_width={:.0}\nwindow_maximized={}\n",
+            "theme={}\nanimations={}\nclipboard_seconds={}\nauto_prompt_hello={}\nprevent_screenshots={}\nbrowser_integration={}\nbrowser_biometric_gate={}\nsort={}\nwebsite_icons={}\nkeep_in_tray={}\nstart_hidden={}\nminimize_after_copy={}\nlist_width={:.0}\nwindow_maximized={}\n",
             self.theme.key(),
             self.animations,
             self.clipboard_seconds,
             self.auto_prompt_hello,
             self.prevent_screenshots,
+            self.browser_integration,
+            self.browser_biometric_gate,
             self.sort.key(),
             self.website_icons,
             self.keep_in_tray,
@@ -723,6 +731,157 @@ impl VaultPreview {
                                             this.sync_windows_passkey_metadata(false, cx);
                                         }))
                                     })
+                                    .into_any_element(),
+                                true,
+                            )),
+                    )
+                    .child(
+                        card_group("Firefox 浏览器扩展联动", Some(glyph::GLOBE))
+                            .child(setting_row(
+                                "启用浏览器原生通信联动",
+                                "桌面端解锁或锁定时实时同步到 Firefox 轻量扩展，浏览器端零密码库常驻、零重复加密核心。",
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.))
+                                    .child(crate::ui::components::badge(
+                                        if !self.settings.browser_integration {
+                                            "已关闭"
+                                        } else if self.browser_bridge.connected_clients > 0 {
+                                            "Firefox 已连接"
+                                        } else if self.browser_bridge.host_registered {
+                                            "已就绪"
+                                        } else {
+                                            "待注册"
+                                        },
+                                        if !self.settings.browser_integration {
+                                            pal.text_muted
+                                        } else if self.browser_bridge.connected_clients > 0 {
+                                            pal.success
+                                        } else if self.browser_bridge.host_registered {
+                                            pal.accent_text
+                                        } else {
+                                            pal.warning
+                                        },
+                                    ))
+                                    .child(
+                                        toggle_switch_animated(
+                                            "browser-integration",
+                                            self.settings.browser_integration,
+                                            self.ui.toggle_progress(
+                                                &gpui::ElementId::Name(
+                                                    "browser-integration".into(),
+                                                ),
+                                                self.settings.browser_integration,
+                                                now,
+                                                self.animate,
+                                            ),
+                                        )
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.settings.browser_integration =
+                                                !this.settings.browser_integration;
+                                            this.ui.animate_toggle(
+                                                gpui::ElementId::Name("browser-integration".into()),
+                                                this.settings.browser_integration,
+                                                this.animate,
+                                            );
+                                            this.sync_browser_bridge_service(window, cx);
+                                            this.save_settings(cx);
+                                        })),
+                                    )
+                                    .into_any_element(),
+                                false,
+                            ))
+                            .child(setting_row(
+                                "填充前要求生物识别或手动授权",
+                                "开启后，Firefox 请求自动填充或复制密码前需通过 Windows Hello 验证（或在桌面端确认）。",
+                                toggle_switch_animated(
+                                    "browser-biometric-gate",
+                                    self.settings.browser_biometric_gate,
+                                    self.ui.toggle_progress(
+                                        &gpui::ElementId::Name("browser-biometric-gate".into()),
+                                        self.settings.browser_biometric_gate,
+                                        now,
+                                        self.animate,
+                                    ),
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.settings.browser_biometric_gate =
+                                        !this.settings.browser_biometric_gate;
+                                    this.ui.animate_toggle(
+                                        gpui::ElementId::Name("browser-biometric-gate".into()),
+                                        this.settings.browser_biometric_gate,
+                                        this.animate,
+                                    );
+                                    this.broadcast_browser_state();
+                                    this.save_settings(cx);
+                                }))
+                                .into_any_element(),
+                                false,
+                            ))
+                            .child(setting_row(
+                                "Firefox 原生通信清单与扩展包",
+                                "一键写入 Mozilla NativeMessagingHosts 清单，并打开配套轻量级 Bytewarden Firefox 扩展目录。",
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.))
+                                    .child(
+                                        btn("browser-register-firefox", BtnVariant::Secondary)
+                                            .h(px(30.))
+                                            .px(px(10.))
+                                            .text_size(px(font::CAPTION))
+                                            .child(if self.browser_bridge.host_registered {
+                                                "重新注册清单"
+                                            } else {
+                                                "注册到 Firefox"
+                                            })
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                match crate::browser_bridge::register_firefox_native_host() {
+                                                    Ok(_) => {
+                                                        this.browser_bridge.host_registered = true;
+                                                        this.ui.toast.show(
+                                                            ToastKind::Success,
+                                                            "已注册 Firefox 原生通信清单",
+                                                            std::time::Instant::now(),
+                                                            this.animate,
+                                                        );
+                                                    }
+                                                    Err(err) => {
+                                                        this.ui.toast.show(
+                                                            ToastKind::Error,
+                                                            err,
+                                                            std::time::Instant::now(),
+                                                            this.animate,
+                                                        );
+                                                    }
+                                                }
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        btn("browser-open-ext-dir", BtnVariant::Subtle)
+                                            .h(px(30.))
+                                            .px(px(10.))
+                                            .text_size(px(font::CAPTION))
+                                            .child("扩展目录")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                let dir = crate::browser_bridge::locate_extension_directory();
+                                                let _ = std::process::Command::new("explorer.exe")
+                                                    .arg(&dir)
+                                                    .spawn();
+                                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                                    "about:debugging#/runtime/this-firefox".into(),
+                                                ));
+                                                this.ui.toast.show(
+                                                    ToastKind::Info,
+                                                    "已打开扩展目录，并复制 about:debugging 地址",
+                                                    std::time::Instant::now(),
+                                                    this.animate,
+                                                );
+                                                cx.notify();
+                                            })),
+                                    )
                                     .into_any_element(),
                                 true,
                             )),
