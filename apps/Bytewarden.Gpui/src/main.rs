@@ -10,6 +10,7 @@ mod favicon;
 mod folders;
 mod generator;
 mod generator_preferences;
+mod health;
 mod input;
 mod motion;
 mod passkeys;
@@ -81,6 +82,7 @@ struct VaultPreview {
     folders: folders::Folders,
     sends: sends::SendPage,
     backup: backup::Backup,
+    health: health::HealthPage,
     settings: settings::Settings,
     timeouts: timeout::Timeouts,
     page_motion: Option<Tween>,
@@ -219,6 +221,7 @@ enum Page {
     Sends,
     Backup,
     Generator,
+    Health,
     Settings,
     About,
 }
@@ -254,6 +257,7 @@ impl VaultPreview {
             folders: folders::Folders::default(),
             sends: sends::SendPage::default(),
             backup: backup::Backup::new(cx),
+            health: health::HealthPage::default(),
             settings,
             timeouts: timeout::Timeouts::default(),
             page_motion: None,
@@ -365,6 +369,7 @@ impl VaultPreview {
         self.stop_timeouts();
         self.stop_passkey_provider(cx);
         self.stop_browser_bridge(cx);
+        self.health.clear();
         self.favicon_cache.clear();
         self.selection.clear();
         self.selection_password
@@ -1580,6 +1585,7 @@ impl Render for VaultPreview {
             self.client.form,
             Some(
                 Form::HelloEnrollment
+                    | Form::PinEnrollment
                     | Form::Detail
                     | Form::EditorPassword
                     | Form::Reverify(_)
@@ -1701,6 +1707,7 @@ impl Render for VaultPreview {
                     .overflow_y_scroll()
                     .child(self.generator(now, cx))
                     .into_any_element(),
+                Page::Health => self.render_health(cx).into_any_element(),
                 Page::Settings => self.render_settings(now, cx).into_any_element(),
                 Page::About => div()
                     .id("about-page-scroll")

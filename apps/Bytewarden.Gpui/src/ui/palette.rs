@@ -163,6 +163,14 @@ impl VaultPreview {
             action: PaletteAction::OpenPage(Page::Generator),
         });
         commands.push(PaletteEntry {
+            title: "打开安全体检".into(),
+            subtitle: "离线检测弱密码、重复密码、未启用 2FA 与 HTTP 链接".into(),
+            icon_glyph: glyph::SHIELD,
+            shortcut: None,
+            item_type: None,
+            action: PaletteAction::OpenPage(Page::Health),
+        });
+        commands.push(PaletteEntry {
             title: "打开 Send 分享".into(),
             subtitle: "安全分享限时文本或文件".into(),
             icon_glyph: glyph::SEND,

@@ -231,6 +231,33 @@ body {
   gap: 3px;
 }
 
+.segmented.seg-4 {
+  grid-template-columns: repeat(4, 1fr);
+}
+
+.pin-box {
+  width: 100%;
+  display: flex;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.pin-box input {
+  flex: 1;
+  height: 34px;
+  padding: 0 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--layer);
+  color: var(--text);
+  font-size: 12.5px;
+  outline: none;
+}
+
+.pin-box input:focus {
+  border-color: var(--accent);
+}
+
 .seg-btn {
   height: 27px;
   border: none;

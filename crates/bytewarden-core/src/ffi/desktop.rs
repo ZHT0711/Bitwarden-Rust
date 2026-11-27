@@ -430,6 +430,35 @@ impl Request {
         }
     }
 
+    pub fn enable_pin(
+        self,
+        account: &str,
+        password: &str,
+        pin: &str,
+        require_mp_on_restart: bool,
+    ) -> Result<(), Error> {
+        let account = argument(account)?;
+        let password = argument(password)?;
+        let pin = argument(pin)?;
+        read::<bool>(unsafe {
+            super::pin::bw_pin_enable(
+                ptr(&account),
+                ptr(&password),
+                ptr(&pin),
+                u8::from(require_mp_on_restart),
+                self.0,
+            )
+        })
+        .map(|_| ())
+    }
+
+    pub fn unlock_pin(self, account: &str, pin: &str) -> Result<(), Error> {
+        let account = argument(account)?;
+        let pin = argument(pin)?;
+        read::<bool>(unsafe { super::pin::bw_pin_unlock(ptr(&account), ptr(&pin), self.0) })
+            .map(|_| ())
+    }
+
     pub fn sync(self) -> Result<Overview, Error> {
         vault_sync(self.0, Overview::clone).map_err(Error)
     }
@@ -987,6 +1016,11 @@ pub fn disable_hello(account: &str) -> Result<(), Error> {
         let _ = account;
         Err(Error::from_code("helloUnavailable"))
     }
+}
+
+pub fn disable_pin(account: &str) -> Result<(), Error> {
+    let account = argument(account)?;
+    read::<bool>(unsafe { super::pin::bw_pin_disable(ptr(&account)) }).map(|_| ())
 }
 
 pub fn overview() -> Result<Overview, Error> {

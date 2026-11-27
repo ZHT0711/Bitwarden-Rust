@@ -1,6 +1,6 @@
 // Bytewarden Firefox Extension — Lightweight Focus-Driven Content Script.
-// Zero MutationObserver overhead: activates ONLY when the user focuses a login field
-// or triggers autofill from the popup / keyboard shortcut / context menu.
+// Zero MutationObserver overhead: activates ONLY when focusing a login field,
+// submitting a login form, or executing autofill (Logins / TOTP / Cards / Identities).
 
 (() => {
   if (window.__bytewardenInjected) return;
@@ -13,13 +13,14 @@
   let repositionRaf = 0;
 
   const USERNAME_HINTS = /user|email|login|account|acct|phone|mobile|id|账号|邮箱|手机|用户名/i;
-  const SEARCH_OR_NON_LOGIN = /search|query|coupon|promo|captcha|otp|code|搜索|验证码/i;
+  const OTP_HINTS = /otp|totp|2fa|mfa|token|auth.?code|verify|verification|验证码|动态码|安全码/i;
+  const SEARCH_OR_NON_LOGIN = /search|query|coupon|promo|captcha|搜索/i;
 
   function isVisibleControl(el) {
-    if (!el || !(el instanceof HTMLInputElement)) return false;
+    if (!el || !(el instanceof HTMLInputElement || el instanceof HTMLSelectElement)) return false;
     if (el.disabled || el.readOnly || el.type === "hidden") return false;
     const rect = el.getBoundingClientRect();
-    return rect.width >= 60 && rect.height >= 18;
+    return rect.width >= 48 && rect.height >= 18;
   }
 
   function isPasswordField(el) {
@@ -27,6 +28,16 @@
     if (el.type === "password") return true;
     const ac = (el.getAttribute("autocomplete") || "").toLowerCase();
     return ac.includes("current-password") || ac.includes("new-password");
+  }
+
+  function isOtpField(el) {
+    if (!(el instanceof HTMLInputElement)) return false;
+    const ac = (el.getAttribute("autocomplete") || "").toLowerCase();
+    if (ac.includes("one-time-code")) return true;
+    const type = (el.type || "text").toLowerCase();
+    if (!["text", "tel", "number", ""].includes(type)) return false;
+    const meta = `${el.name || ""} ${el.id || ""} ${el.placeholder || ""} ${el.getAttribute("aria-label") || ""}`;
+    return OTP_HINTS.test(meta) && !isPasswordField(el);
   }
 
   function isLikelyUsernameField(el) {
@@ -37,7 +48,7 @@
     if (ac.includes("username") || ac === "email") return true;
 
     const meta = `${el.name || ""} ${el.id || ""} ${el.placeholder || ""} ${el.getAttribute("aria-label") || ""}`;
-    if (SEARCH_OR_NON_LOGIN.test(meta)) return false;
+    if (SEARCH_OR_NON_LOGIN.test(meta) || OTP_HINTS.test(meta)) return false;
 
     const scope = el.form || el.closest("form, [role='dialog'], main, body") || document.body;
     const hasPwNearby = Boolean(scope.querySelector('input[type="password"]'));
@@ -45,23 +56,41 @@
   }
 
   function isLoginEligibleField(el) {
-    return isVisibleControl(el) && (isPasswordField(el) || isLikelyUsernameField(el));
+    return (
+      el instanceof HTMLInputElement &&
+      isVisibleControl(el) &&
+      (isPasswordField(el) || isLikelyUsernameField(el) || isOtpField(el))
+    );
   }
 
-  function setNativeInputValue(input, value) {
-    if (!input || value == null) return;
-    input.focus({ preventScroll: true });
-    const proto = Object.getPrototypeOf(input);
+  function setNativeControlValue(control, value) {
+    if (!control || value == null || value === "") return;
+    if (control instanceof HTMLSelectElement) {
+      const norm = String(value).trim().toLowerCase();
+      const padded = norm.length === 1 && /^\d$/.test(norm) ? `0${norm}` : norm;
+      const opt = Array.from(control.options).find((o) => {
+        const v = o.value.trim().toLowerCase();
+        const t = o.text.trim().toLowerCase();
+        return v === norm || v === padded || t === norm || t.includes(norm);
+      });
+      if (opt) {
+        control.value = opt.value;
+        control.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+      }
+      return;
+    }
+    control.focus({ preventScroll: true });
+    const proto = Object.getPrototypeOf(control);
     const descriptor =
       Object.getOwnPropertyDescriptor(proto, "value") ||
       Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
     if (descriptor && descriptor.set) {
-      descriptor.set.call(input, value);
+      descriptor.set.call(control, value);
     } else {
-      input.value = value;
+      control.value = value;
     }
-    input.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, data: value }));
-    input.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+    control.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, data: value }));
+    control.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
   }
 
   function findFormPair(seedInput) {
@@ -86,7 +115,11 @@
       for (let i = idx - 1; i >= 0; i--) {
         const candidate = allInputs[i];
         const t = (candidate.type || "text").toLowerCase();
-        if (["text", "email", "tel", ""].includes(t) && !SEARCH_OR_NON_LOGIN.test(candidate.name || "")) {
+        if (
+          ["text", "email", "tel", ""].includes(t) &&
+          !SEARCH_OR_NON_LOGIN.test(candidate.name || "") &&
+          !OTP_HINTS.test(candidate.name || "")
+        ) {
           if (!passwordEl.form || candidate.form === passwordEl.form) {
             usernameEl = candidate;
             break;
@@ -94,7 +127,63 @@
         }
       }
     }
-    return { usernameEl, passwordEl };
+
+    const otpEl =
+      (seedInput && isOtpField(seedInput) ? seedInput : null) ||
+      pool.find(isOtpField) ||
+      allInputs.find(isOtpField) ||
+      null;
+
+    return { usernameEl, passwordEl, otpEl };
+  }
+
+  function fillCardOrIdentity(kind, fields) {
+    const controls = Array.from(document.querySelectorAll("input, select")).filter(isVisibleControl);
+    const matchAndSet = (acList, regex, val) => {
+      if (!val) return;
+      let target = controls.find((el) => {
+        const ac = (el.getAttribute("autocomplete") || "").toLowerCase();
+        return acList.some((token) => ac === token || ac.endsWith(` ${token}`));
+      });
+      if (!target && regex) {
+        target = controls.find((el) => {
+          const meta = `${el.name || ""} ${el.id || ""} ${el.placeholder || ""} ${el.getAttribute("aria-label") || ""}`;
+          return regex.test(meta);
+        });
+      }
+      if (target) setNativeControlValue(target, val);
+    };
+
+    if (kind === "card") {
+      matchAndSet(["cc-name"], /card.?holder|name.?on.?card|持卡人/i, fields.cardholderName);
+      matchAndSet(["cc-number"], /card.?num|cc.?num|pan|卡号/i, fields.number);
+      matchAndSet(["cc-exp-month"], /exp.?mon|cc.?mm|月份/i, fields.expMonth);
+      matchAndSet(["cc-exp-year"], /exp.?year|cc.?yy|年份/i, fields.expYear);
+      if (fields.expMonth && fields.expYear) {
+        const yy = String(fields.expYear).slice(-2);
+        const mm = String(fields.expMonth).padStart(2, "0");
+        matchAndSet(["cc-exp"], /expiry|exp.?date|有效期/i, `${mm}/${yy}`);
+      }
+      matchAndSet(["cc-csc"], /cvv|cvc|csc|sec.?code|安全码/i, fields.code);
+    } else {
+      const fullName = [fields.firstName, fields.middleName, fields.lastName]
+        .filter(Boolean)
+        .join(" ")
+        .trim();
+      matchAndSet(["given-name"], /first.?name|fname|名/i, fields.firstName);
+      matchAndSet(["family-name"], /last.?name|lname|surname|姓/i, fields.lastName);
+      matchAndSet(["name"], /full.?name|your.?name|姓名|收货人/i, fullName);
+      matchAndSet(["username"], /user.?name|用户名/i, fields.username);
+      matchAndSet(["email"], /e-?mail|邮箱/i, fields.email);
+      matchAndSet(["tel", "tel-national"], /phone|mobile|tel|电话|手机/i, fields.phone);
+      matchAndSet(["organization"], /company|org|公司|单位/i, fields.company);
+      matchAndSet(["address-line1", "street-address"], /addr.*1|street|详细地址|地址/i, fields.address1);
+      matchAndSet(["address-line2"], /addr.*2|apt|suite/i, fields.address2);
+      matchAndSet(["address-level2"], /city|城市/i, fields.city);
+      matchAndSet(["address-level1"], /state|province|region|省|州/i, fields.state);
+      matchAndSet(["postal-code"], /zip|postal|postcode|邮编/i, fields.postalCode);
+      matchAndSet(["country", "country-name"], /country|国家/i, fields.country);
+    }
   }
 
   function ensureOverlay() {
@@ -129,12 +218,9 @@
         transform: scale(1.05);
       }
       .bw-badge svg { width: 14px; height: 14px; }
-      .bw-popover {
+      .bw-popover, .bw-save-banner {
         position: fixed;
-        min-width: 250px;
-        max-width: 320px;
         border-radius: 10px;
-        padding: 6px;
         font-family: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
         font-size: 12.5px;
         color: #F3F4F6;
@@ -145,13 +231,30 @@
         pointer-events: auto;
       }
       @media (prefers-color-scheme: light) {
-        .bw-popover {
+        .bw-popover, .bw-save-banner {
           color: #18181B;
           background: rgba(255, 255, 255, 0.97);
           border-color: rgba(0, 0, 0, 0.1);
           box-shadow: 0 10px 28px rgba(0, 0, 0, 0.14);
         }
       }
+      .bw-popover {
+        min-width: 250px;
+        max-width: 320px;
+        padding: 6px;
+      }
+      .bw-save-banner {
+        top: 16px;
+        right: 16px;
+        width: 300px;
+        padding: 12px 14px;
+        display: flex;
+        flex-direction: column;
+        gap: 9px;
+      }
+      .bw-banner-title { font-weight: 650; font-size: 13px; }
+      .bw-banner-sub { font-size: 11.5px; opacity: 0.75; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .bw-banner-actions { display: flex; justify-content: flex-end; gap: 6px; }
       .bw-head {
         display: flex;
         align-items: center;
@@ -173,9 +276,7 @@
         flex-direction: column;
         gap: 2px;
       }
-      .bw-item:hover {
-        background: rgba(139, 92, 246, 0.16);
-      }
+      .bw-item:hover { background: rgba(139, 92, 246, 0.16); }
       .bw-item-title {
         font-weight: 600;
         font-size: 12.5px;
@@ -201,7 +302,7 @@
       .bw-action-btn {
         border: none;
         border-radius: 6px;
-        padding: 6px 10px;
+        padding: 6px 12px;
         font-size: 12px;
         font-weight: 600;
         color: #FFFFFF;
@@ -209,11 +310,23 @@
         cursor: pointer;
       }
       .bw-action-btn:hover { background: #6D28D9; }
+      .bw-ghost-btn {
+        border: 1px solid rgba(128, 128, 138, 0.3);
+        border-radius: 6px;
+        padding: 6px 10px;
+        font-size: 12px;
+        color: inherit;
+        background: transparent;
+        cursor: pointer;
+      }
     `;
     shadow.appendChild(style);
     const root = document.createElement("div");
     root.id = "bw-root";
     shadow.appendChild(root);
+    const bannerRoot = document.createElement("div");
+    bannerRoot.id = "bw-banner-root";
+    shadow.appendChild(bannerRoot);
     (document.documentElement || document.body).appendChild(hostEl);
   }
 
@@ -223,6 +336,51 @@
       const root = shadow.getElementById("bw-root");
       if (root) root.replaceChildren();
     }
+  }
+
+  function hideSaveBanner() {
+    if (shadow) {
+      const br = shadow.getElementById("bw-banner-root");
+      if (br) br.replaceChildren();
+    }
+  }
+
+  function renderSaveBanner(host, username) {
+    if (window !== window.top) return;
+    ensureOverlay();
+    const br = shadow.getElementById("bw-banner-root");
+    if (!br) return;
+    br.replaceChildren();
+
+    const card = document.createElement("div");
+    card.className = "bw-save-banner";
+    const t = document.createElement("div");
+    t.className = "bw-banner-title";
+    t.textContent = "保存到 Bytewarden 保险库？";
+    const sub = document.createElement("div");
+    sub.className = "bw-banner-sub";
+    sub.textContent = username ? `${host} · ${username}` : host;
+
+    const actions = document.createElement("div");
+    actions.className = "bw-banner-actions";
+    const cancelBtn = document.createElement("button");
+    cancelBtn.className = "bw-ghost-btn";
+    cancelBtn.textContent = "忽略";
+    cancelBtn.addEventListener("click", () => {
+      hideSaveBanner();
+      browser.runtime.sendMessage({ type: "bw:dismiss_save_banner" }).catch(() => {});
+    });
+    const saveBtn = document.createElement("button");
+    saveBtn.className = "bw-action-btn";
+    saveBtn.textContent = "保存登录项";
+    saveBtn.addEventListener("click", async () => {
+      saveBtn.textContent = "保存中…";
+      await browser.runtime.sendMessage({ type: "bw:confirm_save_banner" }).catch(() => {});
+      hideSaveBanner();
+    });
+    actions.append(cancelBtn, saveBtn);
+    card.append(t, sub, actions);
+    br.appendChild(card);
   }
 
   function positionBadgeAndMenu() {
@@ -365,6 +523,28 @@
     positionBadgeAndMenu();
   }
 
+  // Passive capture of login form submission to offer saving new credentials.
+  document.addEventListener(
+    "submit",
+    (e) => {
+      const form = e.target;
+      if (!(form instanceof HTMLFormElement)) return;
+      const { usernameEl, passwordEl } = findFormPair(form.querySelector('input[type="password"]'));
+      if (passwordEl && passwordEl.value) {
+        browser.runtime
+          .sendMessage({
+            type: "bw:form_submitted",
+            url: location.href,
+            title: document.title || "",
+            username: usernameEl ? usernameEl.value.trim() : "",
+            password: passwordEl.value,
+          })
+          .catch(() => {});
+      }
+    },
+    true
+  );
+
   document.addEventListener(
     "focusin",
     (e) => {
@@ -405,6 +585,12 @@
 
     if (msg.type === "bw:vault_locked") {
       hideOverlay();
+      hideSaveBanner();
+      return undefined;
+    }
+
+    if (msg.type === "bw:show_save_banner") {
+      renderSaveBanner(msg.host || location.hostname, msg.username || "");
       return undefined;
     }
 
@@ -412,15 +598,24 @@
       const seed =
         (document.activeElement instanceof HTMLInputElement ? document.activeElement : null) ||
         activeInput;
-      const { usernameEl, passwordEl } = findFormPair(seed);
+      const { usernameEl, passwordEl, otpEl } = findFormPair(seed);
       if (usernameEl && msg.username) {
-        setNativeInputValue(usernameEl, msg.username);
+        setNativeControlValue(usernameEl, msg.username);
       }
       if (passwordEl && msg.password) {
-        setNativeInputValue(passwordEl, msg.password);
-      } else if (!usernameEl && seed && isVisibleControl(seed) && msg.password) {
-        setNativeInputValue(seed, msg.password);
+        setNativeControlValue(passwordEl, msg.password);
+      } else if (!usernameEl && !otpEl && seed && isVisibleControl(seed) && msg.password) {
+        setNativeControlValue(seed, msg.password);
       }
+      if (otpEl && msg.totp) {
+        setNativeControlValue(otpEl, msg.totp);
+      }
+      hideOverlay();
+      return Promise.resolve({ ok: true });
+    }
+
+    if (msg.type === "bw:perform_profile_fill") {
+      fillCardOrIdentity(msg.kind, msg.fields || {});
       hideOverlay();
       return Promise.resolve({ ok: true });
     }
@@ -430,7 +625,7 @@
         (document.activeElement instanceof HTMLInputElement ? document.activeElement : null) ||
         activeInput;
       if (target && isVisibleControl(target) && msg.password) {
-        setNativeInputValue(target, msg.password);
+        setNativeControlValue(target, msg.password);
       }
       return Promise.resolve({ ok: true });
     }

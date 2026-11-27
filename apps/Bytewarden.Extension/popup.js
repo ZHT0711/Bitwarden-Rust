@@ -63,9 +63,14 @@ function renderState(state, rawError = null) {
     $("locked-desc").textContent =
       state.session === "signedOut"
         ? "请先在 Bytewarden 桌面端登录账户。"
-        : `账户 ${state.accountEmail || ""} 已锁定，解锁后实时同步就绪。`;
+        : `账户 ${state.accountEmail || ""} 已锁定，支持 PIN 码或 Windows Hello 直接解锁。`;
+    const showPin = state.session === "locked" && Boolean(state.pinEnabled);
+    $("pin-unlock-box").classList.toggle("hidden", !showPin);
     $("btn-hello-unlock").classList.toggle("hidden", !state.helloEnabled);
     viewLocked.classList.remove("hidden");
+    if (showPin) {
+      setTimeout(() => $("pin-unlock-input").focus(), 40);
+    }
     return;
   }
 
@@ -175,6 +180,69 @@ function createVaultRow(item) {
   return row;
 }
 
+function createProfileRow(item, kind) {
+  const row = document.createElement("div");
+  row.className = "vault-row";
+
+  const main = document.createElement("div");
+  main.className = "row-main";
+  const title = document.createElement("div");
+  title.className = "row-title";
+  title.textContent = item.name || (kind === "card" ? "未命名银行卡" : "未命名身份");
+  const sub = document.createElement("div");
+  sub.className = "row-sub";
+  sub.textContent = item.subtitle || (kind === "card" ? "点击一键填充支付卡片" : "点击一键填充姓名地址");
+  main.append(title, sub);
+
+  const doFill = async () => {
+    if (!activeTab || activeTab.id == null) return;
+    const res = await browser.runtime.sendMessage({
+      type: "bw:fill_profile",
+      tabId: activeTab.id,
+      itemId: item.id,
+      tabUrl: activeTab.url || "",
+    });
+    if (res && res.ok) {
+      showToast("已自动填入表单");
+      setTimeout(() => window.close(), 350);
+    } else {
+      showToast((res && res.message) || "填表失败");
+    }
+  };
+  main.addEventListener("click", doFill);
+
+  const btns = document.createElement("div");
+  btns.className = "row-btns";
+  const fillBtn = document.createElement("button");
+  fillBtn.className = "fill-pill";
+  fillBtn.textContent = "填表";
+  fillBtn.addEventListener("click", doFill);
+  btns.appendChild(fillBtn);
+
+  if (kind === "card") {
+    const copyNumBtn = document.createElement("button");
+    copyNumBtn.className = "mini-btn";
+    copyNumBtn.title = "复制卡号";
+    copyNumBtn.textContent = "号";
+    copyNumBtn.addEventListener("click", async () => {
+      const res = await nativeCall("get_autofill_profile", {
+        id: item.id,
+        tabUrl: (activeTab && activeTab.url) || "",
+      });
+      if (res && res.ok && res.data && res.data.fields && res.data.fields.number) {
+        await navigator.clipboard.writeText(res.data.fields.number);
+        showToast("已复制银行卡号");
+      } else {
+        showToast("无法读取卡号");
+      }
+    });
+    btns.appendChild(copyNumBtn);
+  }
+
+  row.append(main, btns);
+  return row;
+}
+
 async function refreshVaultList() {
   if (!currentState || currentState.session !== "unlocked") return;
   const query = $("search-input").value.trim();
@@ -200,10 +268,9 @@ async function refreshVaultList() {
   const secRes = $("section-results");
   const listRes = $("list-results");
   listRes.replaceChildren();
-  const shownList = query ? results : results;
-  if (shownList.length > 0) {
-    $("results-label").textContent = query ? `搜索结果 (${shownList.length})` : "全部登录项";
-    for (const item of shownList) {
+  if (results.length > 0) {
+    $("results-label").textContent = query ? `搜索结果 (${results.length})` : "全部登录项";
+    for (const item of results) {
       listRes.appendChild(createVaultRow(item));
     }
     secRes.classList.remove("hidden");
@@ -211,8 +278,28 @@ async function refreshVaultList() {
     secRes.classList.add("hidden");
   }
 
-  const empty = tabMatches.length === 0 && shownList.length === 0;
+  const empty = tabMatches.length === 0 && results.length === 0;
   $("vault-empty").classList.toggle("hidden", !empty);
+}
+
+async function refreshProfilesList() {
+  if (!currentState || currentState.session !== "unlocked") return;
+  const res = await nativeCall("query_autofill_profiles", {});
+  if (!res || !res.ok || !res.data) return;
+  const cards = res.data.cards || [];
+  const identities = res.data.identities || [];
+
+  const listCards = $("list-cards");
+  listCards.replaceChildren();
+  for (const c of cards) listCards.appendChild(createProfileRow(c, "card"));
+  $("section-cards").classList.toggle("hidden", cards.length === 0);
+
+  const listIds = $("list-identities");
+  listIds.replaceChildren();
+  for (const idItem of identities) listIds.appendChild(createProfileRow(idItem, "identity"));
+  $("section-identities").classList.toggle("hidden", identities.length === 0);
+
+  $("profiles-empty").classList.toggle("hidden", cards.length + identities.length > 0);
 }
 
 async function refreshGeneratedPassword() {
@@ -250,7 +337,6 @@ document.addEventListener("DOMContentLoaded", async () => {
   const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
   activeTab = tab || null;
 
-  // Segmented tabs
   for (const btn of document.querySelectorAll(".seg-btn")) {
     btn.addEventListener("click", () => {
       for (const b of document.querySelectorAll(".seg-btn")) {
@@ -258,8 +344,10 @@ document.addEventListener("DOMContentLoaded", async () => {
       }
       const target = btn.dataset.tab;
       $("tab-vault").classList.toggle("hidden", target !== "vault");
+      $("tab-profiles").classList.toggle("hidden", target !== "profiles");
       $("tab-generator").classList.toggle("hidden", target !== "generator");
       $("tab-create").classList.toggle("hidden", target !== "create");
+      if (target === "profiles") refreshProfilesList();
       if (target === "generator") refreshGeneratedPassword();
       if (target === "create") prefillCreateTab();
     });
@@ -287,6 +375,30 @@ document.addEventListener("DOMContentLoaded", async () => {
     const res = await nativeCall("launch_desktop");
     $("btn-launch-desktop").textContent = "启动 Bytewarden 桌面端";
     if (res && res.ok && res.data) renderState(res.data);
+  });
+
+  const submitPinUnlock = async () => {
+    const pinInput = $("pin-unlock-input");
+    const pin = pinInput.value.trim();
+    if (!pin) return;
+    pinInput.value = "";
+    $("btn-pin-unlock").textContent = "验证中…";
+    const res = await nativeCall("unlock_pin", { pin });
+    $("btn-pin-unlock").textContent = "PIN 解锁";
+    if (res && res.ok && res.data) {
+      renderState(res.data);
+    } else {
+      showToast((res && res.message) || "PIN 码错误");
+      const refreshed = await browser.runtime.sendMessage({ type: "bw:get_state" }).catch(() => null);
+      if (refreshed && refreshed.state) renderState(refreshed.state);
+    }
+  };
+  $("btn-pin-unlock").addEventListener("click", submitPinUnlock);
+  $("pin-unlock-input").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      submitPinUnlock();
+    }
   });
 
   $("btn-hello-unlock").addEventListener("click", async () => {
@@ -394,7 +506,6 @@ document.addEventListener("DOMContentLoaded", async () => {
     }
   });
 
-  // Live state updates from background
   browser.runtime.onMessage.addListener((msg) => {
     if (msg && msg.type === "bw:state_changed" && msg.state) {
       renderState(msg.state);

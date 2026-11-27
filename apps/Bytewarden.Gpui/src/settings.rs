@@ -919,6 +919,33 @@ impl VaultPreview {
                         )),
                     )
                 })
+                .child({
+                    let pin_enabled = self
+                        .client
+                        .active()
+                        .is_some_and(|account| account.pin_enabled);
+                    let can_change_pin = timeout_enabled
+                        && (pin_enabled
+                            || self.client.overview.is_some() && !self.client.write_guard);
+                    card_group("PIN 码快速解锁", Some(glyph::KEYBOARD)).child(setting_row(
+                        "本地短 PIN 码解锁",
+                        if pin_enabled {
+                            "当前账户已启用本地 PIN 码解锁（连续输错 5 次将自动撤销并退回主密码）。"
+                        } else {
+                            "适用于无指纹/人脸硬件的台式机。使用 Argon2 派生密钥封装，支持桌面端与浏览器弹窗快速解锁。"
+                        },
+                        btn("settings-pin", BtnVariant::Secondary)
+                            .child(if pin_enabled { "关闭" } else { "设置 PIN" })
+                            .when(!can_change_pin, |button| button.opacity(0.45))
+                            .when(can_change_pin, |button| {
+                                button.on_click(cx.listener(|this, _, window, cx| {
+                                    this.change_pin(window, cx)
+                                }))
+                            })
+                            .into_any_element(),
+                        true,
+                    ))
+                })
                 .child(
                     card_group("保险库超时策略", Some(glyph::LOCK)).child(
                         div()

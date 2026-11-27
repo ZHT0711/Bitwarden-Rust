@@ -43,6 +43,7 @@ pub enum Form {
     SignIn,
     Unlock,
     HelloEnrollment,
+    PinEnrollment,
     Detail,
     EditorPassword,
     Confirm(ItemAction),
@@ -192,6 +193,9 @@ pub struct Client {
     email: Entity<Input>,
     server: Entity<Input>,
     pub(crate) password: Entity<Input>,
+    pub(crate) pin: Entity<Input>,
+    pub(crate) pin_require_mp_on_restart: bool,
+    pub(crate) unlock_with_pin: bool,
     code: Entity<Input>,
 }
 
@@ -239,6 +243,9 @@ impl Client {
             email: cx.new(|cx| Input::new("电子邮箱", false, cx)),
             server: cx.new(|cx| Input::new("https://vault.example.com", false, cx)),
             password: cx.new(|cx| Input::new("主密码", true, cx)),
+            pin: cx.new(|cx| Input::new("输入 PIN 码（至少 4 位）", true, cx)),
+            pin_require_mp_on_restart: false,
+            unlock_with_pin: false,
             code: cx.new(|cx| Input::new("验证码", true, cx)),
         }
     }
@@ -292,7 +299,13 @@ impl Client {
     }
 
     fn freeze_auth_inputs(&self, read_only: bool, cx: &mut Context<VaultPreview>) {
-        for field in [&self.email, &self.server, &self.password, &self.code] {
+        for field in [
+            &self.email,
+            &self.server,
+            &self.password,
+            &self.pin,
+            &self.code,
+        ] {
             field.update(cx, |field, cx| field.set_read_only(read_only, cx));
         }
     }
@@ -371,7 +384,14 @@ fn device_id(root: &Path) -> io::Result<Uuid> {
 
 enum LocalUnlock {
     Password(Zeroizing<String>),
-    Hello { account: String, window: usize },
+    Pin {
+        account: String,
+        pin: Zeroizing<String>,
+    },
+    Hello {
+        account: String,
+        window: usize,
+    },
 }
 
 fn hello_hwnd(window: &Window) -> Option<usize> {
@@ -400,6 +420,9 @@ pub(crate) fn status_text(err: &Error) -> String {
         "helloUnavailable" => "Windows Hello 当前不可用，请使用主密码。",
         "helloFailed" => "Windows Hello 验证失败。请用主密码解锁后重新设置。",
         "helloNotEnabled" => "当前账户尚未启用 Windows Hello。",
+        "wrongPin" => "PIN 码不正确，请重试（连续输错 5 次将退回主密码）。",
+        "pinRevoked" => "PIN 码连续输错次数超限，已自动撤销并退回主密码解锁。",
+        "pinNotEnabled" => "当前账户尚未启用 PIN 码解锁。",
         "localStorage" => "无法保存本机设置，请检查存储后重试。",
         "signInRequired" => "离线快照只读，请重新登录并同步。",
         "notSynced" => "本机存在尚待核对的写入结果。请同步后再继续操作。",
@@ -585,6 +608,7 @@ impl VaultPreview {
         self.folders = crate::folders::Folders::default();
         self.sends.clear(cx);
         self.backup.clear(cx);
+        self.health.clear();
         self.client.clear_overview();
         self.search_index = crate::vault_list::Index::default();
         self.index_generation = None;
@@ -604,8 +628,10 @@ impl VaultPreview {
             self.lock_queued = true;
             self.cancel_pending(cx);
         }
-        if matches!(self.client.form, Some(Form::SignIn | Form::HelloEnrollment))
-            && let Some(request) = self.client.pending.take()
+        if matches!(
+            self.client.form,
+            Some(Form::SignIn | Form::HelloEnrollment | Form::PinEnrollment)
+        ) && let Some(request) = self.client.pending.take()
         {
             request.cancel();
         }
@@ -626,6 +652,7 @@ impl VaultPreview {
         self.client
             .password
             .update(cx, |field, cx| field.set("", cx));
+        self.client.pin.update(cx, |field, cx| field.set("", cx));
         self.client.code.update(cx, |field, cx| field.set("", cx));
     }
 
@@ -747,14 +774,27 @@ impl VaultPreview {
     pub fn submit(&mut self, cx: &mut Context<Self>) {
         if !self.client.ready()
             || !self.client.password.read(cx).committed()
+            || !self.client.pin.read(cx).committed()
             || !self.client.code.read(cx).committed()
         {
             return;
         }
         match self.client.form {
             Some(Form::SignIn) => self.request_login(cx),
-            Some(Form::Unlock) => self.request_unlock(cx),
+            Some(Form::Unlock) => {
+                let use_pin = self.client.unlock_with_pin
+                    && self
+                        .client
+                        .local_unlock_account()
+                        .is_some_and(|a| a.pin_enabled);
+                if use_pin {
+                    self.request_pin_unlock(cx);
+                } else {
+                    self.request_unlock(cx);
+                }
+            }
             Some(Form::HelloEnrollment) => self.enroll_hello(cx),
+            Some(Form::PinEnrollment) => self.enroll_pin(cx),
             Some(Form::EditorPassword) => {
                 let secret = self.client.password.update(cx, |field, cx| field.take(cx));
                 if !secret.is_empty() {
@@ -1003,6 +1043,132 @@ impl VaultPreview {
         self.run_local_unlock(LocalUnlock::Password(password), cx);
     }
 
+    fn request_pin_unlock(&mut self, cx: &mut Context<Self>) {
+        if !self.client.ready() || !self.client.pin.read(cx).committed() {
+            return;
+        }
+        let Some(account) = self
+            .client
+            .local_unlock_account()
+            .filter(|account| account.pin_enabled)
+        else {
+            return;
+        };
+        let account = account.id.clone();
+        let pin = self.client.pin.update(cx, |field, cx| field.take(cx));
+        if pin.is_empty() {
+            return;
+        }
+        self.run_local_unlock(LocalUnlock::Pin { account, pin }, cx);
+    }
+
+    pub(crate) fn change_pin(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.closing || !self.client.ready() || !self.navigation_available() {
+            return;
+        }
+        let Some(account) = self
+            .client
+            .active()
+            .filter(|account| account.session() == Session::Unlocked)
+        else {
+            return;
+        };
+        if account.pin_enabled {
+            let id = account.id.clone();
+            self.run(
+                "正在关闭 PIN 码解锁",
+                None,
+                cx,
+                move || desktop::disable_pin(&id).and_then(|()| desktop::accounts()),
+                |this, result, _| match result {
+                    Ok(accounts) => {
+                        this.client.accounts = accounts;
+                        this.client.notice = "已关闭本机 PIN 码快速解锁。".into();
+                        this.broadcast_browser_state();
+                    }
+                    Err(error) => this.client.notice = status_text(&error),
+                },
+            );
+            return;
+        }
+        if self.client.overview.is_none() || self.client.write_guard {
+            self.client.notice = "请先同步保险库。".into();
+            cx.notify();
+            return;
+        }
+        self.close_detail();
+        self.close_form(cx);
+        self.client.pin_require_mp_on_restart = false;
+        self.client.form = Some(Form::PinEnrollment);
+        self.client.password.read(cx).focus(window);
+        cx.notify();
+    }
+
+    fn enroll_pin(&mut self, cx: &mut Context<Self>) {
+        let Some(account) = self
+            .client
+            .active()
+            .filter(|account| account.session() == Session::Unlocked && !account.pin_enabled)
+        else {
+            return;
+        };
+        let id = account.id.clone();
+        let pin = Zeroizing::new(self.client.pin.read(cx).value().trim().to_owned());
+        if pin.chars().count() < 4 {
+            self.ui.trigger_auth_shake(self.animate);
+            self.client.notice = "PIN 码至少需要 4 个字符。".into();
+            cx.notify();
+            return;
+        }
+        let password = self.client.password.update(cx, |input, cx| input.take(cx));
+        if password.is_empty() {
+            self.ui.trigger_auth_shake(self.animate);
+            self.client.notice = "请输入主密码以确认身份。".into();
+            cx.notify();
+            return;
+        }
+        self.client.pin.update(cx, |input, cx| input.set("", cx));
+        let require_mp_on_restart = self.client.pin_require_mp_on_restart;
+        let request = Request::begin();
+        let generation = self.client.form_generation;
+        self.client.freeze_auth_inputs(true, cx);
+        self.run(
+            "正在加密保存 PIN 码",
+            Some(request),
+            cx,
+            move || {
+                let result = request.enable_pin(&id, &password, &pin, require_mp_on_restart);
+                (result, desktop::accounts())
+            },
+            move |this, (result, accounts), cx| {
+                this.client.freeze_auth_inputs(false, cx);
+                if let Ok(accounts) = accounts {
+                    this.client.accounts = accounts;
+                }
+                if this.client.form_generation != generation {
+                    return;
+                }
+                match result {
+                    Ok(()) => {
+                        this.close_form(cx);
+                        this.client.notice = "已启用本机 PIN 码快速解锁。".into();
+                        this.broadcast_browser_state();
+                        this.ui.toast.show(
+                            crate::ui::toast::ToastKind::Success,
+                            "已启用 PIN 码快速解锁",
+                            std::time::Instant::now(),
+                            this.animate,
+                        );
+                    }
+                    Err(error) => {
+                        this.ui.trigger_auth_shake(this.animate);
+                        this.client.notice = status_text(&error);
+                    }
+                }
+            },
+        );
+    }
+
     fn request_hello_unlock(&mut self, window: &Window, cx: &mut Context<Self>) {
         if !self.client.ready() {
             return;
@@ -1130,17 +1296,28 @@ impl VaultPreview {
         self.run(
             if matches!(&method, LocalUnlock::Hello { .. }) {
                 "请完成 Windows Hello 验证"
+            } else if matches!(&method, LocalUnlock::Pin { .. }) {
+                "正在验证 PIN 码"
             } else {
                 "正在离线解锁"
             },
             Some(req),
             cx,
             move || {
-                match method {
+                let res = match method {
                     LocalUnlock::Password(password) => req.unlock(&password),
+                    LocalUnlock::Pin { account, pin } => req.unlock_pin(&account, &pin),
                     LocalUnlock::Hello { account, window } => req.unlock_hello(&account, window),
+                };
+                match res {
+                    Ok(()) => snapshot().map_err(|e| (e, None)),
+                    Err(err) => {
+                        let refreshed = (err.code() == "pinRevoked")
+                            .then(|| desktop::accounts().ok())
+                            .flatten();
+                        Err((err, refreshed))
+                    }
                 }
-                .and_then(|()| snapshot())
             },
             move |this, result, cx| {
                 this.client.freeze_auth_inputs(false, cx);
@@ -1151,7 +1328,7 @@ impl VaultPreview {
                     // the unlock form. If the core already committed, `run` will
                     // execute the queued compensating lock immediately afterward.
                     this.lock_queued = true;
-                    if let Err(error) = result {
+                    if let Err((error, _)) = result {
                         this.client.notice = status_text(&error);
                     }
                     return;
@@ -1163,7 +1340,12 @@ impl VaultPreview {
                         this.ui.trigger_page_motion(this.animate);
                         this.session_notice();
                     }
-                    Err(e) => {
+                    Err((e, refreshed_accounts)) => {
+                        if let Some(accounts) = refreshed_accounts {
+                            this.client.accounts = accounts;
+                            this.client.unlock_with_pin = false;
+                            this.broadcast_browser_state();
+                        }
                         this.ui.trigger_auth_shake(this.animate);
                         this.client.notice = status_text(&e);
                     }
@@ -1392,10 +1574,19 @@ impl VaultPreview {
         {
             self.reauthenticate(window, cx);
         } else {
+            let prefer_pin = self
+                .client
+                .local_unlock_account()
+                .is_some_and(|a| a.pin_enabled);
             self.close_form(cx);
             self.client.show_accounts = false;
+            self.client.unlock_with_pin = prefer_pin;
             self.client.form = Some(Form::Unlock);
-            self.client.password.read(cx).focus(window);
+            if prefer_pin {
+                self.client.pin.read(cx).focus(window);
+            } else {
+                self.client.password.read(cx).focus(window);
+            }
         }
         if self.settings.auto_prompt_hello {
             self.request_hello_unlock(window, cx);
@@ -1428,6 +1619,13 @@ impl VaultPreview {
                 subtitle: "先确认主密码，再完成 Windows Hello 验证。".into(),
                 danger: false,
                 action_label: "继续",
+            },
+            Form::PinEnrollment => crate::ui::state::ModalClosingSnapshot {
+                title: "设置 PIN 码快速解锁".into(),
+                subtitle: "使用 Argon2 与受保护密钥信封加密本地密钥，输错 5 次自动回退主密码。"
+                    .into(),
+                danger: false,
+                action_label: "启用 PIN",
             },
             Form::SignIn | Form::Unlock => unreachable!(),
         })
@@ -1472,15 +1670,27 @@ impl VaultPreview {
             Form::SignIn => "登录 Bytewarden",
             Form::Unlock => "解锁保险库",
             Form::HelloEnrollment => "启用 Windows Hello 解锁",
+            Form::PinEnrollment => "设置 PIN 码快速解锁",
             Form::Detail | Form::EditorPassword | Form::Reverify(_) => "验证主密码",
             Form::Confirm(_) => "永久删除此条目？",
         };
+        let offer_pin = self
+            .client
+            .local_unlock_account()
+            .is_some_and(|account| account.pin_enabled);
+        let using_pin_unlock = form == Form::Unlock && offer_pin && self.client.unlock_with_pin;
         let subtitle = match form {
             Form::SignIn if allow_local => "使用主密码连接服务器并同步，或仅离线解锁本机快照。",
             Form::SignIn if reconnect.is_some() => "登录后同步此账户的最新数据。",
             Form::SignIn => "连接到 Bitwarden 官方云或自托管服务器",
+            Form::Unlock if using_pin_unlock => {
+                "输入本地短 PIN 码快速解密保险库（连续输错 5 次自动回退主密码）"
+            }
             Form::Unlock => "输入主密码以离线解密本机快照",
             Form::HelloEnrollment => "先确认主密码，再完成 Windows Hello 验证。",
+            Form::PinEnrollment => {
+                "验证主密码并设置至少 4 位本地 PIN 码（连续输错 5 次自动回退主密码）。"
+            }
             Form::Detail | Form::EditorPassword | Form::Reverify(_) => {
                 "此条目受主密码复验保护，请输入主密码继续。"
             }
@@ -1845,10 +2055,53 @@ impl VaultPreview {
                 );
             }
         }
-        if matches!(
+        if form == Form::Unlock && offer_pin {
+            panel = panel.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(
+                        pill_chip("unlock-mode-pin", "PIN 码解锁", None, using_pin_unlock)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                if this.client.ready() {
+                                    this.client.unlock_with_pin = true;
+                                    this.client.pin.read(cx).focus(window);
+                                    cx.notify();
+                                }
+                            })),
+                    )
+                    .child(
+                        pill_chip("unlock-mode-mp", "主密码解锁", None, !using_pin_unlock)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                if this.client.ready() {
+                                    this.client.unlock_with_pin = false;
+                                    this.client.password.read(cx).focus(window);
+                                    cx.notify();
+                                }
+                            })),
+                    ),
+            );
+        }
+        if using_pin_unlock {
+            panel = panel.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(
+                        div()
+                            .text_size(px(font::CAPTION))
+                            .text_color(hex(pal.text_secondary))
+                            .child("PIN 码"),
+                    )
+                    .child(self.client.pin.clone()),
+            );
+        } else if matches!(
             form,
             Form::Unlock
                 | Form::HelloEnrollment
+                | Form::PinEnrollment
                 | Form::Detail
                 | Form::EditorPassword
                 | Form::Reverify(_)
@@ -1867,6 +2120,60 @@ impl VaultPreview {
                     )
                     .child(self.client.password.clone()),
             );
+        }
+        if form == Form::PinEnrollment {
+            let require_mp_p = self.ui.toggle_progress(
+                &gpui::ElementId::Name("pin-require-mp".into()),
+                self.client.pin_require_mp_on_restart,
+                now,
+                self.animate,
+            );
+            panel = panel
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.))
+                        .child(
+                            div()
+                                .text_size(px(font::CAPTION))
+                                .text_color(hex(pal.text_secondary))
+                                .child("设置 PIN 码（至少 4 位数字或字母）"),
+                        )
+                        .child(self.client.pin.clone()),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .py(px(2.))
+                        .child(
+                            div()
+                                .text_size(px(font::CAPTION))
+                                .text_color(hex(pal.text_secondary))
+                                .child("每次重启应用后首次仍需输入主密码"),
+                        )
+                        .child(
+                            toggle_switch_animated(
+                                "pin-require-mp",
+                                self.client.pin_require_mp_on_restart,
+                                require_mp_p,
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if this.client.ready() {
+                                    this.client.pin_require_mp_on_restart =
+                                        !this.client.pin_require_mp_on_restart;
+                                    this.ui.animate_toggle(
+                                        "pin-require-mp",
+                                        this.client.pin_require_mp_on_restart,
+                                        this.animate,
+                                    );
+                                    cx.notify();
+                                }
+                            })),
+                        ),
+                );
         }
         let submit_variant = if matches!(form, Form::Confirm(_)) {
             BtnVariant::Danger
@@ -1913,6 +2220,7 @@ impl VaultPreview {
                                 Form::SignIn => "登录并同步",
                                 Form::Unlock => "解锁",
                                 Form::HelloEnrollment => "继续",
+                                Form::PinEnrollment => "启用 PIN",
                                 Form::Detail | Form::EditorPassword | Form::Reverify(_) => "验证",
                                 Form::Confirm(_) => "确认永久删除",
                             })
@@ -1920,7 +2228,9 @@ impl VaultPreview {
                     )
                 })
                 .when(
-                    ready || is_full_auth || form == Form::HelloEnrollment,
+                    ready
+                        || is_full_auth
+                        || matches!(form, Form::HelloEnrollment | Form::PinEnrollment),
                     |bar| {
                         bar.child(
                             btn("cancel-form", BtnVariant::Secondary)

@@ -204,6 +204,7 @@ struct SecretPayload {
     password: Zeroizing<String>,
     totp: Option<Zeroizing<String>>,
     totp_remaining: Option<i64>,
+    profile_fields: Option<serde_json::Map<String, Value>>,
 }
 
 pub struct PendingBrowserApproval {
@@ -465,6 +466,7 @@ impl VaultPreview {
         let active = self.client.active();
         let email = active.map(|a| a.email.clone());
         let hello_enabled = active.is_some_and(|a| a.hello_enabled);
+        let pin_enabled = active.is_some_and(|a| a.pin_enabled);
         let item_count = self.client.overview.as_ref().map_or(0, |ov| {
             ov.items
                 .iter()
@@ -477,6 +479,7 @@ impl VaultPreview {
             "session": session,
             "accountEmail": email,
             "helloEnabled": hello_enabled,
+            "pinEnabled": pin_enabled,
             "biometricGate": self.settings.browser_biometric_gate,
             "itemCount": item_count,
         })
@@ -827,6 +830,112 @@ impl VaultPreview {
             "create_login" => {
                 Self::handle_create_login(weak, app, id, &req.payload, responder).await;
             }
+            "unlock_pin" => {
+                Self::handle_unlock_pin(weak, app, id, &req.payload, responder).await;
+            }
+            "check_save_candidate" => {
+                let url = req
+                    .payload
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let username = req
+                    .payload
+                    .get("username")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned();
+                let reply = weak
+                    .update(app, |this, _| {
+                        if !this.settings.browser_integration
+                            || this.client.state() != Session::Unlocked
+                        {
+                            return Self::serialize_ok(id, json!({ "shouldPrompt": false }));
+                        }
+                        let Some(overview) = &this.client.overview else {
+                            return Self::serialize_ok(id, json!({ "shouldPrompt": false }));
+                        };
+                        if overview.read_only {
+                            return Self::serialize_ok(id, json!({ "shouldPrompt": false }));
+                        }
+                        let Some(tab_host) = extract_url_host(&url) else {
+                            return Self::serialize_ok(id, json!({ "shouldPrompt": false }));
+                        };
+                        let already_saved = overview.items.iter().any(|item| {
+                            !item.deleted
+                                && !item.restricted
+                                && item.item_type == 1
+                                && item
+                                    .website_host
+                                    .as_deref()
+                                    .is_some_and(|ih| domain_match_score(&tab_host, ih, false) > 0)
+                                && (username.is_empty()
+                                    || item.subtitle.trim().eq_ignore_ascii_case(&username))
+                        });
+                        Self::serialize_ok(
+                            id,
+                            json!({
+                                "shouldPrompt": !already_saved,
+                                "suggestedName": tab_host,
+                            }),
+                        )
+                    })
+                    .unwrap_or_else(|_| Self::serialize_err(id, "closed", "桌面端已关闭"));
+                let _ = responder.send(reply);
+            }
+            "query_autofill_profiles" => {
+                let reply = weak
+                    .update(app, |this, _| {
+                        if !this.settings.browser_integration {
+                            return Self::serialize_err(id, "disabled", "浏览器联动已关闭");
+                        }
+                        if this.client.state() != Session::Unlocked {
+                            return Self::serialize_err(id, "locked", "保险库已锁定");
+                        }
+                        let Some(overview) = &this.client.overview else {
+                            return Self::serialize_ok(
+                                id,
+                                json!({ "cards": [], "identities": [] }),
+                            );
+                        };
+                        let mut cards = Vec::new();
+                        let mut identities = Vec::new();
+                        for item in &overview.items {
+                            if item.deleted || item.restricted {
+                                continue;
+                            }
+                            if item.item_type == 3 {
+                                cards.push(json!({
+                                    "id": item.id,
+                                    "name": item.name,
+                                    "subtitle": item.subtitle,
+                                    "reprompt": item.reprompt,
+                                }));
+                            } else if item.item_type == 4 {
+                                identities.push(json!({
+                                    "id": item.id,
+                                    "name": item.name,
+                                    "subtitle": item.subtitle,
+                                    "reprompt": item.reprompt,
+                                }));
+                            }
+                        }
+                        Self::serialize_ok(
+                            id,
+                            json!({
+                                "cards": cards,
+                                "identities": identities,
+                            }),
+                        )
+                    })
+                    .unwrap_or_else(|_| Self::serialize_err(id, "closed", "桌面端已关闭"));
+                let _ = responder.send(reply);
+            }
+            "get_autofill_profile" => {
+                Self::handle_get_autofill_profile(weak, app, id, &req.payload, responder).await;
+            }
             _ => {
                 let _ = responder.send(Self::serialize_err(
                     id,
@@ -982,6 +1091,7 @@ impl VaultPreview {
                         password: Zeroizing::default(),
                         totp: None,
                         totp_remaining: None,
+                        profile_fields: None,
                     })
                 } else {
                     let id_clone = item.id.clone();
@@ -1378,12 +1488,43 @@ fn decrypt_secret_payload(item_id: &str, master_password: &str) -> Result<Secret
         .map_err(|e| crate::client::status_text(&e))?;
     let mut username = Zeroizing::new(String::new());
     let mut password = Zeroizing::new(String::new());
+    let mut profile_map = serde_json::Map::new();
     for field in &mut detail.fields {
-        if field.label == "用户名" && username.is_empty() {
-            *username = std::mem::take(&mut field.value);
-        } else if field.label == "密码" && password.is_empty() {
-            *password = std::mem::take(&mut field.value);
+        if detail.item_type == 1 {
+            if field.label == "用户名" && username.is_empty() {
+                *username = std::mem::take(&mut field.value);
+            } else if field.label == "密码" && password.is_empty() {
+                *password = std::mem::take(&mut field.value);
+            } else {
+                field.value.zeroize();
+            }
         } else {
+            let key = match (detail.item_type, field.label.as_str()) {
+                (3, "持卡人") => Some("cardholderName"),
+                (3, "卡组织") => Some("brand"),
+                (3, "卡号") => Some("number"),
+                (3, "到期月份") => Some("expMonth"),
+                (3, "到期年份") => Some("expYear"),
+                (3, "安全码") => Some("code"),
+                (4, "称谓") => Some("title"),
+                (4, "名") => Some("firstName"),
+                (4, "中间名") => Some("middleName"),
+                (4, "姓") => Some("lastName"),
+                (4, "用户名") => Some("username"),
+                (4, "公司") => Some("company"),
+                (4, "邮箱") => Some("email"),
+                (4, "电话") => Some("phone"),
+                (4, "地址 1") => Some("address1"),
+                (4, "地址 2") => Some("address2"),
+                (4, "城市") => Some("city"),
+                (4, "省 / 州") => Some("state"),
+                (4, "邮编") => Some("postalCode"),
+                (4, "国家") => Some("country"),
+                _ => None,
+            };
+            if let Some(k) = key {
+                profile_map.insert(k.into(), Value::String(field.value.clone()));
+            }
             field.value.zeroize();
         }
     }
@@ -1395,13 +1536,276 @@ fn decrypt_secret_payload(item_id: &str, master_password: &str) -> Result<Secret
         ),
         _ => (None, None),
     };
+    let item_type = detail.item_type;
     detail.revoke();
     Ok(SecretPayload {
         username,
         password,
         totp,
         totp_remaining,
+        profile_fields: (item_type != 1).then_some(profile_map),
     })
+}
+
+impl VaultPreview {
+    async fn handle_unlock_pin(
+        weak: &gpui::WeakEntity<Self>,
+        app: &mut gpui::AsyncWindowContext,
+        req_id: u64,
+        payload: &Value,
+        responder: oneshot::Sender<Vec<u8>>,
+    ) {
+        let pin = Zeroizing::new(
+            payload
+                .get("pin")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_owned(),
+        );
+        if pin.is_empty() {
+            let _ = responder.send(Self::serialize_err(req_id, "wrongPin", "请输入 PIN 码"));
+            return;
+        }
+        let prep = weak
+            .update(app, |this, cx| {
+                if this.client.state() == Session::Unlocked {
+                    return Ok(None);
+                }
+                let Some(acc) = this
+                    .client
+                    .active()
+                    .filter(|a| a.session() == Session::Locked && a.pin_enabled)
+                else {
+                    return Err(("pinNotEnabled", "当前账户未开启 PIN 码解锁"));
+                };
+                Ok(Some((acc.id.clone(), cx.background_executor().clone())))
+            })
+            .unwrap_or(Err(("closed", "桌面端已关闭")));
+
+        match prep {
+            Ok(None) => {
+                let status = weak
+                    .update(app, |this, _| this.current_browser_status_json())
+                    .unwrap_or(Value::Null);
+                let _ = responder.send(Self::serialize_ok(req_id, status));
+            }
+            Ok(Some((account_id, bg))) => {
+                let token = Request::begin();
+                let unlocked = bg
+                    .spawn(async move {
+                        match token.unlock_pin(&account_id, &pin) {
+                            Ok(()) => {
+                                let accounts = desktop::accounts().map_err(|e| (e, None))?;
+                                let overview = desktop::overview().ok();
+                                Ok((accounts, overview))
+                            }
+                            Err(err) => {
+                                let refreshed = (err.code() == "pinRevoked")
+                                    .then(|| desktop::accounts().ok())
+                                    .flatten();
+                                Err((err, refreshed))
+                            }
+                        }
+                    })
+                    .await;
+                let reply = weak
+                    .update(app, |this, cx| match unlocked {
+                        Ok((accounts, overview)) => {
+                            this.close_form(cx);
+                            this.client.accounts = accounts;
+                            if let Some(ov) = overview {
+                                this.client.set_overview(ov);
+                            }
+                            this.invalidate_query();
+                            this.session_notice();
+                            this.broadcast_browser_state();
+                            cx.notify();
+                            Self::serialize_ok(req_id, this.current_browser_status_json())
+                        }
+                        Err((err, refreshed)) => {
+                            if let Some(accounts) = refreshed {
+                                this.client.accounts = accounts;
+                                this.client.unlock_with_pin = false;
+                                this.broadcast_browser_state();
+                                cx.notify();
+                            }
+                            let msg = crate::client::status_text(&err);
+                            Self::serialize_err(req_id, err.code(), &msg)
+                        }
+                    })
+                    .unwrap_or_else(|_| Self::serialize_err(req_id, "closed", "桌面端已关闭"));
+                let _ = responder.send(reply);
+            }
+            Err((code, msg)) => {
+                let _ = responder.send(Self::serialize_err(req_id, code, msg));
+            }
+        }
+    }
+
+    async fn handle_get_autofill_profile(
+        weak: &gpui::WeakEntity<Self>,
+        app: &mut gpui::AsyncWindowContext,
+        req_id: u64,
+        payload: &Value,
+        responder: oneshot::Sender<Vec<u8>>,
+    ) {
+        let item_id = payload
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let tab_url = payload
+            .get("tabUrl")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        if item_id.is_empty() {
+            let _ = responder.send(Self::serialize_err(req_id, "validation", "缺少条目 ID"));
+            return;
+        }
+
+        enum ProfilePlan {
+            Direct(gpui::BackgroundExecutor),
+            Hello {
+                account_id: String,
+                hwnd: usize,
+                bg: gpui::BackgroundExecutor,
+            },
+            Modal(oneshot::Receiver<Result<SecretPayload, String>>),
+        }
+
+        let plan = weak
+            .update_in(app, |this, window, cx| {
+                if !this.settings.browser_integration {
+                    return Err(("disabled", "浏览器联动已关闭"));
+                }
+                if this.client.state() != Session::Unlocked {
+                    return Err(("locked", "保险库已锁定"));
+                }
+                let Some(overview) = &this.client.overview else {
+                    return Err(("notSynced", "保险库尚未加载"));
+                };
+                let Some(item) = overview
+                    .items
+                    .iter()
+                    .find(|i| {
+                        i.id == item_id
+                            && !i.deleted
+                            && !i.restricted
+                            && matches!(i.item_type, 3 | 4)
+                    })
+                    .cloned()
+                else {
+                    return Err(("notFound", "找不到对应的填表条目"));
+                };
+
+                let needs_reprompt = item.reprompt;
+                let needs_gate = this.settings.browser_biometric_gate || needs_reprompt;
+                if !needs_gate {
+                    return Ok((item, ProfilePlan::Direct(cx.background_executor().clone())));
+                }
+                if !needs_reprompt
+                    && let Some(acc) = this.client.active().filter(|a| a.hello_enabled)
+                    && let Some(hwnd) = crate::tray::window_hwnd_usize(window)
+                {
+                    crate::tray::restore_window_to_front(window);
+                    return Ok((
+                        item,
+                        ProfilePlan::Hello {
+                            account_id: acc.id.clone(),
+                            hwnd,
+                            bg: cx.background_executor().clone(),
+                        },
+                    ));
+                }
+
+                crate::tray::restore_window_to_front(window);
+                window.activate_window();
+                let (tx, rx) = oneshot::channel();
+                let password_input = cx.new(|cx| Input::new("输入主密码以授权填表", true, cx));
+                if needs_reprompt {
+                    password_input.read(cx).focus(window);
+                }
+                let origin_host = extract_url_host(&tab_url).unwrap_or_else(|| "当前网页".into());
+                this.browser_bridge.pending_approval = Some(PendingBrowserApproval {
+                    item_id: item.id.clone(),
+                    item_name: item.name.clone(),
+                    username: item.subtitle.clone(),
+                    origin_host,
+                    action_label: if item.item_type == 3 {
+                        "填充银行卡信息"
+                    } else {
+                        "填充身份信息"
+                    },
+                    needs_password: needs_reprompt,
+                    password_input,
+                    error: None,
+                    busy: false,
+                    reply: Some(tx),
+                });
+                cx.notify();
+                Ok((item, ProfilePlan::Modal(rx)))
+            })
+            .unwrap_or(Err(("closed", "桌面端已关闭")));
+
+        let (item, plan) = match plan {
+            Ok(v) => v,
+            Err((code, msg)) => {
+                let _ = responder.send(Self::serialize_err(req_id, code, msg));
+                return;
+            }
+        };
+
+        let res = match plan {
+            ProfilePlan::Direct(bg) => {
+                let id_clone = item.id.clone();
+                bg.spawn(async move { decrypt_secret_payload(&id_clone, "") })
+                    .await
+            }
+            ProfilePlan::Hello {
+                account_id,
+                hwnd,
+                bg,
+            } => {
+                let id_clone = item.id.clone();
+                bg.spawn(async move {
+                    Request::begin()
+                        .verify_hello(&account_id, hwnd)
+                        .map_err(|e| crate::client::status_text(&e))?;
+                    decrypt_secret_payload(&id_clone, "")
+                })
+                .await
+            }
+            ProfilePlan::Modal(rx) => match rx.await {
+                Ok(r) => r,
+                Err(_) => Err("已取消授权".into()),
+            },
+        };
+
+        match res {
+            Ok(secret) => {
+                let kind = if item.item_type == 3 {
+                    "card"
+                } else {
+                    "identity"
+                };
+                let fields = Value::Object(secret.profile_fields.unwrap_or_default());
+                let out = Self::serialize_ok(
+                    req_id,
+                    json!({
+                        "id": item.id,
+                        "kind": kind,
+                        "fields": fields,
+                    }),
+                );
+                let _ = responder.send(out);
+            }
+            Err(msg) => {
+                let _ = responder.send(Self::serialize_err(req_id, "denied", &msg));
+            }
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -1609,10 +2013,12 @@ mod win_pipe {
             let stop_event_bg = stop_event.clone();
             let clients_bg = clients.clone();
             let count_bg = client_count.clone();
+            let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<()>(1);
 
             std::thread::Builder::new()
                 .name("bw-browser-bridge".into())
                 .spawn(move || {
+                    let mut ready_signal = Some(ready_tx);
                     let mut own_session = 0u32;
                     unsafe {
                         let _ = ProcessIdToSessionId(GetCurrentProcessId(), &mut own_session);
@@ -1634,8 +2040,14 @@ mod win_pipe {
                             )
                         };
                         if pipe_raw.is_null() || pipe_raw == INVALID_HANDLE_VALUE {
+                            if let Some(tx) = ready_signal.take() {
+                                let _ = tx.send(());
+                            }
                             std::thread::sleep(Duration::from_millis(200));
                             continue;
+                        }
+                        if let Some(tx) = ready_signal.take() {
+                            let _ = tx.send(());
                         }
                         let pipe = Arc::new(OwnedHandle(pipe_raw));
                         let connect_ev = OwnedHandle(unsafe { CreateEventW(null(), 1, 0, null()) });
@@ -1751,6 +2163,7 @@ mod win_pipe {
                 })
                 .map_err(|e| e.to_string())?;
 
+            let _ = ready_rx.recv_timeout(Duration::from_secs(2));
             Ok(Self {
                 stop_flag,
                 stop_event,

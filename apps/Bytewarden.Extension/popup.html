@@ -39,16 +39,23 @@
       <div class="state-icon">🔒</div>
       <h2 id="locked-title">保险库已锁定</h2>
       <p id="locked-desc">解锁桌面端后即可在 Firefox 一键自动填充与搜索。</p>
+
+      <div id="pin-unlock-box" class="pin-box hidden">
+        <input id="pin-unlock-input" type="password" placeholder="输入本地 PIN 码快速解锁…" autocomplete="off" />
+        <button id="btn-pin-unlock" class="primary-btn" type="button">PIN 解锁</button>
+      </div>
+
       <div class="btn-stack">
         <button id="btn-hello-unlock" class="primary-btn hidden">Windows Hello 解锁</button>
-        <button id="btn-open-desktop-unlock" class="secondary-btn">在桌面端解锁</button>
+        <button id="btn-open-desktop-unlock" class="secondary-btn">在桌面端输入主密码</button>
       </div>
     </section>
 
     <!-- Unlocked Workspace -->
     <main id="view-unlocked" class="workspace hidden">
-      <nav class="segmented">
-        <button class="seg-btn active" data-tab="vault">密码库</button>
+      <nav class="segmented seg-4">
+        <button class="seg-btn active" data-tab="vault">登录</button>
+        <button class="seg-btn" data-tab="profiles">卡与身份</button>
         <button class="seg-btn" data-tab="generator">生成器</button>
         <button class="seg-btn" data-tab="create">+ 新增</button>
       </nav>
@@ -76,7 +83,22 @@
         </div>
       </section>
 
-      <!-- Tab 2: Native Rust Password Generator -->
+      <!-- Tab 2: Cards & Identities Autofill -->
+      <section id="tab-profiles" class="tab-pane hidden">
+        <div class="list-scroll">
+          <div id="section-cards" class="group hidden">
+            <div class="group-label">银行卡</div>
+            <div id="list-cards" class="item-list"></div>
+          </div>
+          <div id="section-identities" class="group hidden">
+            <div class="group-label">身份与地址信息</div>
+            <div id="list-identities" class="item-list"></div>
+          </div>
+          <div id="profiles-empty" class="empty-hint hidden">保险库中暂无银行卡或身份信息条目</div>
+        </div>
+      </section>
+
+      <!-- Tab 3: Native Rust Password Generator -->
       <section id="tab-generator" class="tab-pane hidden">
         <div class="gen-box">
           <div id="gen-output" class="gen-output">点击刷新生成</div>
@@ -113,7 +135,7 @@
         </div>
       </section>
 
-      <!-- Tab 3: Save New Login to Desktop -->
+      <!-- Tab 4: Save New Login to Desktop -->
       <section id="tab-create" class="tab-pane hidden">
         <div class="form-card">
           <div class="field">

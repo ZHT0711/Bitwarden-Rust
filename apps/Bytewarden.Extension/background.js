@@ -9,15 +9,34 @@ let reconnectTimer = null;
 let nextRequestId = 1;
 const pendingRequests = new Map();
 
+// Ephemeral 45-second pending login capture per tab (auto-purged on timer or vault lock).
+const pendingSaveByTab = new Map();
+
 let bridgeState = {
   desktopRunning: false,
   enabled: true,
   session: "offline", // "offline" | "signedOut" | "locked" | "unlocked"
   accountEmail: null,
   helloEnabled: false,
+  pinEnabled: false,
   biometricGate: false,
   itemCount: 0,
 };
+
+function clearPendingSaveForTab(tabId) {
+  const entry = pendingSaveByTab.get(tabId);
+  if (entry) {
+    clearTimeout(entry.timer);
+    entry.password = "";
+    pendingSaveByTab.delete(tabId);
+  }
+}
+
+function clearAllPendingSaves() {
+  for (const [tabId] of pendingSaveByTab) {
+    clearPendingSaveForTab(tabId);
+  }
+}
 
 function ensurePort() {
   if (nativePort) return nativePort;
@@ -56,6 +75,7 @@ function ensurePort() {
         session: "offline",
         accountEmail: null,
         helloEnabled: false,
+        pinEnabled: false,
         biometricGate: false,
         itemCount: 0,
       });
@@ -118,6 +138,7 @@ function applyBridgeState(next) {
     .catch(() => {});
 
   if (prevSession === "unlocked" && bridgeState.session !== "unlocked") {
+    clearAllPendingSaves();
     broadcastToTabs({ type: "bw:vault_locked" });
   }
 }
@@ -197,24 +218,50 @@ async function fillCredentialsInTab(tabId, frameId, itemId, tabUrl) {
   return { ok: true, data: { totpCopied: Boolean(totp) } };
 }
 
+async function fillProfileInTab(tabId, frameId, itemId, tabUrl) {
+  const res = await sendNative("get_autofill_profile", {
+    id: itemId,
+    tabUrl: tabUrl || "",
+  });
+  if (!res || !res.ok || !res.data) {
+    return res || { ok: false, message: "获取填表信息失败" };
+  }
+  const opts = typeof frameId === "number" ? { frameId } : {};
+  await browser.tabs
+    .sendMessage(
+      tabId,
+      {
+        type: "bw:perform_profile_fill",
+        kind: res.data.kind,
+        fields: res.data.fields || {},
+      },
+      opts
+    )
+    .catch(() => {});
+  return { ok: true };
+}
+
 function setupContextMenus() {
-  browser.contextMenus.removeAll().then(() => {
-    browser.contextMenus.create({
-      id: "bw-fill-best",
-      title: "使用 Bytewarden 自动填充登录信息",
-      contexts: ["editable", "page"],
-    });
-    browser.contextMenus.create({
-      id: "bw-generate-fill",
-      title: "生成强密码并填充到当前输入框",
-      contexts: ["editable"],
-    });
-    browser.contextMenus.create({
-      id: "bw-lock-now",
-      title: "立即锁定 Bytewarden 保险库",
-      contexts: ["action", "page"],
-    });
-  }).catch(() => {});
+  browser.contextMenus
+    .removeAll()
+    .then(() => {
+      browser.contextMenus.create({
+        id: "bw-fill-best",
+        title: "使用 Bytewarden 自动填充登录信息",
+        contexts: ["editable", "page"],
+      });
+      browser.contextMenus.create({
+        id: "bw-generate-fill",
+        title: "生成强密码并填充到当前输入框",
+        contexts: ["editable"],
+      });
+      browser.contextMenus.create({
+        id: "bw-lock-now",
+        title: "立即锁定 Bytewarden 保险库",
+        contexts: ["action", "page"],
+      });
+    })
+    .catch(() => {});
 }
 
 browser.contextMenus.onClicked.addListener(async (info, tab) => {
@@ -274,9 +321,25 @@ browser.tabs.onActivated.addListener(() => {
   updateBadgeForActiveTab();
 });
 
-browser.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
-  if (changeInfo.status === "complete" && tab && tab.active) {
-    updateBadgeForActiveTab();
+browser.tabs.onRemoved.addListener((tabId) => {
+  clearPendingSaveForTab(tabId);
+});
+
+browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo.status === "complete") {
+    if (tab && tab.active) {
+      updateBadgeForActiveTab();
+    }
+    const candidate = pendingSaveByTab.get(tabId);
+    if (candidate && bridgeState.session === "unlocked") {
+      browser.tabs
+        .sendMessage(tabId, {
+          type: "bw:show_save_banner",
+          username: candidate.username,
+          host: candidate.suggestedName,
+        })
+        .catch(() => {});
+    }
   }
 });
 
@@ -307,6 +370,82 @@ browser.runtime.onMessage.addListener((msg, sender) => {
         return Promise.resolve({ ok: false, message: "找不到活动标签页" });
       }
       return fillCredentialsInTab(targetTabId, targetFrameId, msg.itemId, msg.tabUrl || "");
+    }
+
+    case "bw:fill_profile": {
+      const targetTabId = msg.tabId != null ? msg.tabId : sender.tab && sender.tab.id;
+      const targetFrameId = msg.frameId != null ? msg.frameId : sender.frameId;
+      if (targetTabId == null) {
+        return Promise.resolve({ ok: false, message: "找不到活动标签页" });
+      }
+      return fillProfileInTab(targetTabId, targetFrameId, msg.itemId, msg.tabUrl || "");
+    }
+
+    case "bw:form_submitted": {
+      const tabId = sender.tab && sender.tab.id;
+      if (
+        tabId == null ||
+        bridgeState.session !== "unlocked" ||
+        !msg.password ||
+        !msg.url ||
+        !msg.url.startsWith("http")
+      ) {
+        return Promise.resolve({ ok: false });
+      }
+      return sendNative(
+        "check_save_candidate",
+        { url: msg.url, username: msg.username || "" },
+        2500
+      ).then((check) => {
+        if (!check || !check.ok || !check.data || !check.data.shouldPrompt) {
+          return { ok: false };
+        }
+        clearPendingSaveForTab(tabId);
+        const timer = setTimeout(() => clearPendingSaveForTab(tabId), 45000);
+        const suggestedName = check.data.suggestedName || msg.title || "新建网站";
+        pendingSaveByTab.set(tabId, {
+          url: msg.url,
+          name: suggestedName,
+          suggestedName,
+          username: msg.username || "",
+          password: msg.password,
+          timer,
+        });
+        // Also trigger banner immediately in case SPA login does not reload the document!
+        setTimeout(() => {
+          if (pendingSaveByTab.has(tabId)) {
+            browser.tabs
+              .sendMessage(tabId, {
+                type: "bw:show_save_banner",
+                username: msg.username || "",
+                host: suggestedName,
+              })
+              .catch(() => {});
+          }
+        }, 700);
+        return { ok: true };
+      });
+    }
+
+    case "bw:confirm_save_banner": {
+      const tabId = sender.tab && sender.tab.id;
+      if (tabId == null) return Promise.resolve({ ok: false });
+      const entry = pendingSaveByTab.get(tabId);
+      if (!entry) return Promise.resolve({ ok: false, message: "待保存信息已过期" });
+      const payload = {
+        name: entry.name,
+        username: entry.username,
+        password: entry.password,
+        uri: entry.url,
+      };
+      clearPendingSaveForTab(tabId);
+      return sendNative("create_login", payload, 10000);
+    }
+
+    case "bw:dismiss_save_banner": {
+      const tabId = sender.tab && sender.tab.id;
+      if (tabId != null) clearPendingSaveForTab(tabId);
+      return Promise.resolve({ ok: true });
     }
 
     case "bw:inline_query": {

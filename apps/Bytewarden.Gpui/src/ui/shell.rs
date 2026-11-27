@@ -145,6 +145,7 @@ impl VaultPreview {
             Page::Sends => "sends".into(),
             Page::Folders => "folders-page".into(),
             Page::Generator => "generator".into(),
+            Page::Health => "health".into(),
             Page::Backup => "data".into(),
             Page::Settings => {
                 if self.ui.settings_tab == SettingsTab::Data {
@@ -183,6 +184,7 @@ impl VaultPreview {
             && self.filter == Filter::Favorites;
         let is_sends = self.page == Page::Sends;
         let is_generator = self.page == Page::Generator;
+        let is_health = self.page == Page::Health;
         let is_archived = self.page == Page::Vault
             && self.client.selected_folder.is_none()
             && self.filter == Filter::Archived;
@@ -406,6 +408,24 @@ impl VaultPreview {
                                         .on_click(
                                             cx.listener(|this, _, _, cx| {
                                                 this.open_page(Page::Generator, cx);
+                                            }),
+                                        ),
+                                    )
+                                    .child(
+                                        sidebar_item(
+                                            "nav-health",
+                                            is_health,
+                                            "安全体检",
+                                            glyph::SHIELD,
+                                            alpha,
+                                            None,
+                                        )
+                                        .when(is_health, |el| {
+                                            el.child(nav_pill_anchor(anchor_slot.clone(), true))
+                                        })
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| {
+                                                this.open_page(Page::Health, cx);
                                             }),
                                         ),
                                     )
