@@ -404,7 +404,7 @@ impl DeviceLoginMiddleware {
         }
         form.append_pair("deviceType", "6");
         form.append_pair("deviceIdentifier", &self.device_identifier);
-        form.append_pair("deviceName", "BytewardenWinUI");
+        form.append_pair("deviceName", "Bytewarden");
         if let Some(otp) = otp.as_ref() {
             form.append_pair("newDeviceOtp", otp);
         }
