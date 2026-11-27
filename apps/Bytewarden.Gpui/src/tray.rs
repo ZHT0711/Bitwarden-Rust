@@ -83,14 +83,22 @@ mod windows {
     const TPM_RETURNCMD: u32 = 0x0100;
     const TPM_NONOTIFY: u32 = 0x0080;
     const SW_HIDE: i32 = 0;
+    const SW_SHOW: i32 = 5;
     const SW_RESTORE: i32 = 9;
+    const WM_ACTIVATE_EXISTING: u32 = WM_APP + 43;
+    const ERROR_ALREADY_EXISTS: u32 = 183;
     const ERROR_CLASS_ALREADY_EXISTS: u32 = 1410;
     const IDI_APPLICATION: *const u16 = 32512usize as *const u16;
 
     const WINDOW_CLASS: &[u16] = &[
         66, 121, 116, 101, 119, 97, 114, 100, 101, 110, 46, 71, 80, 85, 73, 46, 84, 114, 97, 121, 0,
     ];
+    const ACTIVATION_CLASS: &[u16] = &[
+        66, 121, 116, 101, 119, 97, 114, 100, 101, 110, 46, 71, 80, 85, 73, 46, 65, 99, 116, 105,
+        118, 97, 116, 101, 0,
+    ];
     static REGISTERED_CLASS: OnceLock<bool> = OnceLock::new();
+    static REGISTERED_ACTIVATION_CLASS: OnceLock<bool> = OnceLock::new();
 
     #[repr(C)]
     struct WindowClassW {
@@ -246,10 +254,7 @@ mod windows {
 
         fn restore(&self) {
             self.hidden.set(false);
-            unsafe {
-                ShowWindow(self.app_window, SW_RESTORE);
-                SetForegroundWindow(self.app_window);
-            }
+            unsafe { restore_hwnd(self.app_window) };
         }
 
         fn show_menu(&self, x: i32, y: i32) {
@@ -374,6 +379,193 @@ mod windows {
             if self.state.owns_icon && !self.state.icon.is_null() {
                 unsafe { DestroyIcon(self.state.icon) };
                 self.state.icon = null_mut();
+            }
+        }
+    }
+
+    unsafe fn restore_hwnd(app_window: Hwnd) {
+        if app_window.is_null() {
+            return;
+        }
+        let cmd = if unsafe { IsIconic(app_window) } != 0 {
+            SW_RESTORE
+        } else {
+            SW_SHOW
+        };
+        unsafe {
+            ShowWindow(app_window, cmd);
+            BringWindowToTop(app_window);
+            SetForegroundWindow(app_window);
+        }
+    }
+
+    pub(super) fn profile_scope_tag(local_app_data: Option<&str>) -> String {
+        let mut hash: u64 = 0xcbf29ce484222325;
+        let normalized = local_app_data.unwrap_or("default");
+        for byte in normalized.as_bytes() {
+            let lower = byte.to_ascii_lowercase();
+            hash ^= u64::from(lower);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        format!("{hash:016x}")
+    }
+
+    fn current_scope_tag() -> String {
+        let local = std::env::var("LOCALAPPDATA").ok();
+        profile_scope_tag(local.as_deref())
+    }
+
+    fn encode_wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    fn ensure_activation_class() -> bool {
+        *REGISTERED_ACTIVATION_CLASS.get_or_init(|| unsafe {
+            let instance = GetModuleHandleW(null());
+            let class = WindowClassW {
+                style: 0,
+                window_proc: Some(activation_window_proc),
+                class_extra: 0,
+                window_extra: 0,
+                instance,
+                icon: null_mut(),
+                cursor: null_mut(),
+                background: null_mut(),
+                menu_name: null(),
+                class_name: ACTIVATION_CLASS.as_ptr(),
+            };
+            if RegisterClassW(&class) != 0 {
+                true
+            } else {
+                GetLastError() == ERROR_CLASS_ALREADY_EXISTS
+            }
+        })
+    }
+
+    unsafe extern "system" fn activation_window_proc(
+        window: Hwnd,
+        message: u32,
+        wparam: usize,
+        lparam: isize,
+    ) -> isize {
+        if message == WM_NCCREATE {
+            let create = lparam as *const CreateStructW;
+            if !create.is_null() {
+                let app_hwnd = unsafe { (*create).create_params };
+                unsafe { SetWindowLongPtrW(window, GWLP_USERDATA, app_hwnd as isize) };
+            }
+            return 1;
+        }
+        if message == WM_ACTIVATE_EXISTING {
+            let app_hwnd = unsafe { GetWindowLongPtrW(window, GWLP_USERDATA) as Hwnd };
+            unsafe { restore_hwnd(app_hwnd) };
+            return 0;
+        }
+        if message == WM_NCDESTROY {
+            unsafe { SetWindowLongPtrW(window, GWLP_USERDATA, 0) };
+        }
+        unsafe { DefWindowProcW(window, message, wparam, lparam) }
+    }
+
+    /// Per-profile single-instance guard. When a second GPUI process starts for the same
+    /// `LOCALAPPDATA` profile, it signals the existing instance to restore and focus its
+    /// window, then exits silently instead of opening a duplicate error window.
+    pub(crate) struct SingleInstance {
+        mutex: *mut c_void,
+        activation_window: Hwnd,
+        window_title: Vec<u16>,
+    }
+
+    impl SingleInstance {
+        pub(crate) fn acquire_or_activate(silent_if_running: bool) -> Option<Self> {
+            let tag = current_scope_tag();
+            let mutex_name = encode_wide(&format!("Local\\Bytewarden.GPUI.SingleInstance.{tag}"));
+            let window_title = encode_wide(&format!("Bytewarden.GPUI.Activate.{tag}"));
+            let mutex = unsafe { CreateMutexW(null(), 0, mutex_name.as_ptr()) };
+            if mutex.is_null() {
+                // Fail open if mutex creation is denied by environment policy.
+                return Some(Self {
+                    mutex: null_mut(),
+                    activation_window: null_mut(),
+                    window_title,
+                });
+            }
+            if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+                unsafe { CloseHandle(mutex) };
+                if !silent_if_running {
+                    // Retry briefly in case the primary instance is still initializing its window.
+                    for _ in 0..20 {
+                        let existing = unsafe {
+                            FindWindowW(ACTIVATION_CLASS.as_ptr(), window_title.as_ptr())
+                        };
+                        if !existing.is_null() {
+                            let mut pid: u32 = 0;
+                            unsafe {
+                                GetWindowThreadProcessId(existing, &mut pid);
+                                if pid != 0 {
+                                    AllowSetForegroundWindow(pid);
+                                }
+                                PostMessageW(existing, WM_ACTIVATE_EXISTING, 0, 0);
+                            }
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    }
+                }
+                return None;
+            }
+            Some(Self {
+                mutex,
+                activation_window: null_mut(),
+                window_title,
+            })
+        }
+
+        pub(crate) fn attach_window(&mut self, window: &Window) {
+            if !self.activation_window.is_null() || !ensure_activation_class() {
+                return;
+            }
+            let Ok(handle) = HasWindowHandle::window_handle(window) else {
+                return;
+            };
+            let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+                return;
+            };
+            let app_window = handle.hwnd.get() as Hwnd;
+            if app_window.is_null() {
+                return;
+            }
+            self.activation_window = unsafe {
+                CreateWindowExW(
+                    WS_EX_TOOLWINDOW,
+                    ACTIVATION_CLASS.as_ptr(),
+                    self.window_title.as_ptr(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    null_mut(),
+                    null_mut(),
+                    GetModuleHandleW(null()),
+                    app_window,
+                )
+            };
+        }
+    }
+
+    impl Drop for SingleInstance {
+        fn drop(&mut self) {
+            if !self.activation_window.is_null() {
+                unsafe {
+                    SetWindowLongPtrW(self.activation_window, GWLP_USERDATA, 0);
+                    DestroyWindow(self.activation_window);
+                }
+                self.activation_window = null_mut();
+            }
+            if !self.mutex.is_null() {
+                unsafe { CloseHandle(self.mutex) };
+                self.mutex = null_mut();
             }
         }
     }
@@ -517,7 +709,12 @@ mod windows {
         fn GetWindowLongPtrW(window: Hwnd, index: i32) -> isize;
         fn DestroyWindow(window: Hwnd) -> i32;
         fn ShowWindow(window: Hwnd, command: i32) -> i32;
+        fn IsIconic(window: Hwnd) -> i32;
+        fn BringWindowToTop(window: Hwnd) -> i32;
         fn SetForegroundWindow(window: Hwnd) -> i32;
+        fn FindWindowW(class_name: *const u16, window_name: *const u16) -> Hwnd;
+        fn GetWindowThreadProcessId(window: Hwnd, pid: *mut u32) -> u32;
+        fn AllowSetForegroundWindow(pid: u32) -> i32;
         fn RegisterWindowMessageW(name: *const u16) -> u32;
         fn LoadIconW(instance: Hinstance, name: *const u16) -> Hicon;
         fn DestroyIcon(icon: Hicon) -> i32;
@@ -548,6 +745,12 @@ mod windows {
     unsafe extern "system" {
         fn GetModuleHandleW(name: *const u16) -> Hinstance;
         fn GetLastError() -> u32;
+        fn CreateMutexW(
+            attributes: *const c_void,
+            initial_owner: i32,
+            name: *const u16,
+        ) -> *mut c_void;
+        fn CloseHandle(handle: *mut c_void) -> i32;
     }
 
     #[link(name = "shell32")]
@@ -687,10 +890,22 @@ mod windows {
 }
 
 #[cfg(windows)]
-pub(crate) use windows::Tray;
+pub(crate) use windows::{SingleInstance, Tray};
 
 #[cfg(not(windows))]
 pub(crate) struct Tray;
+
+#[cfg(not(windows))]
+pub(crate) struct SingleInstance;
+
+#[cfg(not(windows))]
+impl SingleInstance {
+    pub(crate) fn acquire_or_activate(_: bool) -> Option<Self> {
+        Some(Self)
+    }
+
+    pub(crate) fn attach_window(&mut self, _: &gpui::Window) {}
+}
 
 #[cfg(not(windows))]
 impl Tray {
@@ -760,5 +975,15 @@ mod tests {
         let (w64, bytes64) = super::windows::select_ico_entry(data, 64).expect("64px entry");
         assert!(w64 >= 64);
         assert!(bytes64.len() > bytes48.len());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn single_instance_scope_tag_is_case_insensitive_and_isolates_profiles() {
+        let a = super::windows::profile_scope_tag(Some(r"C:\Users\Alice\AppData\Local"));
+        let b = super::windows::profile_scope_tag(Some(r"c:\users\alice\appdata\local"));
+        let c = super::windows::profile_scope_tag(Some(r"C:\Temp\IsolatedProfile"));
+        assert_eq!(a, b);
+        assert_ne!(a, c);
     }
 }

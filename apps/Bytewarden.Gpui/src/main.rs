@@ -96,6 +96,7 @@ struct VaultPreview {
     generator: Generator,
     favicon_cache: favicon::FaviconCache,
     tray: Option<tray::Tray>,
+    single_instance: Option<tray::SingleInstance>,
     clipboard: clipboard::Clipboard,
     clipboard_generation: u64,
     confirm_attachment: Option<String>,
@@ -266,6 +267,7 @@ impl VaultPreview {
             generator: Generator::new(cx),
             favicon_cache: favicon::FaviconCache::default(),
             tray: None,
+            single_instance: None,
             clipboard: clipboard::Clipboard::default(),
             clipboard_generation: 0,
             confirm_attachment: None,
@@ -2063,7 +2065,14 @@ fn bind_shortcuts(cx: &mut App) {
 }
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
+    let startup_requested =
+        std::env::args_os().any(|argument| argument == std::ffi::OsStr::new("--start-in-tray"));
+    let Some(single_instance) = tray::SingleInstance::acquire_or_activate(startup_requested) else {
+        return;
+    };
+    let single_instance = std::rc::Rc::new(std::cell::RefCell::new(Some(single_instance)));
+
+    Application::new().run(move |cx: &mut App| {
         bind_shortcuts(cx);
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
@@ -2079,8 +2088,7 @@ fn main() {
             ),
             cx,
         );
-        let startup_requested =
-            std::env::args_os().any(|argument| argument == std::ffi::OsStr::new("--start-in-tray"));
+        let single_instance_for_window = single_instance.clone();
         let window = match cx.open_window(
             WindowOptions {
                 titlebar: Some(TitlebarOptions {
@@ -2097,7 +2105,12 @@ fn main() {
                 let view = cx.new(|cx| VaultPreview::new(window, cx));
                 let weak = view.downgrade();
                 let app = cx.to_async();
+                let mut guard = single_instance_for_window.borrow_mut().take();
+                if let Some(instance) = guard.as_mut() {
+                    instance.attach_window(window);
+                }
                 view.update(cx, |this, _cx| {
+                    this.single_instance = guard;
                     if this.settings.keep_in_tray {
                         let weak = weak.clone();
                         let app = app.clone();
