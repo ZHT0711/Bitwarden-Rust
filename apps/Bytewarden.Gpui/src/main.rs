@@ -382,6 +382,11 @@ impl VaultPreview {
             // drained. Clipboard contention must never keep vault keys alive or
             // prevent the application from closing indefinitely.
             clock.spawn(async { desktop::shutdown() }).await;
+            // Release the single-instance guard now that the core cache is closed,
+            // so relaunching immediately during clipboard cleanup opens cleanly.
+            let _ = view.update(app, |this, _| {
+                this.single_instance = None;
+            });
 
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {

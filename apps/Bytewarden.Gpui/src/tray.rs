@@ -29,7 +29,7 @@ enum TrayEvent {
 
 fn tray_event(event: u16) -> TrayEvent {
     match event as u32 {
-        NIN_SELECT | NIN_KEYSELECT => TrayEvent::Restore,
+        NIN_SELECT | NIN_KEYSELECT | WM_LBUTTONDBLCLK => TrayEvent::Restore,
         WM_CONTEXTMENU => TrayEvent::ContextMenu,
         _ => TrayEvent::Ignore,
     }
@@ -37,6 +37,7 @@ fn tray_event(event: u16) -> TrayEvent {
 
 const NIN_SELECT: u32 = 0x0400;
 const NIN_KEYSELECT: u32 = 0x0401;
+const WM_LBUTTONDBLCLK: u32 = 0x0203;
 const WM_CONTEXTMENU: u32 = 0x007b;
 
 #[cfg(windows)]
@@ -85,6 +86,13 @@ mod windows {
     const SW_HIDE: i32 = 0;
     const SW_SHOW: i32 = 5;
     const SW_RESTORE: i32 = 9;
+    const HWND_TOP: Hwnd = std::ptr::null_mut();
+    const HWND_TOPMOST: Hwnd = (-1isize) as Hwnd;
+    const HWND_NOTOPMOST: Hwnd = (-2isize) as Hwnd;
+    const SWP_NOSIZE: u32 = 0x0001;
+    const SWP_NOMOVE: u32 = 0x0002;
+    const SWP_SHOWWINDOW: u32 = 0x0040;
+    const SMTO_ABORTIFHUNG: u32 = 0x0002;
     const WDA_NONE: u32 = 0x0000_0000;
     const WDA_EXCLUDEFROMCAPTURE: u32 = 0x0000_0011;
     const WM_ACTIVATE_EXISTING: u32 = WM_APP + 43;
@@ -428,6 +436,55 @@ mod windows {
             ShowWindow(app_window, cmd);
             BringWindowToTop(app_window);
             SetForegroundWindow(app_window);
+            if GetForegroundWindow() != app_window {
+                // Bypass Windows' foreground lock when activating from tray or a
+                // second-instance relaunch while another app owns the foreground.
+                let fg = GetForegroundWindow();
+                let fg_tid = if fg.is_null() {
+                    0
+                } else {
+                    GetWindowThreadProcessId(fg, null_mut())
+                };
+                let cur_tid = GetCurrentThreadId();
+                let attached =
+                    fg_tid != 0 && fg_tid != cur_tid && AttachThreadInput(cur_tid, fg_tid, 1) != 0;
+                BringWindowToTop(app_window);
+                SetWindowPos(
+                    app_window,
+                    HWND_TOP,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+                );
+                SetForegroundWindow(app_window);
+                if attached {
+                    AttachThreadInput(cur_tid, fg_tid, 0);
+                }
+            }
+            if GetForegroundWindow() != app_window {
+                // Final Z-order pulse guarantees visibility even behind elevated windows.
+                SetWindowPos(
+                    app_window,
+                    HWND_TOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+                );
+                SetWindowPos(
+                    app_window,
+                    HWND_NOTOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+                );
+                SetForegroundWindow(app_window);
+            }
         }
     }
 
@@ -547,9 +604,18 @@ mod windows {
                             if pid != 0 {
                                 AllowSetForegroundWindow(pid);
                             }
-                            if PostMessageW(existing, WM_ACTIVATE_EXISTING, 0, 0) != 0
-                                && !pending_activation.is_null()
-                            {
+                            let mut delivered = 0usize;
+                            let sent = SendMessageTimeoutW(
+                                existing,
+                                WM_ACTIVATE_EXISTING,
+                                0,
+                                0,
+                                SMTO_ABORTIFHUNG,
+                                2000,
+                                &mut delivered,
+                            ) != 0
+                                || PostMessageW(existing, WM_ACTIVATE_EXISTING, 0, 0) != 0;
+                            if sent && !pending_activation.is_null() {
                                 ResetEvent(pending_activation);
                             }
                         }
@@ -770,8 +836,28 @@ mod windows {
         fn DestroyWindow(window: Hwnd) -> i32;
         fn ShowWindow(window: Hwnd, command: i32) -> i32;
         fn IsIconic(window: Hwnd) -> i32;
+        fn GetForegroundWindow() -> Hwnd;
+        fn AttachThreadInput(id_attach: u32, id_attach_to: u32, attach: i32) -> i32;
+        fn SetWindowPos(
+            window: Hwnd,
+            insert_after: Hwnd,
+            x: i32,
+            y: i32,
+            cx: i32,
+            cy: i32,
+            flags: u32,
+        ) -> i32;
         fn BringWindowToTop(window: Hwnd) -> i32;
         fn SetForegroundWindow(window: Hwnd) -> i32;
+        fn SendMessageTimeoutW(
+            window: Hwnd,
+            message: u32,
+            wparam: usize,
+            lparam: isize,
+            flags: u32,
+            timeout_ms: u32,
+            result: *mut usize,
+        ) -> isize;
         fn SetWindowDisplayAffinity(window: Hwnd, affinity: u32) -> i32;
         fn FindWindowW(class_name: *const u16, window_name: *const u16) -> Hwnd;
         fn GetWindowThreadProcessId(window: Hwnd, pid: *mut u32) -> u32;
@@ -821,6 +907,7 @@ mod windows {
         fn ResetEvent(event: *mut c_void) -> i32;
         fn WaitForSingleObject(handle: *mut c_void, millis: u32) -> u32;
         fn CloseHandle(handle: *mut c_void) -> i32;
+        fn GetCurrentThreadId() -> u32;
     }
 
     #[link(name = "shell32")]
@@ -868,10 +955,6 @@ mod windows {
             fn CloseDesktop(desktop: Hwnd) -> i32;
             fn SendMessageW(window: Hwnd, message: u32, wparam: usize, lparam: isize) -> isize;
             fn IsWindowVisible(window: Hwnd) -> i32;
-        }
-        #[link(name = "kernel32")]
-        unsafe extern "system" {
-            fn GetCurrentThreadId() -> u32;
         }
 
         struct Desktop {
@@ -1065,6 +1148,7 @@ mod tests {
     fn shell_callback_mapping_ignores_unknown_events() {
         assert_eq!(tray_event(0x0400), TrayEvent::Restore);
         assert_eq!(tray_event(0x0401), TrayEvent::Restore);
+        assert_eq!(tray_event(0x0203), TrayEvent::Restore);
         assert_eq!(tray_event(0x007b), TrayEvent::ContextMenu);
         assert_eq!(tray_event(0x0200), TrayEvent::Ignore);
     }
