@@ -108,6 +108,8 @@ pub(super) struct AuthSession {
     send_write_uncertain: bool,
     #[cfg(windows)]
     pin_enrollment: Option<pin::PinEnrollment>,
+    #[cfg(windows)]
+    restored_tokens: Option<PersistedSessionTokens>,
 }
 
 struct OpenDetail {
@@ -159,6 +161,23 @@ struct PersistedVaultEnvelope {
     account_id: uuid::Uuid,
     unlock_data: Option<PersistedUnlockData>,
     state: EncryptedVaultState,
+}
+
+#[cfg(windows)]
+#[derive(Serialize, Deserialize, Zeroize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct PersistedSessionTokens {
+    version: u8,
+    access_token: String,
+    refresh_token: String,
+    expires_on: i64,
+}
+
+#[cfg(windows)]
+impl Drop for PersistedSessionTokens {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
 }
 
 impl AuthSession {
@@ -229,10 +248,8 @@ pub(super) fn restore_persisted_sessions(limit: usize) -> Vec<AuthSession> {
                 return None;
             }
             let server = auth_server(envelope.server_mode, &envelope.server_url)?;
-            if crate::local_cache::account_digest(&format!(
-                "{}\n{}",
-                server.api_url, envelope.email
-            )) != digest
+            let identity = format!("{}\n{}", server.api_url, envelope.email);
+            if crate::local_cache::account_digest(&identity) != digest
                 || uuid::Uuid::parse_str(&envelope.device_identifier).is_err()
             {
                 return None;
@@ -245,6 +262,12 @@ pub(super) fn restore_persisted_sessions(limit: usize) -> Vec<AuthSession> {
             if !vault.has_cached_snapshot() {
                 return None;
             }
+            let restored_tokens = crate::local_cache::load_session_tokens(&identity)
+                .and_then(|bytes| serde_json::from_slice::<PersistedSessionTokens>(&bytes).ok())
+                .filter(|t| {
+                    t.version == 1 && !t.access_token.is_empty() && !t.refresh_token.is_empty()
+                });
+            let offline_only = restored_tokens.is_none();
             let middleware = Arc::new(DeviceLoginMiddleware::new(
                 envelope.device_identifier.clone(),
             ));
@@ -261,9 +284,10 @@ pub(super) fn restore_persisted_sessions(limit: usize) -> Vec<AuthSession> {
                 unlock_data: Some(unlock_data),
                 vault,
                 open_detail: None,
-                offline_only: true,
+                offline_only,
                 send_write_uncertain: false,
                 pin_enrollment: None,
+                restored_tokens,
             })
         })
         .take(limit)
@@ -284,6 +308,50 @@ fn local_cache_identity(session: &AuthSession) -> String {
 #[cfg(windows)]
 fn remove_cached_vault(session: &AuthSession) -> bool {
     crate::local_cache::remove(&local_cache_identity(session))
+}
+
+#[cfg(windows)]
+fn persist_session_tokens_with_runtime(session: &AuthSession, runtime: &tokio::runtime::Runtime) {
+    if !crate::local_cache::is_configured() || session.offline_only {
+        return;
+    }
+    let Some(tokens) = runtime.block_on(async {
+        session
+            .client
+            .platform()
+            .state()
+            .value::<bw_sdk_core::client::persisted_state::AUTHENTICATION_TOKENS>()
+            .try_get()
+            .await
+            .ok()
+            .flatten()
+    }) else {
+        return;
+    };
+    let Some(refresh_token) = tokens.refresh_token.filter(|r| !r.is_empty()) else {
+        return;
+    };
+    if tokens.access_token.is_empty() {
+        return;
+    }
+    let record = PersistedSessionTokens {
+        version: 1,
+        access_token: tokens.access_token,
+        refresh_token,
+        expires_on: tokens.expires_on,
+    };
+    if let Ok(encoded) = serde_json::to_vec(&record).map(Zeroizing::new) {
+        let _ = crate::local_cache::save_session_tokens(&local_cache_identity(session), &encoded);
+    }
+}
+
+#[cfg(windows)]
+fn persist_session_tokens(session: &AuthSession) {
+    if tokio::runtime::Handle::try_current().is_err() {
+        if let Some(rt) = runtime() {
+            persist_session_tokens_with_runtime(session, rt);
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -314,6 +382,7 @@ fn persist_cached_vault(session: &AuthSession) {
     if crate::local_cache::save(&identity, &encoded) {
         crate::local_cache::clear_pending(&identity);
     }
+    persist_session_tokens(session);
 }
 
 #[cfg(windows)]
@@ -597,6 +666,8 @@ fn auth_client_for_server<'a>(
             send_write_uncertain: false,
             #[cfg(windows)]
             pin_enrollment: None,
+            #[cfg(windows)]
+            restored_tokens: None,
         });
     }
 
@@ -1096,6 +1167,8 @@ pub unsafe extern "C" fn bw_auth_login_with_remember(
                         authenticated.state = SESSION_UNLOCKED;
                         #[cfg(windows)]
                         authenticated.restore_local_vault(runtime);
+                        #[cfg(windows)]
+                        persist_session_tokens_with_runtime(&authenticated, runtime);
                         // Cache restoration may take time for large vaults. Do not publish a
                         // session if a lock, account switch or cancellation arrived meanwhile.
                         if !auth_request::is_current(request_id) {
@@ -1367,8 +1440,8 @@ fn complete_vault_unlock_raw(
         runtime.block_on(auth_request::run(request_id, async {
             let keys = session.unlock_data.as_ref().ok_or("unlockUnavailable")?;
             initialize(session, keys)?;
-            if session.offline_only {
-                #[cfg(windows)]
+            #[cfg(windows)]
+            if session.offline_only || session.restored_tokens.is_some() {
                 session
                     .client
                     .platform()
@@ -1384,6 +1457,29 @@ fn complete_vault_unlock_raw(
                     .await
                     .map_err(|_| "internal".to_owned())?;
             }
+            #[cfg(windows)]
+            if let Some(tokens) = session.restored_tokens.as_ref() {
+                session
+                    .client
+                    .platform()
+                    .state()
+                    .value::<bw_sdk_core::client::persisted_state::AUTHENTICATION_TOKENS>()
+                    .set(bw_sdk_core::client::persisted_state::AuthenticationTokens {
+                        access_token: tokens.access_token.clone(),
+                        refresh_token: Some(tokens.refresh_token.clone()),
+                        expires_on: tokens.expires_on,
+                    })
+                    .await
+                    .map_err(|_| "internal".to_owned())?;
+                if let Some(user_id) = session.vault.user_id() {
+                    let _ = session
+                        .client
+                        .internal
+                        .init_user_id(bw_sdk_core::UserId::new(user_id))
+                        .await;
+                }
+            }
+            session.vault.activate(&session.client);
             session
                 .vault
                 .restore_overview(&session.client)
@@ -1393,6 +1489,10 @@ fn complete_vault_unlock_raw(
     }));
     let code = match result {
         Ok(Ok(Ok(()))) if auth_request::is_current(request_id) => {
+            #[cfg(windows)]
+            {
+                session.restored_tokens = None;
+            }
             session.state = SESSION_UNLOCKED;
             guard.publish_state();
             return Ok(());
@@ -1529,6 +1629,16 @@ fn vault_sync<T>(request_id: u64, project: impl FnOnce(&VaultOverview) -> T) -> 
             }
             Ok(Ok(Ok(_))) | Ok(Err(RequestError::Cancelled)) => Err("cancelled".into()),
             Ok(Err(RequestError::TimedOut)) => Err("timedOut".into()),
+            Ok(Ok(Err(VaultError::NotAuthenticated))) => {
+                session.offline_only = true;
+                #[cfg(windows)]
+                {
+                    session.restored_tokens = None;
+                    let _ =
+                        crate::local_cache::remove_session_tokens(&local_cache_identity(session));
+                }
+                Err("signInRequired".into())
+            }
             Ok(Ok(Err(error))) => Err(error.to_string()),
             Err(_) => Err("internal".into()),
         }
@@ -2680,6 +2790,8 @@ mod tests {
                 send_write_uncertain: false,
                 #[cfg(windows)]
                 pin_enrollment: None,
+                #[cfg(windows)]
+                restored_tokens: None,
             });
             super::SESSION_STATE.store(
                 super::SESSION_UNLOCKED,

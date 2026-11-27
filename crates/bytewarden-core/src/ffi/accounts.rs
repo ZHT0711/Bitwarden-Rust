@@ -234,6 +234,7 @@ fn revoke_and_clear(session: &mut AuthSession) -> bool {
     session.state = SESSION_LOCKED;
     #[cfg(windows)]
     {
+        session.restored_tokens = None;
         super::pin::clear_session(session);
         super::remove_cached_vault(session)
     }

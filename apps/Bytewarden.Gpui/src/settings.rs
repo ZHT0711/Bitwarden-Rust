@@ -37,7 +37,7 @@ impl Default for Settings {
             theme: Theme::System,
             animations: true,
             clipboard_seconds: 30,
-            auto_prompt_hello: false,
+            auto_prompt_hello: cfg!(all(windows, not(test))),
             prevent_screenshots: false,
             browser_integration: true,
             browser_biometric_gate: false,
@@ -152,7 +152,13 @@ impl Settings {
             let h = f32::from(bounds.size.height);
             let x = f32::from(bounds.origin.x);
             let y = f32::from(bounds.origin.y);
-            if w >= 420. && h >= 410. && x.is_finite() && y.is_finite() {
+            if w >= 420.
+                && h >= 410.
+                && x.is_finite()
+                && y.is_finite()
+                && x > -10_000.
+                && y > -10_000.
+            {
                 self.window_x = Some(x);
                 self.window_y = Some(y);
                 self.window_w = Some(w.clamp(420., 3840.));
@@ -650,14 +656,24 @@ impl VaultPreview {
                                         self.animate,
                                     ),
                                 )
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.settings.auto_prompt_hello = !this.settings.auto_prompt_hello;
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    let next = !this.settings.auto_prompt_hello;
+                                    this.settings.auto_prompt_hello = next;
                                     this.ui.animate_toggle(
                                         gpui::ElementId::Name("auto-prompt-hello".into()),
                                         this.settings.auto_prompt_hello,
                                         this.animate,
                                     );
                                     this.save_settings(cx);
+                                    if next
+                                        && can_change
+                                        && !this
+                                            .client
+                                            .active()
+                                            .is_some_and(|account| account.hello_enabled)
+                                    {
+                                        this.change_hello(window, cx);
+                                    }
                                 }))
                                 .into_any_element(),
                                 true,

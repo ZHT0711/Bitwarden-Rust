@@ -1056,6 +1056,29 @@ impl VaultPreview {
                                     })),
                             )
                             .when(
+                                cfg!(windows)
+                                    && self.client.overview.is_some()
+                                    && !self.client.write_guard
+                                    && self.client.active().is_some_and(|account| {
+                                        account.session()
+                                            == bytewarden_core::desktop::Session::Unlocked
+                                            && !account.needs_sign_in
+                                            && !account.hello_enabled
+                                    }),
+                                |el| {
+                                    el.child(
+                                        btn("quick-enable-hello", BtnVariant::Primary)
+                                            .h(px(30.))
+                                            .text_size(px(font::CAPTION))
+                                            .child("启用面部解锁")
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.client.show_accounts = false;
+                                                this.change_hello(window, cx);
+                                            })),
+                                    )
+                                },
+                            )
+                            .when(
                                 self.client
                                     .active()
                                     .is_some_and(|account| account.needs_sign_in),

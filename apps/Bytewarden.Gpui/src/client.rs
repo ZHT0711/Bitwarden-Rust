@@ -196,6 +196,7 @@ pub struct Client {
     pub(crate) pin: Entity<Input>,
     pub(crate) pin_require_mp_on_restart: bool,
     pub(crate) unlock_with_pin: bool,
+    pub(crate) enroll_hello_on_login: bool,
     code: Entity<Input>,
 }
 
@@ -246,6 +247,7 @@ impl Client {
             pin: cx.new(|cx| Input::new("输入 PIN 码（至少 4 位）", true, cx)),
             pin_require_mp_on_restart: false,
             unlock_with_pin: false,
+            enroll_hello_on_login: cfg!(all(windows, not(test))),
             code: cx.new(|cx| Input::new("验证码", true, cx)),
         }
     }
@@ -503,6 +505,20 @@ impl VaultPreview {
                     this.client.device = Some(device);
                     this.apply_snapshot(snapshot, cx);
                     this.session_notice();
+                    #[cfg(not(test))]
+                    if !this.started_hidden && this.client.state() == Session::Locked {
+                        let handle = this.window_handle;
+                        let weak = cx.weak_entity();
+                        cx.defer(move |cx| {
+                            let _ = handle.update(cx, |_, window, cx| {
+                                let _ = weak.update(cx, |this, cx| {
+                                    if this.client.form.is_none() {
+                                        this.open_unlock(window, cx);
+                                    }
+                                });
+                            });
+                        });
+                    }
                 }
                 Err(message) => this.client.notice = message,
             },
@@ -663,6 +679,7 @@ impl VaultPreview {
         self.close_form(cx);
         self.close_detail();
         self.client.show_accounts = false;
+        self.client.hello_window = hello_hwnd(window);
         self.client.form = Some(Form::SignIn);
         self.client.email.read(cx).focus(window);
         cx.notify();
@@ -869,6 +886,8 @@ impl VaultPreview {
         let login_generation = self.client.login_challenge.generation;
         let provider = self.client.provider;
         let remember = self.client.remember;
+        let enroll_hello_after_login = cfg!(windows) && self.client.enroll_hello_on_login;
+        let hello_hwnd_for_login = self.client.hello_window;
         if matches!(mode, LoginMode::Login) {
             self.client.session_transition_pending = true;
         }
@@ -898,22 +917,34 @@ impl VaultPreview {
                         req.resend_device_code(&email, &password, device, region.server(&url))
                     }
                 };
-                drop(password);
                 let state = matches!(
                     (mode, &result),
                     (LoginMode::Login, Ok(AuthStatus::Authenticated))
                 )
                 .then(|| match req.sync() {
-                    Ok(overview) => (
-                        desktop::accounts().map(|accounts| Snapshot {
-                            accounts,
-                            overview: Some(overview),
-                            overview_error: None,
-                        }),
-                        None,
-                    ),
-                    Err(error) => (snapshot(), Some(error)),
+                    Ok(overview) => {
+                        let mut hello_enrolled = false;
+                        if enroll_hello_after_login
+                            && let Some(hwnd) = hello_hwnd_for_login
+                            && let Ok(accts) = desktop::accounts()
+                            && let Some(active) = accts.iter().find(|a| a.active)
+                            && !active.hello_enabled
+                        {
+                            hello_enrolled = req.enable_hello(&active.id, &password, hwnd).is_ok();
+                        }
+                        (
+                            desktop::accounts().map(|accounts| Snapshot {
+                                accounts,
+                                overview: Some(overview),
+                                overview_error: None,
+                            }),
+                            None,
+                            hello_enrolled,
+                        )
+                    }
+                    Err(error) => (snapshot(), Some(error), false),
                 });
+                drop(password);
                 (result, state, device_code)
             },
             move |this, (result, state, device_code), cx| {
@@ -930,7 +961,7 @@ impl VaultPreview {
                     {
                         this.clear_account_view(cx);
                         this.lock_queued = true;
-                        if let Some((Ok(state), _)) = state {
+                        if let Some((Ok(state), _, _)) = state {
                             this.apply_snapshot(state, cx);
                             this.client.notice =
                                 "登录已完成，但登录窗口已关闭；正在锁定保险库。".into();
@@ -942,8 +973,12 @@ impl VaultPreview {
                     Ok(AuthStatus::Authenticated) if matches!(mode, LoginMode::Login) => {
                         this.clear_account_view(cx);
                         this.ui.trigger_page_motion(this.animate);
-                        let (state, sync_error) =
+                        let (state, sync_error, hello_enrolled) =
                             state.expect("successful login has account snapshot");
+                        if hello_enrolled {
+                            this.settings.auto_prompt_hello = true;
+                            this.settings.save_silent();
+                        }
                         match state {
                             Ok(state) => {
                                 this.apply_snapshot(state, cx);
@@ -951,6 +986,15 @@ impl VaultPreview {
                                 if let Some(error) = sync_error {
                                     this.client.notice =
                                         format!("已登录，但同步未完成。{}", status_text(&error));
+                                } else if hello_enrolled {
+                                    this.client.notice =
+                                        "已登录并开启 Windows Hello 面部/指纹免密解锁。".into();
+                                    this.ui.toast.show(
+                                        crate::ui::toast::ToastKind::Success,
+                                        "已开启 Windows Hello 免密刷脸解锁",
+                                        std::time::Instant::now(),
+                                        this.animate,
+                                    );
                                 }
                             }
                             Err(e) => this.client.notice = status_text(&e),
@@ -1020,9 +1064,11 @@ impl VaultPreview {
 
     fn restart_login(&mut self, cx: &mut Context<Self>) {
         let account = self.client.reconnect_account.take();
+        let hw = self.client.hello_window;
         self.close_form(cx);
         self.client.form = Some(Form::SignIn);
         self.client.reconnect_account = account;
+        self.client.hello_window = hw;
     }
 
     fn request_login(&mut self, cx: &mut Context<Self>) {
@@ -1275,8 +1321,17 @@ impl VaultPreview {
                 }
                 match result {
                     Ok(()) => {
+                        this.settings.auto_prompt_hello = true;
+                        this.settings.save_silent();
                         this.close_form(cx);
-                        this.client.notice = "已启用 Windows Hello 解锁。".into();
+                        this.client.notice = "已启用 Windows Hello 面部/指纹免密解锁。".into();
+                        this.broadcast_browser_state();
+                        this.ui.toast.show(
+                            crate::ui::toast::ToastKind::Success,
+                            "已启用 Windows Hello 免密刷脸解锁",
+                            std::time::Instant::now(),
+                            this.animate,
+                        );
                     }
                     Err(error) => {
                         this.ui.trigger_auth_shake(this.animate);
@@ -1335,10 +1390,20 @@ impl VaultPreview {
                 }
                 match result {
                     Ok(state) => {
+                        let should_auto_sync =
+                            state.overview.as_ref().is_some_and(|ov| ov.read_only)
+                                && state
+                                    .accounts
+                                    .iter()
+                                    .find(|a| a.active)
+                                    .is_some_and(|a| !a.needs_sign_in);
                         this.close_form(cx);
                         this.apply_snapshot(state, cx);
                         this.ui.trigger_page_motion(this.animate);
                         this.session_notice();
+                        if should_auto_sync && !this.lock_queued {
+                            this.request_sync(cx);
+                        }
                     }
                     Err((e, refreshed_accounts)) => {
                         if let Some(accounts) = refreshed_accounts {
@@ -1376,10 +1441,24 @@ impl VaultPreview {
             "正在同步",
             Some(req),
             cx,
-            move || req.sync(),
+            move || match req.sync() {
+                Ok(overview) => Ok(overview),
+                Err(e) => {
+                    let refreshed = (e.code() == "signInRequired")
+                        .then(|| desktop::accounts().ok())
+                        .flatten();
+                    Err((e, refreshed))
+                }
+            },
             |this, result, _| match result {
                 Ok(overview) => this.accept_synced_overview(overview),
-                Err(e) => this.client.notice = status_text(&e),
+                Err((e, refreshed)) => {
+                    if let Some(accounts) = refreshed {
+                        this.client.accounts = accounts;
+                        this.broadcast_browser_state();
+                    }
+                    this.client.notice = status_text(&e);
+                }
             },
         );
     }
@@ -2055,6 +2134,18 @@ impl VaultPreview {
                 );
             }
         }
+        if ready && offer_hello {
+            panel = panel.child(
+                btn("hello-unlock", BtnVariant::Primary)
+                    .w_full()
+                    .h(px(38.))
+                    .child(glyph_icon(glyph::PASSKEY, 15.))
+                    .child("Windows Hello 面部 / 指纹解锁")
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.request_hello_unlock(window, cx)),
+                    ),
+            );
+        }
         if form == Form::Unlock && offer_pin {
             panel = panel.child(
                 div()
@@ -2121,6 +2212,66 @@ impl VaultPreview {
                     .child(self.client.password.clone()),
             );
         }
+        if form == Form::SignIn
+            && challenge.is_none()
+            && cfg!(windows)
+            && !reconnect.is_some_and(|a| a.hello_enabled)
+        {
+            let hello_login_p = self.ui.toggle_progress(
+                &gpui::ElementId::Name("login-enroll-hello".into()),
+                self.client.enroll_hello_on_login,
+                now,
+                self.animate,
+            );
+            panel = panel.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.))
+                    .py(px(2.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(1.))
+                            .child(
+                                div()
+                                    .text_size(px(font::CAPTION))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(hex(pal.text))
+                                    .child("启用 Windows Hello 面部 / 指纹免密登录"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(hex(pal.text_secondary))
+                                    .child("登录成功后自动绑定面部/生物识别，下次打开直接刷脸解锁并同步"),
+                            ),
+                    )
+                    .child(
+                        toggle_switch_animated(
+                            "login-enroll-hello",
+                            self.client.enroll_hello_on_login,
+                            hello_login_p,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if this.client.ready() {
+                                this.client.enroll_hello_on_login =
+                                    !this.client.enroll_hello_on_login;
+                                this.ui.animate_toggle(
+                                    "login-enroll-hello",
+                                    this.client.enroll_hello_on_login,
+                                    this.animate,
+                                );
+                                cx.notify();
+                            }
+                        })),
+                    ),
+            );
+        }
         if form == Form::PinEnrollment {
             let require_mp_p = self.ui.toggle_progress(
                 &gpui::ElementId::Name("pin-require-mp".into()),
@@ -2180,28 +2331,13 @@ impl VaultPreview {
         } else {
             BtnVariant::Primary
         };
-        if ready && (offer_hello || (form == Form::SignIn && allow_local)) {
+        if ready && form == Form::SignIn && allow_local {
             panel = panel.child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap(px(8.))
-                    .when(offer_hello, |row| {
-                        row.child(
-                            btn("hello-unlock", BtnVariant::Secondary)
-                                .child("Windows Hello")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.request_hello_unlock(window, cx)
-                                })),
-                        )
-                    })
-                    .when(form == Form::SignIn && allow_local, |row| {
-                        row.child(
-                            btn("offline-unlock", BtnVariant::Secondary)
-                                .child("仅离线解锁")
-                                .on_click(cx.listener(|this, _, _, cx| this.request_unlock(cx))),
-                        )
-                    }),
+                div().flex().flex_wrap().gap(px(8.)).child(
+                    btn("offline-unlock", BtnVariant::Secondary)
+                        .child("仅离线解锁")
+                        .on_click(cx.listener(|this, _, _, cx| this.request_unlock(cx))),
+                ),
             );
         }
         panel.child(

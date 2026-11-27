@@ -347,7 +347,14 @@ impl VaultCache {
             .sync_api()
             .get(Some(true))
             .await
-            .map_err(|_| VaultError::Network)?;
+            .map_err(|error| match error {
+                bw_sdk_core::ApiError::Response(resp)
+                    if resp.status == reqwest::StatusCode::UNAUTHORIZED =>
+                {
+                    VaultError::NotAuthenticated
+                }
+                _ => VaultError::Network,
+            })?;
         Self::from_response(client, response, unlock_data).await
     }
 

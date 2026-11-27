@@ -363,8 +363,48 @@ pub(crate) fn remove(identity: &str) -> bool {
         let snapshot_revoked = revoke_at(&root, &account_digest(identity));
         let hello_revoked = remove_hello_at(&root, identity);
         let pin_revoked = remove_pin_at(&root, identity);
-        hello_revoked && pin_revoked && snapshot_revoked
+        let tokens_revoked = remove_session_tokens_at(&root, identity);
+        hello_revoked && pin_revoked && tokens_revoked && snapshot_revoked
     })
+}
+
+fn session_token_paths(root: &Path, identity: &str) -> (PathBuf, PathBuf, [u8; 32]) {
+    let digest = account_digest(&format!("SessionTokens/v1\n{identity}"));
+    let path = cache_path(root, &digest);
+    (
+        path.with_extension("tokens"),
+        path.with_extension("tokens-revoked"),
+        digest,
+    )
+}
+
+pub(crate) fn load_session_tokens(identity: &str) -> Option<Zeroizing<Vec<u8>>> {
+    let root = configured_root()?;
+    let (path, marker, digest) = session_token_paths(&root, identity);
+    load_protected_bounded(&path, &digest, &marker, 64 * 1024)
+        .ok()
+        .flatten()
+}
+
+pub(crate) fn save_session_tokens(identity: &str, record: &[u8]) -> bool {
+    configured_root().is_some_and(|root| {
+        let (path, marker, digest) = session_token_paths(&root, identity);
+        save_protected_at(&path, &digest, record).is_ok() && remove_if_present(&marker).is_ok()
+    })
+}
+
+fn remove_session_tokens_at(root: &Path, identity: &str) -> bool {
+    let (path, marker, digest) = session_token_paths(root, identity);
+    if remove_if_present(&path).is_ok() {
+        let _ = remove_if_present(&marker);
+        return true;
+    }
+    fs::symlink_metadata(&marker).is_ok()
+        || save_protected_at(&marker, &digest, b"Bytewarden/revoked-session-tokens/v1").is_ok()
+}
+
+pub(crate) fn remove_session_tokens(identity: &str) -> bool {
+    configured_root().is_none_or(|root| remove_session_tokens_at(&root, identity))
 }
 
 fn two_factor_paths(root: &Path, identity: &str) -> (PathBuf, PathBuf, [u8; 32]) {
@@ -661,6 +701,43 @@ mod tests {
         );
         drop(held);
         assert!(remove_pin_at(root, identity));
+        assert!(!path.exists() && !marker.exists());
+    }
+
+    #[test]
+    fn session_token_revocation_is_independent_of_the_snapshot_and_fails_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let identity = "https://api.bitwarden.com\nuser@example.invalid";
+        save_at(root, identity, b"snapshot").unwrap();
+        let (path, marker, digest) = session_token_paths(root, identity);
+        save_protected_at(&path, &digest, b"sealed tokens").unwrap();
+        assert_eq!(
+            load_protected_bounded(&path, &digest, &marker, 64 * 1024)
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            b"sealed tokens"
+        );
+        let other_id = "https://api.bitwarden.eu\nuser@example.invalid";
+        assert_ne!(session_token_paths(root, other_id).2, digest);
+        assert_ne!(pin_paths(root, identity).2, digest);
+        let held = OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&path)
+            .unwrap();
+        assert!(remove_session_tokens_at(root, identity));
+        assert!(path.exists() && marker.is_file());
+        assert!(load_protected_bounded(&path, &digest, &marker, 64 * 1024)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            load_at(root, identity).unwrap().unwrap().as_slice(),
+            b"snapshot"
+        );
+        drop(held);
+        assert!(remove_session_tokens_at(root, identity));
         assert!(!path.exists() && !marker.exists());
     }
 

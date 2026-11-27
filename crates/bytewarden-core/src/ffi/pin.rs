@@ -593,6 +593,7 @@ mod tests {
             offline_only: false,
             send_write_uncertain: false,
             pin_enrollment: None,
+            restored_tokens: None,
         };
         let session_binding = binding(&session).unwrap();
         let salt = [0x33_u8; 32];

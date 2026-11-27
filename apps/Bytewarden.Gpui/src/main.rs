@@ -103,6 +103,7 @@ struct VaultPreview {
     lock_queued: bool,
     clone_pending: bool,
     closing: bool,
+    started_hidden: bool,
     generator: Generator,
     favicon_cache: favicon::FaviconCache,
     tray: Option<tray::Tray>,
@@ -278,6 +279,7 @@ impl VaultPreview {
             lock_queued: false,
             clone_pending: false,
             closing: false,
+            started_hidden: false,
             generator: Generator::new(cx),
             favicon_cache: favicon::FaviconCache::default(),
             tray: None,
@@ -325,6 +327,20 @@ impl VaultPreview {
         window
             .observe_window_appearance(|window, _| window.refresh())
             .detach();
+        #[cfg(not(test))]
+        cx.observe_window_activation(window, |this, window, cx| {
+            if !window.is_window_active() {
+                return;
+            }
+            this.started_hidden = false;
+            if this.client.ready()
+                && this.client.state() == bytewarden_core::desktop::Session::Locked
+                && this.client.form.is_none()
+            {
+                this.open_unlock(window, cx);
+            }
+        })
+        .detach();
         let weak = cx.weak_entity();
         window.on_window_should_close(cx, move |window, cx| {
             weak.update(cx, |this, cx| {
@@ -2192,6 +2208,9 @@ fn main() {
                 let guard = single_instance_for_window.borrow_mut().take();
                 view.update(cx, |this, _cx| {
                     this.single_instance = guard;
+                    this.started_hidden = startup_requested
+                        && this.settings.start_hidden
+                        && this.settings.keep_in_tray;
                     if this.settings.keep_in_tray {
                         let weak = weak.clone();
                         let app = app.clone();
