@@ -400,9 +400,24 @@ internal enum AuthStatus : uint
     AccountLimitReached = 8,
     InvalidTwoFactorCode = 9,
     RateLimited = 10,
+    NetworkError = 11,
+    ServerError = 12,
+    AuthenticationRejected = 13,
 }
 
 internal readonly record struct AuthResult(AuthStatus Status, uint AvailableTwoFactorMethods);
+
+internal static class AuthStatusMessages
+{
+    internal static string LoginStatusMessage(AuthStatus status) => status switch
+    {
+        AuthStatus.NetworkError => "无法连接服务器或网络中断，请检查网络、代理和服务器地址后重试。",
+        AuthStatus.ServerError => "服务器返回了无法识别的响应，请确认服务器兼容性后重试。",
+        AuthStatus.AuthenticationRejected => "服务器未接受此次身份验证。请核对账户信息、二步验证和服务器配置后重试。",
+        AuthStatus.Failed => "登录未成功，原因无法确定。请检查账户信息和服务器配置后重试。",
+        _ => "登录未成功。",
+    };
+}
 
 internal enum VaultSessionState : byte
 {

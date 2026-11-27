@@ -6,7 +6,7 @@
 
 [![切换到简体中文](https://img.shields.io/badge/README-%E7%AE%80%E4%BD%93%E4%B8%AD%E6%96%87-005AA4?style=flat-square)](./README.md) · **English**
 
-Bytewarden is an unofficial, Bitwarden-compatible Windows desktop client with a Rust core and a native WinUI 3 interface. The project aims for feature parity with the official desktop client before tackling Firefox integration.
+Bytewarden is an unofficial, Bitwarden-compatible Windows desktop client with a Rust core. WinUI 3 powers the current functional preview. A separate [native GPUI desktop preview](apps/Bytewarden.Gpui/README.md) explores a redesigned interface rendered in Rust without a WebView. It now connects to the shared Rust core for sign-in, sync and browsing, but [feature migration and validation](docs/GPUI-MIGRATION.md) are still in progress. It does not replace the WinUI app yet. The project aims for desktop parity before tackling Firefox integration.
 
 [![Windows Validation](https://img.shields.io/github/actions/workflow/status/ZHT0711/Bytewarden/windows.yml?style=for-the-badge&logo=github&label=Windows%20CI)](https://github.com/ZHT0711/Bytewarden/actions/workflows/windows.yml)
 [![GPL-3.0](https://img.shields.io/github/license/ZHT0711/Bytewarden.svg?style=for-the-badge)](LICENSE)

@@ -103,7 +103,10 @@ internal static class RememberedTwoFactorChecks
             case "reuse":
                 Require(Login(device: Guid.NewGuid().ToString("D")).Status == AuthStatus.TwoFactorRequired, "different device still requires 2FA");
                 if (peer != address) Require(Login(server: peer).Status == AuthStatus.TwoFactorRequired, "same email on different server still requires 2FA");
-                Require(Login(password: "wrong synthetic password").Status == AuthStatus.Failed && !RustCore.IsAuthenticated, "remembered token never replaces a valid master password");
+                var rejectedPassword = Login(password: "wrong synthetic password");
+                Require(rejectedPassword.Status == AuthStatus.AuthenticationRejected,
+                    $"wrong-password authentication retains its typed rejection ({rejectedPassword.Status})");
+                Require(!RustCore.IsAuthenticated, "remembered token never replaces a valid master password");
                 Require(Login(device: "{" + Device.ToUpperInvariant() + "}").Status == AuthStatus.Authenticated,
                     "equivalent UUID spellings reuse the same canonical device-bound credential");
                 RustCore.Logout();

@@ -6,7 +6,7 @@
 
 **简体中文（默认）** · [![Switch to English](https://img.shields.io/badge/README-English-005AA4?style=flat-square)](README.en.md)
 
-以 Rust 为安全与业务核心、以 WinUI 3 为 Windows 桌面界面的 Bitwarden 兼容客户端重写工程[[免责声明](#免责声明)]。目标是逐项复刻官方最新 MSIX 桌面端，完成桌面端后再优化 Firefox 扩展联动。
+以 Rust 为安全与业务核心的 Bitwarden 兼容客户端重写工程[[免责声明](#免责声明)]。现有功能由 WinUI 3 预览版提供；[GPUI 原生桌面预览](apps/Bytewarden.Gpui/README.md) 不使用 WebView，已接入 Rust 核心的登录、同步和浏览流程；[功能迁移与验收](docs/GPUI-MIGRATION.md) 仍在进行，尚未替代 WinUI 版。目标是逐项对照官方桌面端，之后再优化 Firefox 扩展联动。
 
 ---
 

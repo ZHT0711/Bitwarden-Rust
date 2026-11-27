@@ -16,8 +16,8 @@ use bitwarden_generators::{
 use bitwarden_vault::{CipherId, FolderId};
 use bw_sdk_core::{
     auth::login::{
-        LoginError, PasswordLoginRequest, PasswordLoginUnlockData, TwoFactorProvider,
-        TwoFactorRequest,
+        LoginError, PasswordLoginRequest, PasswordLoginUnlockData, PreloginError,
+        TwoFactorProvider, TwoFactorRequest,
     },
     client::{ClientSettings, DeviceType},
     key_management::MasterPasswordAuthenticationData,
@@ -28,6 +28,10 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 use zeroize::{Zeroize, Zeroizing};
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod auth_status_tests;
+pub mod desktop;
+mod desktop_transfer;
 mod export;
 #[cfg(windows)]
 mod hello;
@@ -61,6 +65,9 @@ const ACCOUNT_ALREADY_SIGNED_IN: u32 = 7;
 const ACCOUNT_LIMIT_REACHED: u32 = 8;
 const INVALID_TWO_FACTOR_CODE: u32 = 9;
 const AUTH_RATE_LIMITED: u32 = 10;
+const AUTH_NETWORK_ERROR: u32 = 11;
+const AUTH_SERVER_ERROR: u32 = 12;
+const AUTH_REJECTED: u32 = 13;
 const TWO_FACTOR_MASK_SHIFT: u32 = 8;
 const TWO_FACTOR_AUTHENTICATOR: u32 = 1 << 0;
 const TWO_FACTOR_EMAIL: u32 = 1 << 1;
@@ -648,34 +655,120 @@ fn login_status(
             let methods = advertised_two_factor_methods(&providers);
             TWO_FACTOR_REQUIRED | (methods << TWO_FACTOR_MASK_SHIFT)
         }
-        Err(LoginError::IdentityFail(error))
-            if error.to_string().trim() == "new device verification required" =>
+        Err(error) => login_error_status(&error),
+    }
+}
+
+fn login_error_status(error: &LoginError) -> u32 {
+    match error {
+        LoginError::IdentityFail(error)
+            if error.error_model.message.trim() == "new device verification required"
+                || error.error_description.trim() == "new device verification required" =>
         {
             DEVICE_VERIFICATION_REQUIRED
         }
-        Err(LoginError::IdentityFail(error))
-            if error.to_string().trim() == "invalid new device otp" =>
+        LoginError::IdentityFail(error)
+            if error.error_model.message.trim() == "invalid new device otp"
+                || error.error_description.trim() == "invalid new device otp" =>
         {
             DEVICE_VERIFICATION_INVALID
         }
-        Err(LoginError::IdentityFail(error))
-            if error.error.eq_ignore_ascii_case("TooManyRequests") =>
-        {
+        LoginError::IdentityFail(error) if error.error.eq_ignore_ascii_case("TooManyRequests") => {
             AUTH_RATE_LIMITED
         }
-        Err(LoginError::Api(bw_sdk_core::ApiError::Response(error)))
-            if error.status.as_u16() == 429 =>
-        {
-            AUTH_RATE_LIMITED
-        }
-        Err(LoginError::IdentityFail(error))
+        LoginError::IdentityFail(error)
             if is_invalid_two_factor_message(&error.error_model.message)
                 || is_invalid_two_factor_message(&error.error_description) =>
         {
             INVALID_TWO_FACTOR_CODE
         }
-        Err(_) => AUTH_FAILED,
+        // invalid_grant rejects authentication, but does not prove a wrong password.
+        LoginError::IdentityFail(error) if error.error.eq_ignore_ascii_case("invalid_grant") => {
+            AUTH_REJECTED
+        }
+        LoginError::AuthenticationFailed => AUTH_REJECTED,
+        LoginError::IdentityFail(_) => AUTH_SERVER_ERROR,
+        LoginError::Api(error) => auth_api_error_status(error),
+        LoginError::Prelogin(error) => auth_prelogin_error_status(error),
+        LoginError::Serde(_)
+        | LoginError::MissingField(_)
+        | LoginError::JwtTokenParse(_)
+        | LoginError::JwtTokenMissingEmail
+        | LoginError::InvalidResponse => AUTH_SERVER_ERROR,
+        _ => AUTH_FAILED,
     }
+}
+
+fn auth_prelogin_error_status(error: &PreloginError) -> u32 {
+    match error {
+        PreloginError::Api(error) => auth_api_error_status(error),
+        PreloginError::MissingField(_) => AUTH_SERVER_ERROR,
+    }
+}
+
+// Classify only typed metadata. Never format, log, or return an SDK error/body/URL.
+fn auth_api_error_status(error: &bw_sdk_core::ApiError) -> u32 {
+    use bw_sdk_core::ApiError;
+    match error {
+        ApiError::Reqwest(error) => auth_reqwest_error_status(error),
+        ApiError::ReqwestMiddleware(reqwest_middleware::Error::Reqwest(error)) => {
+            auth_reqwest_error_status(error)
+        }
+        ApiError::ReqwestMiddleware(reqwest_middleware::Error::Middleware(_)) => AUTH_FAILED,
+        ApiError::Response(response) => auth_http_status(response.status),
+        ApiError::Serde(_) => AUTH_SERVER_ERROR,
+        ApiError::Io(error) => match error.kind() {
+            std::io::ErrorKind::TimedOut => AUTH_TIMED_OUT,
+            std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::NotConnected
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::UnexpectedEof => AUTH_NETWORK_ERROR,
+            std::io::ErrorKind::InvalidData => AUTH_SERVER_ERROR,
+            _ => AUTH_FAILED,
+        },
+    }
+}
+
+fn auth_http_status(status: reqwest::StatusCode) -> u32 {
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        AUTH_RATE_LIMITED
+    } else {
+        // An HTTP error alone does not establish that the credentials were rejected.
+        AUTH_SERVER_ERROR
+    }
+}
+
+fn auth_reqwest_error_status(error: &reqwest::Error) -> u32 {
+    if let Some(status) = error.status() {
+        auth_http_status(status)
+    } else if error.is_timeout() {
+        AUTH_TIMED_OUT
+    } else if error.is_decode() {
+        if reqwest_error_has_incomplete_http_source(error) {
+            AUTH_NETWORK_ERROR
+        } else {
+            AUTH_SERVER_ERROR
+        }
+    } else if error.is_connect() || error.is_request() || error.is_body() {
+        // DNS, TLS/connect and request sending can fail before a usable response exists.
+        AUTH_NETWORK_ERROR
+    } else {
+        AUTH_FAILED
+    }
+}
+
+fn reqwest_error_has_incomplete_http_source(error: &reqwest::Error) -> bool {
+    use std::error::Error as _;
+    let mut source = error.source();
+    while let Some(current) = source {
+        if let Some(hyper) = current.downcast_ref::<hyper::Error>() {
+            return hyper.is_incomplete_message() || hyper.is_closed();
+        }
+        source = current.source();
+    }
+    false
 }
 
 fn login_status_ref_is_invalid_code(error: &LoginError) -> bool {
@@ -1089,7 +1182,15 @@ pub unsafe extern "C" fn bw_auth_send_two_factor_email(
             ));
             let status = match response {
                 Ok(Ok(())) => AUTHENTICATED as u8,
-                Ok(Err(_)) => AUTH_FAILED as u8,
+                Ok(Err(error)) => match error {
+                    bw_sdk_core::auth::login::TwoFactorEmailError::Api(error) => {
+                        auth_api_error_status(&error) as u8
+                    }
+                    bw_sdk_core::auth::login::TwoFactorEmailError::Prelogin(error) => {
+                        auth_prelogin_error_status(&error) as u8
+                    }
+                    _ => AUTH_FAILED as u8,
+                },
                 Err(RequestError::TimedOut) => AUTH_TIMED_OUT as u8,
                 Err(RequestError::Cancelled) => AUTH_CANCELLED as u8,
             };
@@ -1158,7 +1259,7 @@ pub unsafe extern "C" fn bw_auth_resend_new_device_verification(
                 Ok(Ok(kdf)) => kdf,
                 Err(RequestError::TimedOut) => return Ok(AUTH_TIMED_OUT as u8),
                 Err(RequestError::Cancelled) => return Ok(AUTH_CANCELLED as u8),
-                Ok(Err(_)) => return Ok(AUTH_FAILED as u8),
+                Ok(Err(error)) => return Ok(auth_prelogin_error_status(&error) as u8),
             };
             let auth_data = MasterPasswordAuthenticationData::derive(&password, &kdf, &email)
                 .map_err(|_| ())?;
@@ -1187,7 +1288,11 @@ pub unsafe extern "C" fn bw_auth_resend_new_device_verification(
                 });
             match runtime.block_on(auth_request::run(request_id, request.send())) {
                 Ok(Ok(response)) if response.status().is_success() => Ok(AUTHENTICATED as u8),
-                Ok(Ok(_)) | Ok(Err(_)) => Ok(AUTH_FAILED as u8),
+                Ok(Ok(response)) => Ok(auth_http_status(response.status()) as u8),
+                Ok(Err(reqwest_middleware::Error::Reqwest(error))) => {
+                    Ok(auth_reqwest_error_status(&error) as u8)
+                }
+                Ok(Err(reqwest_middleware::Error::Middleware(_))) => Ok(AUTH_FAILED as u8),
                 Err(RequestError::TimedOut) => Ok(AUTH_TIMED_OUT as u8),
                 Err(RequestError::Cancelled) => Ok(AUTH_CANCELLED as u8),
             }

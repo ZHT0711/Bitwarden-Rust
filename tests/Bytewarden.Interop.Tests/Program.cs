@@ -42,6 +42,7 @@ void Check(bool result, string name)
 }
 
 VaultTimeoutChecks.Run(Check);
+AuthStatusChecks.Run(Check);
 GeneratorSettingsChecks.Run(Check);
 VaultQueryChecks.Run(Check);
 SearchDispatchChecks.Run(Check);

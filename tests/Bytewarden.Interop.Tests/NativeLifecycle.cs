@@ -458,8 +458,10 @@ internal static class NativeLifecycle
                 CreateNote("Primary account item");
                 check(LoginAt(address, " TEST@BITWARDEN.COM ") == AuthStatus.AccountAlreadySignedIn,
                     "a duplicate account is rejected on the same server");
-                check(LoginAt(otherAddress, "unregistered@example.invalid") == AuthStatus.Failed &&
-                    RustCore.GetAccounts().Single().Id == first.Id && HasItem("Primary account item"),
+                var rejectedPrelogin = LoginAt(otherAddress, "unregistered@example.invalid");
+                check(rejectedPrelogin == AuthStatus.ServerError,
+                    $"a refused second prelogin preserves its typed server failure ({rejectedPrelogin})");
+                check(RustCore.GetAccounts().Single().Id == first.Id && HasItem("Primary account item"),
                     "a failed second login preserves the active account and cache");
 
                 check(LoginAt(otherAddress) == AuthStatus.Authenticated, "the same email on another server logs in independently");

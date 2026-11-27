@@ -1,0 +1,41 @@
+[package]
+name = "bytewarden-gpui-preview"
+version = "0.2.0"
+edition = "2024"
+license = "GPL-3.0-only"
+
+[dependencies]
+gpui = { version = "=0.2.2", default-features = false, features = ["windows-manifest"] }
+futures = "=0.3.34"
+image = { version = "=0.25.10", default-features = false, features = ["bmp", "gif", "jpeg", "png", "tiff", "webp"] }
+bytewarden-core = { path = "../../crates/bytewarden-core" }
+zeroize = "1"
+uuid = { version = "1", features = ["v4"] }
+unicode-segmentation = "1"
+raw-window-handle = "0.6"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[dev-dependencies]
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Registry", "Win32_Storage_FileSystem", "Win32_UI_WindowsAndMessaging"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Graphics_Gdi", "Win32_Security", "Win32_System_StationsAndDesktops", "Win32_System_Threading"] }
+
+[features]
+test-support = ["gpui/test-support"]
+
+[workspace]
+
+# Cargo only applies patches from the current workspace root. Keep the desktop
+# SDK implementation identical to the DLL built by the parent workspace.
+[patch.crates-io]
+gpui = { path = "../../vendor/gpui-0.2.2" }
+
+[patch."https://github.com/bitwarden/sdk-internal"]
+bitwarden-core = { path = "../../vendor/sdk-internal/crates/bitwarden-core" }
+
+[profile.dev]
+debug = 0

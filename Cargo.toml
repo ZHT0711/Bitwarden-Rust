@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "crates/bytewarden-core",
 ]
-exclude = ["vendor/sdk-internal", "vendor/win_webauthn"]
+exclude = ["apps/Bytewarden.Gpui", "vendor/sdk-internal", "vendor/win_webauthn"]
 
 [workspace.package]
 version = "0.2.0"
@@ -33,7 +33,7 @@ csv = "1.4"
 hmac = "0.13"
 http = "1"
 rand = "0.8"
-reqwest = { version = "0.13", default-features = false, features = ["form", "json", "multipart"] }
+reqwest = { version = "0.13", default-features = false, features = ["form", "json", "multipart", "system-proxy"] }
 reqwest-middleware = { version = "0.5", features = ["form", "json", "multipart"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

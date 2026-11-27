@@ -652,6 +652,8 @@ public sealed partial class MainWindow : Window
                 {
                     AuthStatus.Authenticated => "验证码发送请求已成功。请检查邮箱。",
                     AuthStatus.TimedOut => "服务器响应超时，请检查服务器地址和网络连接后重试。",
+                    AuthStatus.NetworkError => AuthStatusMessages.LoginStatusMessage(result.Status),
+                    AuthStatus.ServerError => AuthStatusMessages.LoginStatusMessage(result.Status),
                     AuthStatus.Cancelled => "请求已取消。",
                     _ => "无法发送验证码。请检查账户信息与网络连接后重试。",
                 };
@@ -678,6 +680,8 @@ public sealed partial class MainWindow : Window
                 {
                     AuthStatus.Authenticated => "已请求重新发送验证码。请检查账户邮箱。",
                     AuthStatus.TimedOut => "服务器响应超时，请检查网络后重试。",
+                    AuthStatus.NetworkError => AuthStatusMessages.LoginStatusMessage(result.Status),
+                    AuthStatus.ServerError => AuthStatusMessages.LoginStatusMessage(result.Status),
                     AuthStatus.Cancelled => "请求已取消。",
                     _ => "无法重新发送验证码。请确认登录信息后重试。",
                 };
@@ -795,9 +799,7 @@ public sealed partial class MainWindow : Window
                     AuthStatus.RateLimited => "服务器暂时限制登录尝试。请等待一段时间，不要连续重试。",
                     AuthStatus.AccountAlreadySignedIn => "该账户已登录，请从账户菜单切换。",
                     AuthStatus.AccountLimitReached => "最多可同时登录 5 个账户，请先退出其中一个。",
-                    AuthStatus.Failed when deviceVerificationRequired && !needsToken => "新设备验证码无效或已过期。请重新输入或重新发送。",
-                    AuthStatus.Failed when allowLocalUnlock => "未能连接账户。请检查主密码或网络；也可选择仅离线解锁。",
-                    _ => "登录失败。请检查账户、主密码、验证码和服务器地址后重试。",
+                    _ => AuthStatusMessages.LoginStatusMessage(result.Status),
                 };
             }
             catch (OperationCanceledException) { statusText.Text = "请求已取消。"; }

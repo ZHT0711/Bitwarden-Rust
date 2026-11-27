@@ -595,7 +595,9 @@ class FixtureHandler(BaseHTTPRequestHandler):
                     if provider == "5":
                         state.remember_attempts += 1
                         if valid_remember and saved is not None and form.get("password", [""])[0] != saved[1]:
-                            self.fail("Username or password is incorrect. Try again.")
+                            self.reply({"error": "invalid_grant", "error_description": "invalid_username_or_password",
+                                        "ErrorModel": {"Message": "Username or password is incorrect. Try again.",
+                                                       "Object": "error"}}, 400)
                             return
                         if valid_remember:
                             state.remember_accepted += 1
@@ -1410,6 +1412,17 @@ def self_test() -> bool:
                                             {"email": PUBLIC_EMAIL, "masterPasswordHash": "synthetic-hash"},
                                             authenticated=False, device_identifier=device_identifier)
             self.assertEqual(status, 200)
+
+        def test_remembered_auth_still_requires_a_matching_password_hash(self):
+            self.state.require_authenticator = True
+            self.state.remembered_two_factor["synthetic-device"] = ("synthetic-token", "expected-hash")
+            form = (b"grant_type=password&username=test%40bitwarden.com&deviceIdentifier=synthetic-device"
+                    b"&twoFactorProvider=5&twoFactorToken=synthetic-token&password=wrong-hash")
+            status, response = self.request("POST", "/identity/connect/token", raw=form, authenticated=False)
+            self.assertEqual(status, 400)
+            self.assertEqual(response["error"], "invalid_grant")
+            self.assertEqual(response["ErrorModel"]["Object"], "error")
+            self.assertEqual(self.state.remember_accepted, 0)
 
         def test_attachment_request_metadata_is_converted_and_preserved(self):
             item = self.create(attachments2={"synthetic-attachment": {"fileName": "encrypted-name", "key": "encrypted-key"}})

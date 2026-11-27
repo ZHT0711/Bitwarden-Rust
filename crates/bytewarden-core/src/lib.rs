@@ -11,5 +11,6 @@ mod storage;
 mod vault;
 
 pub use crypto::{EncryptedSnapshot, LocalKey, LocalKeyDeriver};
+pub use ffi::desktop;
 pub use model::{Cipher, CipherType, Folder, Login, SecureNote, VaultSnapshot};
 pub use storage::{decode_snapshot, encode_snapshot, CoreError, VaultRepository};

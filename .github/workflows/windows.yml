@@ -185,3 +185,93 @@ jobs:
           name: Bytewarden-unsigned-msix-x64
           path: ${{ steps.preview.outputs.path }}
           if-no-files-found: error
+  gpui-preview:
+    runs-on: windows-2025
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Prepare Rust and Windows shader compiler
+        id: rust-toolchain
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          rustup update stable --no-self-update
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          rustup component add rustfmt clippy
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $version = (& rustc --version).Trim()
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $version = $version -replace '[^A-Za-z0-9._-]', '_'
+          "version=$version" | Add-Content -LiteralPath $env:GITHUB_OUTPUT
+          $roots = @(
+            "${env:ProgramFiles(x86)}\Windows Kits\10\bin",
+            "$env:ProgramFiles\Windows Kits\10\bin"
+          )
+          $fxc = @(
+            foreach ($root in $roots) {
+              if (Test-Path -LiteralPath $root) {
+                Get-ChildItem -LiteralPath $root -Filter fxc.exe -File -Recurse -ErrorAction SilentlyContinue |
+                  Where-Object { $_.FullName -match '[\\/]x64[\\/]fxc\.exe$' }
+              }
+            }
+          ) | Sort-Object FullName -Descending | Select-Object -First 1
+          if ($null -eq $fxc) { throw 'Windows SDK x64 fxc.exe was not found.' }
+          "GPUI_FXC_PATH=$($fxc.FullName)" | Add-Content -LiteralPath $env:GITHUB_ENV
+      - name: Restore GPUI Cargo cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        continue-on-error: true
+        timeout-minutes: 5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            apps/Bytewarden.Gpui/target
+          key: ${{ runner.os }}-${{ runner.arch }}-gpui-${{ steps.rust-toolchain.outputs.version }}-${{ hashFiles('Cargo.lock', 'apps/Bytewarden.Gpui/Cargo.toml', 'vendor/gpui-0.2.2/**/*.rs', 'vendor/gpui-0.2.2/build.rs') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-gpui-${{ steps.rust-toolchain.outputs.version }}-
+          enableCrossOsArchive: false
+          fail-on-cache-miss: false
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: 5
+      - name: Format GPUI workspace
+        shell: pwsh
+        run: |
+          cargo fmt --manifest-path apps/Bytewarden.Gpui/Cargo.toml --all -- --check
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Test GPUI application
+        shell: pwsh
+        run: |
+          cargo test --locked --manifest-path apps/Bytewarden.Gpui/Cargo.toml --features test-support
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Lint GPUI application
+        shell: pwsh
+        run: |
+          cargo clippy --locked --manifest-path apps/Bytewarden.Gpui/Cargo.toml --all-targets --features test-support -- -D warnings
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Build and stage GPUI x64 preview
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo build --locked --release --manifest-path apps/Bytewarden.Gpui/Cargo.toml
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $binary = 'apps/Bytewarden.Gpui/target/release/bytewarden-gpui-preview.exe'
+          if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) { throw 'GPUI release executable was not produced.' }
+          $stage = Join-Path $env:GITHUB_WORKSPACE 'work/gpui-release'
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item -LiteralPath $binary -Destination (Join-Path $stage 'Bytewarden-GPUI-Preview.exe')
+          Copy-Item -LiteralPath 'apps/Bytewarden.Gpui/README.md' -Destination (Join-Path $stage 'README.md')
+          $hash = (Get-FileHash -LiteralPath (Join-Path $stage 'Bytewarden-GPUI-Preview.exe') -Algorithm SHA256).Hash
+          $size = (Get-Item -LiteralPath (Join-Path $stage 'Bytewarden-GPUI-Preview.exe')).Length
+          if ($size -lt 1048576) { throw "Unexpectedly small GPUI executable: $size bytes." }
+          Compress-Archive -LiteralPath (Join-Path $stage 'Bytewarden-GPUI-Preview.exe'), (Join-Path $stage 'README.md') -DestinationPath 'work/Bytewarden-GPUI-Preview-windows-x64.zip' -CompressionLevel Optimal -Force
+          @('## GPUI Windows x64 preview', "- Executable SHA-256: $hash", "- Executable size: $size bytes", '- Unit tests and strict Clippy completed in this job.') |
+            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+          "path=$env:GITHUB_WORKSPACE\work\Bytewarden-GPUI-Preview-windows-x64.zip" | Add-Content -LiteralPath $env:GITHUB_OUTPUT
+        id: gpui-preview
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: Bytewarden-GPUI-Preview-windows-x64
+          path: ${{ steps.gpui-preview.outputs.path }}
+          if-no-files-found: error
