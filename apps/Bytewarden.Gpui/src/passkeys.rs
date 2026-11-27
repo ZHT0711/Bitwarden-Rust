@@ -63,13 +63,13 @@ impl PasskeyState {
                 "需在系统开启",
                 "已向 Windows 注册，但尚未在「Windows 设置 → 账户 → 通行密钥」中开启 Bytewarden。",
             ),
-            "notRegistered" => (
+            "notRegistered" | "unregistered" => (
                 "未注册",
                 "点击右侧「注册到 Windows」后，即可在系统通行密钥设置中启用 Bytewarden。",
             ),
-            "unsupported" => (
-                "系统不支持",
-                "当前 Windows 版本未提供第三方通行密钥提供程序接口（需 Windows 11 24H2 / 25H2 及以上）。",
+            "unsupported" | "unavailable" => (
+                "不可用",
+                "当前运行环境暂不支持系统通行密钥（需通过 MSIX 应用包运行于 Windows 11 24H2/25H2 及以上）。",
             ),
             _ => ("检测中", "正在读取 Windows 通行密钥提供程序状态…"),
         }
@@ -288,7 +288,14 @@ impl VaultPreview {
                             }
                         }
                         Err(err) => {
-                            this.client.notice = crate::client::status_text(&err);
+                            let detail = crate::client::status_text(&err);
+                            this.client.notice = detail.clone();
+                            this.ui.toast.show(
+                                crate::ui::toast::ToastKind::Error,
+                                format!("注册失败：{detail}"),
+                                std::time::Instant::now(),
+                                this.animate,
+                            );
                         }
                     }
                     cx.notify();
