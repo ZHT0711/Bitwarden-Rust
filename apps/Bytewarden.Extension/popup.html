@@ -10,7 +10,10 @@
   <div class="app">
     <header class="topbar">
       <div class="brand">
-        <img src="icons/icon.svg" alt="" class="brand-logo" />
+        <picture>
+          <source srcset="icons/mark-light-64.png" media="(prefers-color-scheme: dark)" />
+          <img src="icons/mark-dark-64.png" alt="" class="brand-logo" />
+        </picture>
         <div class="brand-text">
           <span class="brand-title">Bytewarden</span>
           <span id="status-sub" class="brand-sub">正在连接桌面端…</span>

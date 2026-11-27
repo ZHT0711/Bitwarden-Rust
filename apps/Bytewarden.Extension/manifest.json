@@ -13,11 +13,11 @@
     }
   },
   "icons": {
-    "16": "icons/icon.svg",
-    "32": "icons/icon.svg",
-    "48": "icons/icon.svg",
-    "96": "icons/icon.svg",
-    "128": "icons/icon.svg"
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "96": "icons/icon-96.png",
+    "128": "icons/icon-128.png"
   },
   "permissions": [
     "nativeMessaging",
@@ -38,9 +38,21 @@
     "default_title": "Bytewarden",
     "default_popup": "popup.html",
     "default_icon": {
-      "16": "icons/icon.svg",
-      "32": "icons/icon.svg"
-    }
+      "16": "icons/mark-dark-16.png",
+      "32": "icons/mark-dark-32.png"
+    },
+    "theme_icons": [
+      {
+        "light": "icons/mark-light-16.png",
+        "dark": "icons/mark-dark-16.png",
+        "size": 16
+      },
+      {
+        "light": "icons/mark-light-32.png",
+        "dark": "icons/mark-dark-32.png",
+        "size": 32
+      }
+    ]
   },
   "content_scripts": [
     {

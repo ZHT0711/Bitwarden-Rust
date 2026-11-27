@@ -15,6 +15,10 @@
   const USERNAME_HINTS = /user|email|login|account|acct|phone|mobile|id|账号|邮箱|手机|用户名/i;
   const OTP_HINTS = /otp|totp|2fa|mfa|token|auth.?code|verify|verification|验证码|动态码|安全码/i;
   const SEARCH_OR_NON_LOGIN = /search|query|coupon|promo|captcha|搜索/i;
+  const MARK_DARK_URI =
+    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAOkSURBVFhH1Zfbq5ZVEIefLAsysxOJYaYVSWejzG4z8CLvuvBAieBNRBLddLyLbqIIvZH+gCgqLDUrAs00wRJStEhLO3vIrCQrUfOieGRGZq/e79vuLUL+YPGtvdbMrHnXmvnNbDgDcRZwfswnAVfH3DX3Thtuid+pwFfA9cAG4JOYuzatkT1ljADOjvk2YDXwNvAPcDh+6/wdYBXwZdF3DBvXAtuB54Bfy4E5FgIPd6z/FjrqXtcaPRlcCtwB3Nlh/BCwBvgFmA/MC+dc+6tD3me5HbisPaQffEOVfy+G9gNPAxNC5qY4UIdujrUrgaeAn4te2phS7PeE73VDfPmfxcgy4IpWGLgqRotxwFtFX0e9CW33jYmRwM7mCl9qhYaAJY2tr+OMvjB4UmFluzkMrCj2nm83K3z3rfHWCv8EXFj2JZlZwGPxzl3j8ZCphKSNvWHTwP0MuLXsD8C6EPwC+BG4uOzJdOa7BuSDD+L3DeA14HVgC3AUGFX0LgJ+CJvaXl/2TuAc4G7gvWA0YVq9UmQ0ui9Yr8I0fAh4ALgN2AOMLvsvA2tjLi+8D0yPM09gDLArPDwIvBrX9WyR0QGfRSpOeNDfoXcEmAl81zjwTNjSpraV1UlvZgDM7xSQSk3Fii4HLog1dXzne4HvGweEOn69cn8AE5v943T5IXAshB5tBeIwn0BWq2vpgHvpQA3exCMh5xk+yeS6qQMGYDrwRN0MnBuHZcUT1QGvdUYE3HlFJmH2pAMftQ4IaTSfYFG7GfgUeLL8rQOZYhLWg8Cmsl/xYnmC/7BnDUJHRm2L2RFsGUA6oLyl2ubEKji30UmYVWl/dxuEpsQ9wPIQsMCMrQIFS4Ouc/+FKEzejjWjC5eXSikzetaANExUL+tVtzC3LcELgPvi9kyzXpAhB7vd41T8eeSsgh5gX9ALUu43Mea0mwWXFJv+ekbf0lyLkdcl5IBKywk5v6sRVdb4EPmsjr7FSHSVYznc3D5QOuB+MBiVVSf5P8eg5dhm4cbI9WxIvgXGR3rd3yp0wOfYHDoeqA0D8K6w3bchSdhiqSgvWBU1qjGjXL7oBQ99s8SFpJTc0rMEd8EGUv72JuoV5teYLYuDMR3OXattXA6/XFtDakoTtuWWZ4Onqy3vNSQkddQdVlue8J+SJAyrmV/pPx8eIiPmgTl/N5qU7CnUz39sThmZu5ZpM8WA+hjYGN3ujrjuKntaYBRny2VaXhNz104qwv9X+BenKDBoqI0KaQAAAABJRU5ErkJggg==";
+  const MARK_LIGHT_URI =
+    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAP4SURBVFhH1Zfbq1VVFMbNbtDJ1AyjSMuME6lpYXV6NaGHeuuhjJSglwgjerHUN/EljKiX8A+IIqXSSkUo7SJYgUoXvKWmXdTKirQkTfiN+Jbf3I013ft0RAX7YLHnnvMblzXnmGOMNWzY/w0RcQFwmccTgBs11pzWav5ZAzDVv3cCO4FbgI3Apx5rbiBzzxgRMTwiLtQY2Aa8D7wTEQH8pd88BlYB7wE7kvzwWu+QAdwEbAeeA34pBpPhJ4G5XeZ/tYxk+2u9/4mIGAPcAdzVRflRYD1wKCIeBebIOc/92YU/AEwHrqrt9ITO0MK/J0U/AwuB8eZMkUE7dKvmImIcsAD4Kck1OoDbajunQOcFTNKbA38kJSuAa7vwr9dTzwPXAG8leTmqnZg0aExExMXAriJo4aU1b6gAXq507ZaNmteCgicJvFuvny6At5O+JfV6Bzp34AudtckHI+KKsu4E9CAwz+fc7XlGnJyQpAM4YJ2HgC8jYlrHcCLKiY9M3Ap8B4wu68p0uu9S4Hywzr/LgdcjYhnwOXA8IvqS3lHAt9Jp3Rtkq4WIuAiYAaxRRtOcr9WridMH/Kisl2V9DZ8AZgO3A/uBEWn9FeBDj5UX1gL3yGZHSUSMBL63h4eB17xdixNHDhxUKi5zMgT8bbljwP3A3sqBRdYlnYfN3a+dKZxCHJ8IO3QV83oPBy53rEjmAHAfsC87YJ7qx3bzjgA35HUR+iPiA+CESU+3CP8a0xFMr+aKA1prHMjBm7hPmXdCRxIRN+fFfgVgcSAinm1Jn+Rc4h1oKp7nsgM6+3sVcBFxaVu64c5LDnzcckBwGi1H8GJr0QA2AfPTfzlQrthS4HFgc1vqJIAXyhGckj1zEJrURG0N4CEFWwkgOWD+NjcnqoIP13KCblXS/0MrCHUlImImsNKEoxFxdUuDAbzhdN2sA8+7MGl3VtR8ARhbKqUz48zWNUzE7GVnq2v4bqsEPwY8oN3TNat5BcqQSa8CsKY0JKXir1znRVQDMqbmFTgt7/Ezq14vAK5MOpUPZKN3aa6Kkbar5IBOWi5Qzu/WiIrr+NC4OVbr612MhB7lWHVByeW30gEPBgejuJJp8n/SNXg5dkMy2c1D05AA3wDX6XoBj9QyNXQcwBbLyKB0qCG5W7oHbUgK1GJZUHVBVVFKdyvKlS9qfoGNvlniwlWwyS1dS3AvqIF0/h7IWyj4bVQpX1LG1KOx5zptXOLrzaVr6E1pgdtyfXAs6daW94ITkmQke/pteYE+SkrCcC3XW66yEWXEYrAZA6vdpDQ9heWbD5szRrm77ph3OVg/AT5zJ/21tjtzzwn8udW0XLqWwETP9w0pws83/AOJfhr/H4wopQAAAABJRU5ErkJggg==";
 
   function isVisibleControl(el) {
     if (!el || !(el instanceof HTMLInputElement || el instanceof HTMLSelectElement)) return false;
@@ -217,7 +221,7 @@
         border-color: rgba(139, 92, 246, 0.65);
         transform: scale(1.05);
       }
-      .bw-badge svg { width: 14px; height: 14px; }
+      .bw-badge img { width: 15px; height: 15px; display: block; }
       .bw-popover, .bw-save-banner {
         position: fixed;
         border-radius: 10px;
@@ -418,7 +422,11 @@
     btn.type = "button";
     btn.className = "bw-badge";
     btn.title = "使用 Bytewarden 自动填充 (Alt+Shift+L)";
-    btn.innerHTML = `<svg viewBox="0 0 64 64" fill="none"><path d="M32 10L50 18V32C50 44.4 42.3 55.2 32 58.6C21.7 55.2 14 44.4 14 32V18L32 10Z" stroke="#8B5CF6" stroke-width="5" stroke-linejoin="round"/><path d="M32 17V51.8C39.2 48.8 44 41 44 32V22L32 17Z" fill="#8B5CF6"/></svg>`;
+    const isDarkPage = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+    const iconImg = document.createElement("img");
+    iconImg.src = isDarkPage ? MARK_LIGHT_URI : MARK_DARK_URI;
+    iconImg.alt = "";
+    btn.appendChild(iconImg);
     btn.addEventListener("mousedown", (e) => {
       e.preventDefault();
       e.stopPropagation();
