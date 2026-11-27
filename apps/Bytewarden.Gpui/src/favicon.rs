@@ -316,6 +316,7 @@ impl FaviconCache {
                 let (sender, receiver) = futures::channel::oneshot::channel();
                 std::thread::Builder::new()
                     .name("bytewarden-website-icon".into())
+                    .stack_size(256 * 1024)
                     .spawn(move || {
                         let _permit = permit;
                         let result = desktop::fetch_website_icon(&host, server_mode, &server_url)

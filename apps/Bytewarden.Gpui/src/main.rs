@@ -1750,32 +1750,35 @@ impl Render for VaultPreview {
             .capture_key_down(cx.listener(|this, _, _, cx| this.record_vault_activity(cx)))
             .capture_any_mouse_down(cx.listener(|this, _, _, cx| this.record_vault_activity(cx)))
             .on_scroll_wheel(cx.listener(|this, _, _, cx| this.record_vault_activity(cx)))
-            // Resizable Vault List Splitter drag handling.
-            .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
-                if this.ui.resizing_list {
-                    let delta = f32::from(event.position.x) - this.ui.resize_origin_x;
-                    let next = (this.ui.resize_start_width + delta)
-                        .clamp(ui::tokens::size::LIST_MIN, ui::tokens::size::LIST_MAX);
-                    if (next - this.ui.list_width).abs() > 0.5 {
-                        this.ui.list_width = next;
-                        cx.notify();
-                    }
-                }
-            }))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
+            // Resizable Vault List Splitter drag handling (mounted only while actively dragging
+            // so routine mouse movement across the window dispatches zero root entity updates).
+            .when(self.ui.resizing_list, |root| {
+                root.on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
                     if this.ui.resizing_list {
-                        this.ui.resizing_list = false;
-                        if (this.settings.list_width - this.ui.list_width).abs() > 1. {
-                            this.settings.list_width = this.ui.list_width;
-                            this.save_settings(cx);
-                        } else {
+                        let delta = f32::from(event.position.x) - this.ui.resize_origin_x;
+                        let next = (this.ui.resize_start_width + delta)
+                            .clamp(ui::tokens::size::LIST_MIN, ui::tokens::size::LIST_MAX);
+                        if (next - this.ui.list_width).abs() > 0.5 {
+                            this.ui.list_width = next;
                             cx.notify();
                         }
                     }
-                }),
-            )
+                }))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        if this.ui.resizing_list {
+                            this.ui.resizing_list = false;
+                            if (this.settings.list_width - this.ui.list_width).abs() > 1. {
+                                this.settings.list_width = this.ui.list_width;
+                                this.save_settings(cx);
+                            } else {
+                                cx.notify();
+                            }
+                        }
+                    }),
+                )
+            })
             .on_action(|_: &NextInput, window, _| window.focus_next())
             .on_action(|_: &PrevInput, window, _| window.focus_prev())
             .on_action(

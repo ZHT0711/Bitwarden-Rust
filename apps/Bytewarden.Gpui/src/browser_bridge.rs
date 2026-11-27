@@ -144,6 +144,26 @@ pub fn registrable_domain(host: &str) -> &str {
     &host[byte_offset..]
 }
 
+/// Zero-allocation ASCII case-insensitive substring check, falling back to Unicode
+/// lowercasing only when `haystack` contains non-ASCII characters (`needle_lower` is already lowercase).
+#[inline]
+fn contains_ignore_case(haystack: &str, needle_lower: &str) -> bool {
+    if needle_lower.is_empty() {
+        return true;
+    }
+    if haystack.len() < needle_lower.len() {
+        return false;
+    }
+    if haystack.is_ascii() && needle_lower.is_ascii() {
+        let nb = needle_lower.as_bytes();
+        return haystack
+            .as_bytes()
+            .windows(nb.len())
+            .any(|win| win.eq_ignore_ascii_case(nb));
+    }
+    haystack.to_lowercase().contains(needle_lower)
+}
+
 /// Score how well a vault item's `website_host` matches the active browser tab host (`0` = no match).
 pub fn domain_match_score(tab_host: &str, item_host: &str, favorite: bool) -> u32 {
     let Some(item_norm) = extract_url_host(item_host).or_else(|| {
@@ -653,7 +673,7 @@ impl VaultPreview {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .trim()
-                    .to_ascii_lowercase();
+                    .to_lowercase();
                 let limit = req
                     .payload
                     .get("limit")
@@ -691,12 +711,12 @@ impl VaultPreview {
                                 }
                             }
                             if !query.is_empty() && results.len() < limit {
-                                let matched = item.name.to_lowercase().contains(&query)
-                                    || item.subtitle.to_lowercase().contains(&query)
+                                let matched = contains_ignore_case(&item.name, &query)
+                                    || contains_ignore_case(&item.subtitle, &query)
                                     || item
                                         .website_host
                                         .as_deref()
-                                        .is_some_and(|h| h.to_ascii_lowercase().contains(&query));
+                                        .is_some_and(|h| contains_ignore_case(h, &query));
                                 if matched {
                                     results.push(BridgeItemSummary::from_item(item));
                                 }
@@ -2017,6 +2037,7 @@ mod win_pipe {
 
             std::thread::Builder::new()
                 .name("bw-browser-bridge".into())
+                .stack_size(256 * 1024)
                 .spawn(move || {
                     let mut ready_signal = Some(ready_tx);
                     let mut own_session = 0u32;
@@ -2116,6 +2137,7 @@ mod win_pipe {
                         let stop_client = stop_flag_bg.clone();
                         std::thread::Builder::new()
                             .name("bw-browser-client".into())
+                            .stack_size(256 * 1024)
                             .spawn(move || {
                                 let read_ev =
                                     OwnedHandle(unsafe { CreateEventW(null(), 1, 0, null()) });
@@ -2269,6 +2291,7 @@ mod win_pipe {
                 let stdout_reader = stdout_mutex.clone();
                 std::thread::Builder::new()
                     .name("bw-relay-reader".into())
+                    .stack_size(192 * 1024)
                     .spawn(move || {
                         let read_ev = OwnedHandle(unsafe { CreateEventW(null(), 1, 0, null()) });
                         if read_ev.0.is_null() {

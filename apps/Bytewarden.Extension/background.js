@@ -11,6 +11,18 @@ const pendingRequests = new Map();
 
 // Ephemeral 45-second pending login capture per tab (auto-purged on timer or vault lock).
 const pendingSaveByTab = new Map();
+// Lightweight 20-second host->count cache to avoid redundant IPC on rapid tab switches.
+const hostMatchCountCache = new Map();
+const BADGE_CACHE_TTL_MS = 20000;
+
+function extractHostFast(rawUrl) {
+  try {
+    const u = new URL(rawUrl);
+    return u.protocol === "http:" || u.protocol === "https:" ? u.hostname.toLowerCase() : "";
+  } catch (_e) {
+    return "";
+  }
+}
 
 let bridgeState = {
   desktopRunning: false,
@@ -131,6 +143,7 @@ function sendNative(type, payload = {}, timeoutMs = 45000) {
 function applyBridgeState(next) {
   const prevSession = bridgeState.session;
   bridgeState = { ...bridgeState, ...next };
+  hostMatchCountCache.clear();
   updateBadgeForActiveTab();
 
   browser.runtime
@@ -168,14 +181,25 @@ async function updateBadgeForActiveTab() {
     }
     const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
     const url = tab && tab.url ? tab.url : "";
-    if (!url.startsWith("http://") && !url.startsWith("https://")) {
+    const host = extractHostFast(url);
+    if (!host) {
       await browser.action.setBadgeText({ text: "" });
       return;
     }
-    const res = await sendNative("query_logins", { url, query: "", limit: 20 }, 2500);
-    const count = res && res.ok && res.data && Array.isArray(res.data.tabMatches)
-      ? res.data.tabMatches.length
-      : 0;
+    const now = Date.now();
+    let count = 0;
+    const cached = hostMatchCountCache.get(host);
+    if (cached && now - cached.ts < BADGE_CACHE_TTL_MS) {
+      count = cached.count;
+    } else {
+      const res = await sendNative("query_logins", { url, query: "", limit: 20 }, 2500);
+      count =
+        res && res.ok && res.data && Array.isArray(res.data.tabMatches)
+          ? res.data.tabMatches.length
+          : 0;
+      if (hostMatchCountCache.size > 64) hostMatchCountCache.clear();
+      hostMatchCountCache.set(host, { count, ts: now });
+    }
     if (count > 0) {
       await browser.action.setBadgeBackgroundColor({ color: "#7C3AED" });
       await browser.action.setBadgeTextColor({ color: "#FFFFFF" });

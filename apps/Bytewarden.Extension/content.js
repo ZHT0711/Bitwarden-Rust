@@ -27,6 +27,15 @@
     return rect.width >= 48 && rect.height >= 18;
   }
 
+  function isLoginEligibleField(el) {
+    if (!(el instanceof HTMLInputElement)) return false;
+    if (el.disabled || el.readOnly || el.type === "hidden") return false;
+    // Run cheap attribute/type checks BEFORE getBoundingClientRect() to avoid forced layout on non-login inputs!
+    if (!isPasswordField(el) && !isLikelyUsernameField(el) && !isOtpField(el)) return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width >= 48 && rect.height >= 18;
+  }
+
   function isPasswordField(el) {
     if (!(el instanceof HTMLInputElement)) return false;
     if (el.type === "password") return true;
@@ -57,14 +66,6 @@
     const scope = el.form || el.closest("form, [role='dialog'], main, body") || document.body;
     const hasPwNearby = Boolean(scope.querySelector('input[type="password"]'));
     return hasPwNearby && (USERNAME_HINTS.test(meta) || type === "email" || meta.trim() === "");
-  }
-
-  function isLoginEligibleField(el) {
-    return (
-      el instanceof HTMLInputElement &&
-      isVisibleControl(el) &&
-      (isPasswordField(el) || isLikelyUsernameField(el) || isOtpField(el))
-    );
   }
 
   function setNativeControlValue(control, value) {
@@ -561,7 +562,7 @@
         renderBadgeForInput(target);
       }
     },
-    true
+    { capture: true, passive: true }
   );
 
   document.addEventListener(

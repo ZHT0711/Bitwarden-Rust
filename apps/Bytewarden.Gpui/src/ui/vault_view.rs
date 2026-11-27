@@ -556,12 +556,13 @@ impl VaultPreview {
         cx: &Context<Self>,
     ) -> Stateful<Div> {
         let pal = theme::palette();
-        let id = item.id.clone();
+        let selection_mode = self.selection.active;
+        let id = selection_mode.then(|| item.id.clone());
         let keyboard_id = id.clone();
         let submit_id = id.clone();
         let restricted = item.restricted;
-        let checked = self.selection.ids.contains(&item.id);
-        let is_selected = if self.selection.active {
+        let checked = selection_mode && self.selection.ids.contains(&item.id);
+        let is_selected = if selection_mode {
             checked
         } else {
             self.selected == Some(index)
@@ -688,16 +689,16 @@ impl VaultPreview {
                     .when(self.selection.active, |r| {
                         r.on_action(cx.listener(move |this, _: &Submit, _, cx| {
                             cx.stop_propagation();
-                            if !restricted {
-                                this.toggle_selected_id(&submit_id, cx);
+                            if !restricted && let Some(sid) = submit_id.as_deref() {
+                                this.toggle_selected_id(sid, cx);
                             }
                         }))
                         .on_key_down(cx.listener(
                             move |this, event: &gpui::KeyDownEvent, _, cx| {
                                 if matches!(event.keystroke.key.as_str(), "enter" | "space") {
                                     cx.stop_propagation();
-                                    if !restricted {
-                                        this.toggle_selected_id(&keyboard_id, cx);
+                                    if !restricted && let Some(kid) = keyboard_id.as_deref() {
+                                        this.toggle_selected_id(kid, cx);
                                     }
                                 }
                             },
@@ -901,8 +902,8 @@ impl VaultPreview {
                     this.ui.close_popovers(this.animate);
                 }
                 if this.selection.active {
-                    if !restricted {
-                        this.toggle_selected_id(&id, cx);
+                    if !restricted && let Some(cid) = id.as_deref() {
+                        this.toggle_selected_id(cid, cx);
                     }
                 } else {
                     this.choose_item(index, cx);
