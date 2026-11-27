@@ -11,10 +11,21 @@ use windows::{
         KeyCredentialOperationResult, KeyCredentialRetrievalResult,
     },
     Storage::Streams::IBuffer,
-    Win32::Foundation::E_NOINTERFACE,
+    Win32::Foundation::{E_NOINTERFACE, HWND},
     UI::WindowId,
 };
 use windows_future::IAsyncOperation;
+
+#[link(name = "Windows.UI", kind = "raw-dylib")]
+unsafe extern "system" {
+    fn GetWindowIdFromWindow(window: HWND, id: *mut WindowId) -> HRESULT;
+}
+
+pub(super) fn window_id(hwnd: usize) -> windows::core::Result<u64> {
+    let mut id = WindowId { Value: 0 };
+    unsafe { GetWindowIdFromWindow(HWND(hwnd as *mut c_void), &mut id).ok()? };
+    Ok(id.Value)
+}
 
 define_interface!(
     IKeyCredentialManagerCreateWithWindowStatics,
@@ -111,6 +122,36 @@ pub(super) fn sign(
 mod tests {
     use super::*;
     use windows::Win32::Foundation::{E_ABORT, E_ACCESSDENIED};
+
+    #[test]
+    fn native_window_converts_to_the_window_id_used_by_windows_hello() {
+        use windows::{
+            core::w,
+            Win32::UI::WindowsAndMessaging::{
+                CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WS_POPUP,
+            },
+        };
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("STATIC"),
+                w!("Bytewarden Hello window test"),
+                WS_POPUP,
+                0,
+                0,
+                20,
+                20,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        .unwrap();
+        let id = window_id(hwnd.0 as usize);
+        unsafe { DestroyWindow(hwnd) }.unwrap();
+        assert_ne!(id.unwrap(), 0);
+    }
 
     #[test]
     fn legacy_fallback_is_only_for_a_missing_interface() {

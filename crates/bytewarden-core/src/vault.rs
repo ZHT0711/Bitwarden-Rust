@@ -16,7 +16,8 @@ mod repository;
 mod totp;
 mod transfer_csv;
 use folder_repository::FolderRepository;
-pub(crate) use mutations::{VaultEditorData, VaultMutationResult};
+pub(crate) use mutations::VaultEditorData;
+pub use mutations::VaultMutationResult;
 use repository::CipherRepository;
 pub(crate) use totp::{TotpCode, VaultTotp};
 
@@ -96,38 +97,38 @@ pub(crate) enum VaultError {
     PasskeyProvider(String),
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct VaultItem {
-    id: String,
-    name: String,
-    subtitle: String,
-    item_type: u8,
-    favorite: bool,
-    folder_id: Option<String>,
-    organization_id: Option<String>,
-    deleted: bool,
-    archived: bool,
-    reprompt: bool,
-    restricted: bool,
-    revision_date: String,
-    website_host: Option<String>,
+pub struct VaultItem {
+    pub id: String,
+    pub name: String,
+    pub subtitle: String,
+    pub item_type: u8,
+    pub favorite: bool,
+    pub folder_id: Option<String>,
+    pub organization_id: Option<String>,
+    pub deleted: bool,
+    pub archived: bool,
+    pub reprompt: bool,
+    pub restricted: bool,
+    pub revision_date: String,
+    pub website_host: Option<String>,
 }
 
-#[derive(Clone, Serialize)]
-pub(crate) struct VaultFolder {
-    id: String,
-    name: String,
+#[derive(Clone, Deserialize, Serialize)]
+pub struct VaultFolder {
+    pub id: String,
+    pub name: String,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct VaultOverview {
-    items: Vec<VaultItem>,
-    folders: Vec<VaultFolder>,
-    last_sync: String,
-    failures: usize,
-    read_only: bool,
+pub struct VaultOverview {
+    pub items: Vec<VaultItem>,
+    pub folders: Vec<VaultFolder>,
+    pub last_sync: String,
+    pub failures: usize,
+    pub read_only: bool,
 }
 
 #[derive(Default)]

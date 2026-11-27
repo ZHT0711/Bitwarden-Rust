@@ -7,7 +7,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bytewarden_core::desktop::Overview;
 use gpui::{
     Bounds, Context, Corners, Div, ElementId, MouseButton, Stateful, canvas, div, fill, point,
     prelude::*, px, size,
@@ -168,29 +167,10 @@ impl VaultPreview {
             now,
         } = frame;
         let pal = theme::palette();
-        let (total_active, total_fav, total_archived, total_trash) = self
-            .client
-            .overview
-            .as_ref()
-            .map_or((0, 0, 0, 0), |overview| {
-                let mut active = 0usize;
-                let mut fav = 0usize;
-                let mut arch = 0usize;
-                let mut trash = 0usize;
-                for item in &overview.items {
-                    if item.deleted {
-                        trash += 1;
-                    } else if item.archived {
-                        arch += 1;
-                    } else {
-                        active += 1;
-                        if item.favorite {
-                            fav += 1;
-                        }
-                    }
-                }
-                (active, fav, arch, trash)
-            });
+        let (total_active, total_fav, total_archived, total_trash) = self.ui.sidebar_counts(
+            self.client.overview_generation,
+            self.client.overview.as_ref(),
+        );
 
         let anchor_slot: NavAnchorSlot = Rc::new(Cell::new(None));
         let scroll_vp_slot: ScrollVpSlot = Rc::new(Cell::new(None));
@@ -722,7 +702,9 @@ impl VaultPreview {
             let is_active = self.page == Page::Vault
                 && self.client.selected_folder.as_deref() == Some(folder_id);
             let indent = (depth.min(3) as f32) * 14.;
-            let count = count_items_in_folder(overview, folder_id);
+            let count =
+                self.ui
+                    .folder_item_count(self.client.overview_generation, overview, folder_id);
 
             section = section.child(
                 div()
@@ -1447,16 +1429,26 @@ impl VaultPreview {
             }
             return Some(wrap(
                 super::components::info_bar(kind, notice.to_owned())
-                    .when(is_read_only && self.client.sync_available(), |el| {
-                        el.child(
-                            btn("banner-sync-now", BtnVariant::Primary)
-                                .h(px(26.))
-                                .px(px(10.))
-                                .text_size(px(font::CAPTION))
-                                .child("立即同步")
-                                .on_click(cx.listener(|this, _, _, cx| this.request_sync(cx))),
-                        )
-                    })
+                    .when(
+                        is_read_only
+                            && (self.client.sync_available() || self.client.reconnect_available()),
+                        |el| {
+                            el.child(
+                                btn("banner-sync-now", BtnVariant::Primary)
+                                    .h(px(26.))
+                                    .px(px(10.))
+                                    .text_size(px(font::CAPTION))
+                                    .child(if self.client.reconnect_available() {
+                                        "重新连接"
+                                    } else {
+                                        "立即同步"
+                                    })
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.sync_or_reconnect(window, cx)
+                                    })),
+                            )
+                        },
+                    )
                     .child(
                         div()
                             .id("dismiss-banner")
@@ -1482,16 +1474,25 @@ impl VaultPreview {
                     super::toast::ToastKind::Warning,
                     "当前处于离线只读快照模式，同步成功后可编辑。",
                 )
-                .when(self.client.sync_available(), |el| {
-                    el.child(
-                        btn("offline-sync-now", BtnVariant::Primary)
-                            .h(px(26.))
-                            .px(px(10.))
-                            .text_size(px(font::CAPTION))
-                            .child("立即同步")
-                            .on_click(cx.listener(|this, _, _, cx| this.request_sync(cx))),
-                    )
-                }),
+                .when(
+                    self.client.sync_available() || self.client.reconnect_available(),
+                    |el| {
+                        el.child(
+                            btn("offline-sync-now", BtnVariant::Primary)
+                                .h(px(26.))
+                                .px(px(10.))
+                                .text_size(px(font::CAPTION))
+                                .child(if self.client.reconnect_available() {
+                                    "重新连接"
+                                } else {
+                                    "立即同步"
+                                })
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.sync_or_reconnect(window, cx)
+                                })),
+                        )
+                    },
+                ),
             ));
         }
         None
@@ -1512,14 +1513,4 @@ impl VaultPreview {
             ),
         }
     }
-}
-
-fn count_items_in_folder(overview: &Overview, folder_id: &str) -> usize {
-    overview
-        .items
-        .iter()
-        .filter(|item| {
-            !item.deleted && !item.archived && item.folder_id.as_deref() == Some(folder_id)
-        })
-        .count()
 }

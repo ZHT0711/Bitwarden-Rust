@@ -55,8 +55,14 @@ impl State {
     }
 
     fn touch(&mut self, host: &str) {
-        if let Some(index) = self.lru.iter().position(|entry| entry == host) {
-            self.lru.remove(index);
+        if self.lru.back().is_some_and(|last| last == host) {
+            return;
+        }
+        if let Some(index) = self.lru.iter().position(|entry| entry == host)
+            && let Some(existing) = self.lru.remove(index)
+        {
+            self.lru.push_back(existing);
+            return;
         }
         self.lru.push_back(host.to_owned());
     }

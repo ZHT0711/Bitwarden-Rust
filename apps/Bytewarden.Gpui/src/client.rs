@@ -21,6 +21,14 @@ enum Region {
     Custom,
 }
 impl Region {
+    fn from_mode(mode: u32) -> Self {
+        match mode {
+            0 => Self::Us,
+            1 => Self::Eu,
+            _ => Self::Custom,
+        }
+    }
+
     fn server(self, url: &str) -> Server<'_> {
         match self {
             Self::Us => Server::Us,
@@ -34,6 +42,7 @@ impl Region {
 pub enum Form {
     SignIn,
     Unlock,
+    HelloEnrollment,
     Detail,
     EditorPassword,
     Confirm(ItemAction),
@@ -160,6 +169,9 @@ pub struct Client {
     pub editor: Option<crate::editor::Editor>,
     pub form: Option<Form>,
     pub(crate) form_generation: u64,
+    reconnect_account: Option<String>,
+    local_unlock_pending: bool,
+    hello_window: Option<usize>,
     pub notice: String,
     pub busy: Option<&'static str>,
     pub search: Entity<Input>,
@@ -184,6 +196,13 @@ pub struct Client {
 }
 
 impl Client {
+    #[cfg(all(test, windows))]
+    pub(crate) fn set_probe_password(&self, cx: &mut Context<VaultPreview>) {
+        self.password.update(cx, |field, cx| {
+            field.set("synthetic-master-password-memory-probe", cx)
+        });
+    }
+
     pub fn new(cx: &mut Context<VaultPreview>) -> Self {
         Self {
             accounts: Vec::new(),
@@ -197,6 +216,9 @@ impl Client {
             editor: None,
             form: None,
             form_generation: 0,
+            reconnect_account: None,
+            local_unlock_pending: false,
+            hello_window: None,
             notice: "正在初始化本机保险库…".into(),
             busy: None,
             generation: 0,
@@ -234,6 +256,20 @@ impl Client {
     pub fn active(&self) -> Option<&Account> {
         self.accounts.iter().find(|a| a.active)
     }
+
+    fn reconnect(&self) -> Option<&Account> {
+        let id = self.reconnect_account.as_deref()?;
+        self.active().filter(|account| account.id == id)
+    }
+
+    fn local_unlock_account(&self) -> Option<&Account> {
+        match self.form {
+            Some(Form::Unlock) => self.active(),
+            Some(Form::SignIn) => self.reconnect(),
+            _ => None,
+        }
+        .filter(|account| account.session() == Session::Locked)
+    }
     pub fn state(&self) -> Session {
         self.active().map_or(Session::SignedOut, Account::session)
     }
@@ -243,8 +279,22 @@ impl Client {
                 account.session() == Session::Unlocked && !account.needs_sign_in
             })
     }
+
+    pub(crate) fn reconnect_available(&self) -> bool {
+        self.ready()
+            && self.active().is_some_and(|account| {
+                account.session() == Session::Unlocked && account.needs_sign_in
+            })
+    }
+
     pub fn ready(&self) -> bool {
         self.initialized && self.busy.is_none()
+    }
+
+    fn freeze_auth_inputs(&self, read_only: bool, cx: &mut Context<VaultPreview>) {
+        for field in [&self.email, &self.server, &self.password, &self.code] {
+            field.update(cx, |field, cx| field.set_read_only(read_only, cx));
+        }
     }
     pub fn redact_detail(&mut self) {
         self.rendered_secrets.clear();
@@ -319,12 +369,25 @@ fn device_id(root: &Path) -> io::Result<Uuid> {
     }
 }
 
-fn unlock_dismissal_requires_cancellation(form: Option<Form>, busy: bool) -> bool {
-    form == Some(Form::Unlock) && busy
+enum LocalUnlock {
+    Password(Zeroizing<String>),
+    Hello { account: String, window: usize },
 }
 
-fn unlock_result_still_current(form: Option<Form>, closing: bool) -> bool {
-    !closing && form == Some(Form::Unlock)
+fn hello_hwnd(window: &Window) -> Option<usize> {
+    #[cfg(windows)]
+    {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        match HasWindowHandle::window_handle(window).ok()?.as_raw() {
+            RawWindowHandle::Win32(handle) => Some(handle.hwnd.get() as usize),
+            _ => None,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = window;
+        None
+    }
 }
 
 pub(crate) fn status_text(err: &Error) -> String {
@@ -333,6 +396,11 @@ pub(crate) fn status_text(err: &Error) -> String {
         "timedOut" => "连接超时，请重试。",
         "locked" | "unlockUnavailable" => "保险库未解锁或本机解锁不可用。",
         "passwordRequired" | "wrongPassword" => "请验证主密码后重试。",
+        "helloCancelled" => "Windows Hello 验证已取消，可使用主密码继续。",
+        "helloUnavailable" => "Windows Hello 当前不可用，请使用主密码。",
+        "helloFailed" => "Windows Hello 验证失败。请用主密码解锁后重新设置。",
+        "helloNotEnabled" => "当前账户尚未启用 Windows Hello。",
+        "localStorage" => "无法保存本机设置，请检查存储后重试。",
         "signInRequired" => "离线快照只读，请重新登录并同步。",
         "notSynced" => "本机存在尚待核对的写入结果。请同步后再继续操作。",
         "notFound" => "没有找到数据，或账户尚未同步。",
@@ -488,9 +556,8 @@ impl VaultPreview {
     pub fn cancel_pending(&mut self, cx: &mut Context<Self>) {
         if let Some(req) = self.client.pending.take() {
             req.cancel();
-            if self.client.form == Some(Form::SignIn) {
-                self.close_form(cx);
-                self.client.form = Some(Form::SignIn);
+            if self.client.form == Some(Form::SignIn) && !self.client.local_unlock_pending {
+                self.restart_login(cx);
             }
             self.client.notice = "正在取消操作…".into();
             cx.notify();
@@ -529,17 +596,24 @@ impl VaultPreview {
     }
 
     pub(crate) fn close_form(&mut self, cx: &mut Context<Self>) {
-        if unlock_dismissal_requires_cancellation(self.client.form, self.client.busy.is_some()) {
+        if self.client.local_unlock_pending {
             // A local unlock may commit before its worker reply reaches the UI.
             // Invalidate the request now and always reconcile via a compensating lock.
             self.lock_queued = true;
             self.cancel_pending(cx);
+        }
+        if matches!(self.client.form, Some(Form::SignIn | Form::HelloEnrollment))
+            && let Some(request) = self.client.pending.take()
+        {
+            request.cancel();
         }
         if self.client.form == Some(Form::SignIn) {
             desktop::cancel_login();
         }
         self.client.form_generation = self.client.form_generation.wrapping_add(1);
         self.client.form = None;
+        self.client.reconnect_account = None;
+        self.client.hello_window = None;
         if let Some(editor) = &mut self.client.editor {
             editor.clear(cx);
         }
@@ -572,21 +646,9 @@ impl VaultPreview {
         let Some(account) = self.client.active() else {
             return;
         };
-        let email = account.email.clone();
-        let url = account.server_url.clone();
-        let region = match account.server_mode {
-            0 => Region::Us,
-            1 => Region::Eu,
-            _ => Region::Custom,
-        };
+        let id = account.id.clone();
         self.begin_sign_in(window, cx);
-        self.client.region = region;
-        self.client
-            .email
-            .update(cx, |field, cx| field.set(&email, cx));
-        self.client
-            .server
-            .update(cx, |field, cx| field.set(&url, cx));
+        self.client.reconnect_account = Some(id);
         self.client.password.read(cx).focus(window);
     }
 
@@ -690,6 +752,7 @@ impl VaultPreview {
         match self.client.form {
             Some(Form::SignIn) => self.request_login(cx),
             Some(Form::Unlock) => self.request_unlock(cx),
+            Some(Form::HelloEnrollment) => self.enroll_hello(cx),
             Some(Form::EditorPassword) => {
                 let secret = self.client.password.update(cx, |field, cx| field.take(cx));
                 if !secret.is_empty() {
@@ -716,9 +779,19 @@ impl VaultPreview {
         let Some(device) = self.client.device else {
             return;
         };
-        let email = self.client.email.read(cx).value().trim().to_owned();
-        let url = self.client.server.read(cx).value().trim().to_owned();
-        let region = self.client.region;
+        let (email, url, region) = match self.client.reconnect() {
+            Some(account) => (
+                account.email.clone(),
+                account.server_url.clone(),
+                Region::from_mode(account.server_mode),
+            ),
+            None if self.client.reconnect_account.is_none() => (
+                self.client.email.read(cx).value().trim().to_owned(),
+                self.client.server.read(cx).value().trim().to_owned(),
+                self.client.region,
+            ),
+            None => return,
+        };
         if email.is_empty()
             || self.client.password.read(cx).value().is_empty()
             || !region.server(&url).is_valid()
@@ -758,9 +831,10 @@ impl VaultPreview {
             self.client.session_transition_pending = true;
         }
         let req = Request::begin();
+        self.client.freeze_auth_inputs(true, cx);
         self.run(
             match mode {
-                LoginMode::Login => "正在登录",
+                    LoginMode::Login => "正在登录并同步",
                 _ => "正在发送验证码",
             },
             Some(req),
@@ -782,14 +856,26 @@ impl VaultPreview {
                         req.resend_device_code(&email, &password, device, region.server(&url))
                     }
                 };
+                drop(password);
                 let state = matches!(
                     (mode, &result),
                     (LoginMode::Login, Ok(AuthStatus::Authenticated))
                 )
-                .then(snapshot);
+                .then(|| match req.sync() {
+                    Ok(overview) => (
+                        desktop::accounts().map(|accounts| Snapshot {
+                            accounts,
+                            overview: Some(overview),
+                            overview_error: None,
+                        }),
+                        None,
+                    ),
+                    Err(error) => (snapshot(), Some(error)),
+                });
                 (result, state, device_code)
             },
             move |this, (result, state, device_code), cx| {
+                this.client.freeze_auth_inputs(false, cx);
                 if matches!(mode, LoginMode::Login) {
                     this.client.session_transition_pending = false;
                 }
@@ -802,7 +888,7 @@ impl VaultPreview {
                     {
                         this.clear_account_view(cx);
                         this.lock_queued = true;
-                        if let Some(Ok(state)) = state {
+                        if let Some((Ok(state), _)) = state {
                             this.apply_snapshot(state, cx);
                             this.client.notice =
                                 "登录已完成，但登录窗口已关闭；正在锁定保险库。".into();
@@ -814,12 +900,15 @@ impl VaultPreview {
                     Ok(AuthStatus::Authenticated) if matches!(mode, LoginMode::Login) => {
                         this.clear_account_view(cx);
                         this.ui.trigger_page_motion(this.animate);
-                        match state.expect("successful login has account snapshot") {
+                        let (state, sync_error) =
+                            state.expect("successful login has account snapshot");
+                        match state {
                             Ok(state) => {
                                 this.apply_snapshot(state, cx);
                                 this.session_notice();
-                                if !this.lock_queued {
-                                    this.request_sync(cx);
+                                if let Some(error) = sync_error {
+                                    this.client.notice =
+                                        format!("已登录，但同步未完成。{}", status_text(&error));
                                 }
                             }
                             Err(e) => this.client.notice = status_text(&e),
@@ -888,8 +977,10 @@ impl VaultPreview {
     }
 
     fn restart_login(&mut self, cx: &mut Context<Self>) {
+        let account = self.client.reconnect_account.take();
         self.close_form(cx);
         self.client.form = Some(Form::SignIn);
+        self.client.reconnect_account = account;
     }
 
     fn request_login(&mut self, cx: &mut Context<Self>) {
@@ -897,20 +988,163 @@ impl VaultPreview {
     }
 
     fn request_unlock(&mut self, cx: &mut Context<Self>) {
+        if !self.client.ready()
+            || self.client.local_unlock_account().is_none()
+            || !self.client.password.read(cx).committed()
+        {
+            return;
+        }
         let password = self.client.password.update(cx, |field, cx| field.take(cx));
         if password.is_empty() {
             return;
         }
-        let req = Request::begin();
-        self.client.session_transition_pending = true;
+        self.run_local_unlock(LocalUnlock::Password(password), cx);
+    }
+
+    fn request_hello_unlock(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if !self.client.ready() {
+            return;
+        }
+        let Some(account) = self
+            .client
+            .local_unlock_account()
+            .filter(|account| account.hello_enabled)
+        else {
+            return;
+        };
+        let Some(window) = hello_hwnd(window) else {
+            self.client.notice = "Windows Hello 当前不可用，请使用主密码。".into();
+            cx.notify();
+            return;
+        };
+        let account = account.id.clone();
+        self.client
+            .password
+            .update(cx, |field, cx| field.set("", cx));
+        self.run_local_unlock(LocalUnlock::Hello { account, window }, cx);
+    }
+
+    pub(crate) fn change_hello(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.closing || !self.client.ready() || !self.navigation_available() {
+            return;
+        }
+        let Some(account) = self
+            .client
+            .active()
+            .filter(|account| account.session() == Session::Unlocked)
+        else {
+            return;
+        };
+        if account.hello_enabled {
+            let id = account.id.clone();
+            self.run(
+                "正在关闭 Windows Hello",
+                None,
+                cx,
+                move || desktop::disable_hello(&id).and_then(|()| desktop::accounts()),
+                |this, result, _| match result {
+                    Ok(accounts) => {
+                        this.client.accounts = accounts;
+                        this.client.notice = "已关闭 Windows Hello 解锁。".into();
+                    }
+                    Err(error) => this.client.notice = status_text(&error),
+                },
+            );
+            return;
+        }
+        if self.client.overview.is_none() || self.client.write_guard {
+            self.client.notice = "请先同步保险库。".into();
+            cx.notify();
+            return;
+        }
+        let Some(handle) = hello_hwnd(window) else {
+            self.client.notice = "Windows Hello 当前不可用。".into();
+            cx.notify();
+            return;
+        };
+        self.close_detail();
+        self.close_form(cx);
+        self.client.hello_window = Some(handle);
+        self.client.form = Some(Form::HelloEnrollment);
+        self.client.password.read(cx).focus(window);
+        cx.notify();
+    }
+
+    fn enroll_hello(&mut self, cx: &mut Context<Self>) {
+        let Some(window) = self.client.hello_window else {
+            return;
+        };
+        let Some(account) = self
+            .client
+            .active()
+            .filter(|account| account.session() == Session::Unlocked && !account.hello_enabled)
+        else {
+            return;
+        };
+        let id = account.id.clone();
+        let password = self.client.password.update(cx, |input, cx| input.take(cx));
+        if password.is_empty() {
+            return;
+        }
+        let request = Request::begin();
+        let generation = self.client.form_generation;
+        self.client.freeze_auth_inputs(true, cx);
         self.run(
-            "正在离线解锁",
+            "请完成 Windows Hello 设置",
+            Some(request),
+            cx,
+            move || {
+                let result = request.enable_hello(&id, &password, window);
+                (result, desktop::accounts())
+            },
+            move |this, (result, accounts), cx| {
+                this.client.freeze_auth_inputs(false, cx);
+                if let Ok(accounts) = accounts {
+                    this.client.accounts = accounts;
+                }
+                if this.client.form_generation != generation {
+                    return;
+                }
+                match result {
+                    Ok(()) => {
+                        this.close_form(cx);
+                        this.client.notice = "已启用 Windows Hello 解锁。".into();
+                    }
+                    Err(error) => {
+                        this.ui.trigger_auth_shake(this.animate);
+                        this.client.notice = status_text(&error);
+                    }
+                }
+            },
+        );
+    }
+
+    fn run_local_unlock(&mut self, method: LocalUnlock, cx: &mut Context<Self>) {
+        let req = Request::begin();
+        let generation = self.client.form_generation;
+        self.client.session_transition_pending = true;
+        self.client.local_unlock_pending = true;
+        self.client.freeze_auth_inputs(true, cx);
+        self.run(
+            if matches!(&method, LocalUnlock::Hello { .. }) {
+                "请完成 Windows Hello 验证"
+            } else {
+                "正在离线解锁"
+            },
             Some(req),
             cx,
-            move || req.unlock(&password).and_then(|()| snapshot()),
-            |this, result, cx| {
+            move || {
+                match method {
+                    LocalUnlock::Password(password) => req.unlock(&password),
+                    LocalUnlock::Hello { account, window } => req.unlock_hello(&account, window),
+                }
+                .and_then(|()| snapshot())
+            },
+            move |this, result, cx| {
+                this.client.freeze_auth_inputs(false, cx);
                 this.client.session_transition_pending = false;
-                if !unlock_result_still_current(this.client.form, this.closing) {
+                this.client.local_unlock_pending = false;
+                if this.client.form_generation != generation || this.closing {
                     // Never install decrypted UI state after the user dismissed
                     // the unlock form. If the core already committed, `run` will
                     // execute the queued compensating lock immediately afterward.
@@ -963,6 +1197,14 @@ impl VaultPreview {
                 Err(e) => this.client.notice = status_text(&e),
             },
         );
+    }
+
+    pub(crate) fn sync_or_reconnect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.client.reconnect_available() && self.navigation_available() {
+            self.reauthenticate(window, cx);
+        } else if self.selection.pending.is_none() {
+            self.request_sync(cx);
+        }
     }
 
     pub fn choose_item(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -1137,13 +1379,24 @@ impl VaultPreview {
     }
 
     pub fn open_unlock(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.client.ready() {
+        if !self.client.ready() || self.client.state() != Session::Locked {
             return;
         }
-        self.close_form(cx);
-        self.client.show_accounts = false;
-        self.client.form = Some(Form::Unlock);
-        self.client.password.read(cx).focus(window);
+        if self
+            .client
+            .active()
+            .is_some_and(|account| account.needs_sign_in)
+        {
+            self.reauthenticate(window, cx);
+        } else {
+            self.close_form(cx);
+            self.client.show_accounts = false;
+            self.client.form = Some(Form::Unlock);
+            self.client.password.read(cx).focus(window);
+        }
+        if self.settings.auto_prompt_hello {
+            self.request_hello_unlock(window, cx);
+        }
         cx.notify();
     }
 
@@ -1167,6 +1420,12 @@ impl VaultPreview {
                 danger: true,
                 action_label: "确认永久删除",
             },
+            Form::HelloEnrollment => crate::ui::state::ModalClosingSnapshot {
+                title: "启用 Windows Hello 解锁".into(),
+                subtitle: "先确认主密码，再完成 Windows Hello 验证。".into(),
+                danger: false,
+                action_label: "继续",
+            },
             Form::SignIn | Form::Unlock => unreachable!(),
         })
     }
@@ -1185,6 +1444,13 @@ impl VaultPreview {
 
         let pal = theme::palette();
         let form = self.client.form.expect("form visible");
+        let reconnect = self.client.reconnect();
+        let allow_local = self.client.local_unlock_account().is_some();
+        let offer_hello = cfg!(windows)
+            && self
+                .client
+                .local_unlock_account()
+                .is_some_and(|account| account.hello_enabled);
         let ready = self.client.ready();
         let is_full_auth = matches!(form, Form::SignIn | Form::Unlock);
         let (shake_val, _) = self.ui.auth_shake_spring.sample_staggered(
@@ -1198,14 +1464,20 @@ impl VaultPreview {
                 .sample_staggered(now, std::time::Duration::ZERO, self.animate);
         let shake_x = (shake_val * 2.6).clamp(-10., 10.);
         let title = match form {
+            Form::SignIn if allow_local => "解锁保险库",
+            Form::SignIn if reconnect.is_some() => "重新连接账户",
             Form::SignIn => "登录 Bytewarden",
             Form::Unlock => "解锁保险库",
+            Form::HelloEnrollment => "启用 Windows Hello 解锁",
             Form::Detail | Form::EditorPassword | Form::Reverify(_) => "验证主密码",
             Form::Confirm(_) => "永久删除此条目？",
         };
         let subtitle = match form {
+            Form::SignIn if allow_local => "使用主密码连接服务器并同步，或仅离线解锁本机快照。",
+            Form::SignIn if reconnect.is_some() => "登录后同步此账户的最新数据。",
             Form::SignIn => "连接到 Bitwarden 官方云或自托管服务器",
             Form::Unlock => "输入主密码以离线解密本机快照",
+            Form::HelloEnrollment => "先确认主密码，再完成 Windows Hello 验证。",
             Form::Detail | Form::EditorPassword | Form::Reverify(_) => {
                 "此条目受主密码复验保护，请输入主密码继续。"
             }
@@ -1248,9 +1520,7 @@ impl VaultPreview {
                             .child(subtitle),
                     ),
             );
-            if form == Form::Unlock
-                && let Some(acc) = active_account
-            {
+            if let Some(acc) = reconnect.or(active_account.filter(|_| form == Form::Unlock)) {
                 panel =
                     panel.child(
                         div()
@@ -1334,7 +1604,7 @@ impl VaultPreview {
         }
 
         if form == Form::SignIn {
-            if challenge.is_none() {
+            if challenge.is_none() && reconnect.is_none() {
                 let region_index = match self.client.region {
                     Region::Us => 0,
                     Region::Eu => 1,
@@ -1430,7 +1700,7 @@ impl VaultPreview {
                         )
                         .child(self.client.email.clone()),
                 );
-            } else {
+            } else if challenge.is_some() {
                 panel = panel.child(
                     div()
                         .relative()
@@ -1574,7 +1844,11 @@ impl VaultPreview {
         }
         if matches!(
             form,
-            Form::Unlock | Form::Detail | Form::EditorPassword | Form::Reverify(_)
+            Form::Unlock
+                | Form::HelloEnrollment
+                | Form::Detail
+                | Form::EditorPassword
+                | Form::Reverify(_)
         ) || (form == Form::SignIn && challenge.is_none())
         {
             panel = panel.child(
@@ -1596,6 +1870,30 @@ impl VaultPreview {
         } else {
             BtnVariant::Primary
         };
+        if ready && (offer_hello || (form == Form::SignIn && allow_local)) {
+            panel = panel.child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap(px(8.))
+                    .when(offer_hello, |row| {
+                        row.child(
+                            btn("hello-unlock", BtnVariant::Secondary)
+                                .child("Windows Hello")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.request_hello_unlock(window, cx)
+                                })),
+                        )
+                    })
+                    .when(form == Form::SignIn && allow_local, |row| {
+                        row.child(
+                            btn("offline-unlock", BtnVariant::Secondary)
+                                .child("仅离线解锁")
+                                .on_click(cx.listener(|this, _, _, cx| this.request_unlock(cx))),
+                        )
+                    }),
+            );
+        }
         panel.child(
             div()
                 .pt(px(4.))
@@ -1608,27 +1906,34 @@ impl VaultPreview {
                             .flex_1()
                             .h(px(36.))
                             .child(match form {
-                                Form::SignIn => "登录",
+                                Form::SignIn if allow_local => "解锁并同步",
+                                Form::SignIn => "登录并同步",
                                 Form::Unlock => "解锁",
+                                Form::HelloEnrollment => "继续",
                                 Form::Detail | Form::EditorPassword | Form::Reverify(_) => "验证",
                                 Form::Confirm(_) => "确认永久删除",
                             })
                             .on_click(cx.listener(|this, _, _, cx| this.submit(cx))),
                     )
-                    .child(
-                        btn("cancel-form", BtnVariant::Secondary)
-                            .h(px(36.))
-                            .px(px(16.))
-                            .child("返回")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.close_form(cx);
-                                this.close_detail();
-                                this.focus.focus(window);
-                                this.session_notice();
-                                cx.notify();
-                            })),
-                    )
-                }),
+                })
+                .when(
+                    ready || is_full_auth || form == Form::HelloEnrollment,
+                    |bar| {
+                        bar.child(
+                            btn("cancel-form", BtnVariant::Secondary)
+                                .h(px(36.))
+                                .px(px(16.))
+                                .child(if ready { "返回" } else { "取消" })
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.close_form(cx);
+                                    this.close_detail();
+                                    this.focus.focus(window);
+                                    this.session_notice();
+                                    cx.notify();
+                                })),
+                        )
+                    },
+                ),
         )
     }
 }

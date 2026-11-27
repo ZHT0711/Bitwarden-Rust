@@ -85,9 +85,12 @@ mod windows {
     const SW_HIDE: i32 = 0;
     const SW_SHOW: i32 = 5;
     const SW_RESTORE: i32 = 9;
+    const WDA_NONE: u32 = 0x0000_0000;
+    const WDA_EXCLUDEFROMCAPTURE: u32 = 0x0000_0011;
     const WM_ACTIVATE_EXISTING: u32 = WM_APP + 43;
     const ERROR_ALREADY_EXISTS: u32 = 183;
     const ERROR_CLASS_ALREADY_EXISTS: u32 = 1410;
+    const WAIT_OBJECT_0: u32 = 0;
     const IDI_APPLICATION: *const u16 = 32512usize as *const u16;
 
     const WINDOW_CLASS: &[u16] = &[
@@ -383,6 +386,35 @@ mod windows {
         }
     }
 
+    pub(crate) fn window_hwnd_usize(window: &Window) -> Option<usize> {
+        let handle = HasWindowHandle::window_handle(window).ok()?;
+        let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+            return None;
+        };
+        let hwnd = handle.hwnd.get() as usize;
+        (hwnd != 0).then_some(hwnd)
+    }
+
+    pub(crate) fn apply_screen_capture_protection(window: &Window, prevent: bool) {
+        let Some(hwnd) = window_hwnd_usize(window) else {
+            return;
+        };
+        let affinity = if prevent {
+            WDA_EXCLUDEFROMCAPTURE
+        } else {
+            WDA_NONE
+        };
+        unsafe {
+            let _ = SetWindowDisplayAffinity(hwnd as Hwnd, affinity);
+        }
+    }
+
+    pub(crate) fn restore_window_to_front(window: &Window) {
+        if let Some(hwnd) = window_hwnd_usize(window) {
+            unsafe { restore_hwnd(hwnd as Hwnd) };
+        }
+    }
+
     unsafe fn restore_hwnd(app_window: Hwnd) {
         if app_window.is_null() {
             return;
@@ -472,6 +504,7 @@ mod windows {
     /// window, then exits silently instead of opening a duplicate error window.
     pub(crate) struct SingleInstance {
         mutex: *mut c_void,
+        pending_activation: *mut c_void,
         activation_window: Hwnd,
         window_title: Vec<u16>,
     }
@@ -479,43 +512,60 @@ mod windows {
     impl SingleInstance {
         pub(crate) fn acquire_or_activate(silent_if_running: bool) -> Option<Self> {
             let tag = current_scope_tag();
+            Self::acquire_in_scope(&tag, silent_if_running)
+        }
+
+        fn acquire_in_scope(tag: &str, silent_if_running: bool) -> Option<Self> {
             let mutex_name = encode_wide(&format!("Local\\Bytewarden.GPUI.SingleInstance.{tag}"));
+            let event_name =
+                encode_wide(&format!("Local\\Bytewarden.GPUI.PendingActivation.{tag}"));
             let window_title = encode_wide(&format!("Bytewarden.GPUI.Activate.{tag}"));
+            // Hold the event before publishing the mutex. Early relaunches can
+            // queue activation even while the primary is opening its window.
+            let pending_activation = unsafe { CreateEventW(null(), 0, 0, event_name.as_ptr()) };
             let mutex = unsafe { CreateMutexW(null(), 0, mutex_name.as_ptr()) };
             if mutex.is_null() {
                 // Fail open if mutex creation is denied by environment policy.
                 return Some(Self {
                     mutex: null_mut(),
+                    pending_activation,
                     activation_window: null_mut(),
                     window_title,
                 });
             }
             if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-                unsafe { CloseHandle(mutex) };
                 if !silent_if_running {
-                    // Retry briefly in case the primary instance is still initializing its window.
-                    for _ in 0..20 {
-                        let existing = unsafe {
-                            FindWindowW(ACTIVATION_CLASS.as_ptr(), window_title.as_ptr())
-                        };
-                        if !existing.is_null() {
-                            let mut pid: u32 = 0;
-                            unsafe {
-                                GetWindowThreadProcessId(existing, &mut pid);
-                                if pid != 0 {
-                                    AllowSetForegroundWindow(pid);
-                                }
-                                PostMessageW(existing, WM_ACTIVATE_EXISTING, 0, 0);
-                            }
-                            break;
+                    unsafe {
+                        if !pending_activation.is_null() {
+                            SetEvent(pending_activation);
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(25));
+                        let existing =
+                            FindWindowW(ACTIVATION_CLASS.as_ptr(), window_title.as_ptr());
+                        if !existing.is_null() {
+                            let mut pid = 0;
+                            GetWindowThreadProcessId(existing, &mut pid);
+                            if pid != 0 {
+                                AllowSetForegroundWindow(pid);
+                            }
+                            if PostMessageW(existing, WM_ACTIVATE_EXISTING, 0, 0) != 0
+                                && !pending_activation.is_null()
+                            {
+                                ResetEvent(pending_activation);
+                            }
+                        }
+                    }
+                }
+                unsafe {
+                    CloseHandle(mutex);
+                    if !pending_activation.is_null() {
+                        CloseHandle(pending_activation);
                     }
                 }
                 return None;
             }
             Some(Self {
                 mutex,
+                pending_activation,
                 activation_window: null_mut(),
                 window_title,
             })
@@ -551,6 +601,12 @@ mod windows {
                     app_window,
                 )
             };
+            if !self.activation_window.is_null()
+                && !self.pending_activation.is_null()
+                && unsafe { WaitForSingleObject(self.pending_activation, 0) } == WAIT_OBJECT_0
+            {
+                unsafe { PostMessageW(self.activation_window, WM_ACTIVATE_EXISTING, 0, 0) };
+            }
         }
     }
 
@@ -566,6 +622,10 @@ mod windows {
             if !self.mutex.is_null() {
                 unsafe { CloseHandle(self.mutex) };
                 self.mutex = null_mut();
+            }
+            if !self.pending_activation.is_null() {
+                unsafe { CloseHandle(self.pending_activation) };
+                self.pending_activation = null_mut();
             }
         }
     }
@@ -712,6 +772,7 @@ mod windows {
         fn IsIconic(window: Hwnd) -> i32;
         fn BringWindowToTop(window: Hwnd) -> i32;
         fn SetForegroundWindow(window: Hwnd) -> i32;
+        fn SetWindowDisplayAffinity(window: Hwnd, affinity: u32) -> i32;
         fn FindWindowW(class_name: *const u16, window_name: *const u16) -> Hwnd;
         fn GetWindowThreadProcessId(window: Hwnd, pid: *mut u32) -> u32;
         fn AllowSetForegroundWindow(pid: u32) -> i32;
@@ -750,6 +811,15 @@ mod windows {
             initial_owner: i32,
             name: *const u16,
         ) -> *mut c_void;
+        fn CreateEventW(
+            attributes: *const c_void,
+            manual_reset: i32,
+            initial_state: i32,
+            name: *const u16,
+        ) -> *mut c_void;
+        fn SetEvent(event: *mut c_void) -> i32;
+        fn ResetEvent(event: *mut c_void) -> i32;
+        fn WaitForSingleObject(handle: *mut c_void, millis: u32) -> u32;
         fn CloseHandle(handle: *mut c_void) -> i32;
     }
 
@@ -761,6 +831,27 @@ mod windows {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn early_relaunch_queues_activation_without_a_window() {
+            let tag = uuid::Uuid::new_v4().simple().to_string();
+            let primary = SingleInstance::acquire_in_scope(&tag, false).unwrap();
+            assert!(!primary.pending_activation.is_null());
+            assert!(SingleInstance::acquire_in_scope(&tag, true).is_none());
+            assert_ne!(
+                unsafe { WaitForSingleObject(primary.pending_activation, 0) },
+                WAIT_OBJECT_0
+            );
+            assert!(SingleInstance::acquire_in_scope(&tag, false).is_none());
+            assert_eq!(
+                unsafe { WaitForSingleObject(primary.pending_activation, 0) },
+                WAIT_OBJECT_0
+            );
+            assert_ne!(
+                unsafe { WaitForSingleObject(primary.pending_activation, 0) },
+                WAIT_OBJECT_0
+            );
+        }
 
         #[link(name = "user32")]
         unsafe extern "system" {
@@ -890,10 +981,24 @@ mod windows {
 }
 
 #[cfg(windows)]
-pub(crate) use windows::{SingleInstance, Tray};
+pub(crate) use windows::{
+    SingleInstance, Tray, apply_screen_capture_protection, restore_window_to_front,
+    window_hwnd_usize,
+};
 
 #[cfg(not(windows))]
 pub(crate) struct Tray;
+
+#[cfg(not(windows))]
+pub(crate) fn apply_screen_capture_protection(_: &gpui::Window, _: bool) {}
+
+#[cfg(not(windows))]
+pub(crate) fn restore_window_to_front(_: &gpui::Window) {}
+
+#[cfg(not(windows))]
+pub(crate) fn window_hwnd_usize(_: &gpui::Window) -> Option<usize> {
+    None
+}
 
 #[cfg(not(windows))]
 pub(crate) struct SingleInstance;

@@ -53,10 +53,10 @@ pub(super) struct VaultCustomField {
     pub(super) linked_id: Option<u32>,
 }
 
-#[derive(Serialize)]
-pub(crate) struct VaultMutationResult {
-    pub(super) overview: VaultOverview,
-    pub(super) id: Option<String>,
+#[derive(Deserialize, Serialize)]
+pub struct VaultMutationResult {
+    pub overview: VaultOverview,
+    pub id: Option<String>,
 }
 
 impl VaultCache {

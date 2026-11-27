@@ -98,8 +98,11 @@ impl Editable {
         } = gen_props;
         let pal = crate::theme::palette();
         let is_password = self.label == "密码";
+        let is_totp = self.label == "验证器密钥";
         let input_for_gen = self.input.clone();
         let input_for_opts = self.input.clone();
+        let input_for_qr_clip = self.input.clone();
+        let input_for_qr_file = self.input.clone();
         let apply_generated =
             |this: &mut VaultPreview, target: &Entity<Input>, cx: &mut Context<VaultPreview>| {
                 match this.generator.generate_for_editor() {
@@ -199,6 +202,151 @@ impl Editable {
                                             cx.notify();
                                         },
                                     )),
+                                )
+                            })
+                            .when(is_totp, |el| {
+                                el.child(
+                                    crate::ui::components::btn(
+                                        "editor-totp-qr-clip",
+                                        crate::ui::components::BtnVariant::Tinted,
+                                    )
+                                    .h(px(24.))
+                                    .px(px(8.))
+                                    .text_size(px(crate::ui::tokens::font::MICRO))
+                                    .child(crate::ui::components::glyph_icon(
+                                        crate::ui::tokens::glyph::COPY,
+                                        11.,
+                                    ))
+                                    .child("剪贴板扫码")
+                                    .tooltip(|_, cx| {
+                                        crate::ui::components::make_tooltip(
+                                            "识别剪贴板中的二维码截图（Win+Shift+S）",
+                                            None,
+                                            cx,
+                                        )
+                                    })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if !this.client.ready() {
+                                            return;
+                                        }
+                                        let target = input_for_qr_clip.clone();
+                                        let generation = this.client.generation;
+                                        let bg = cx.background_executor().clone();
+                                        cx.spawn(async move |weak, app| {
+                                            let res = bg
+                                                .spawn(async {
+                                                    crate::totp_qr::decode_totp_from_clipboard()
+                                                })
+                                                .await;
+                                            let _ = weak.update(app, |this, cx| {
+                                                if this.client.generation != generation
+                                                    || this.client.editor.is_none()
+                                                {
+                                                    return;
+                                                }
+                                                match res {
+                                                    Ok(uri) => {
+                                                        target.update(cx, |field, cx| {
+                                                            field.set(&uri, cx);
+                                                        });
+                                                        this.ui.toast.show(
+                                                            crate::ui::toast::ToastKind::Success,
+                                                            "已从剪贴板二维码填入验证器密钥",
+                                                            std::time::Instant::now(),
+                                                            this.animate,
+                                                        );
+                                                    }
+                                                    Err(err) => {
+                                                        this.ui.toast.show(
+                                                            crate::ui::toast::ToastKind::Warning,
+                                                            err,
+                                                            std::time::Instant::now(),
+                                                            this.animate,
+                                                        );
+                                                    }
+                                                }
+                                                cx.notify();
+                                            });
+                                        })
+                                        .detach();
+                                    })),
+                                )
+                                .child(
+                                    crate::ui::components::btn(
+                                        "editor-totp-qr-file",
+                                        crate::ui::components::BtnVariant::Secondary,
+                                    )
+                                    .h(px(24.))
+                                    .px(px(8.))
+                                    .text_size(px(crate::ui::tokens::font::MICRO))
+                                    .child(crate::ui::components::glyph_icon(
+                                        crate::ui::tokens::glyph::UPLOAD,
+                                        11.,
+                                    ))
+                                    .child("图片扫码")
+                                    .tooltip(|_, cx| {
+                                        crate::ui::components::make_tooltip(
+                                            "选择本地二维码图片识别 TOTP",
+                                            None,
+                                            cx,
+                                        )
+                                    })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if !this.client.ready() {
+                                            return;
+                                        }
+                                        let target = input_for_qr_file.clone();
+                                        let generation = this.client.generation;
+                                        crate::detail_tools::choose_file(
+                                            cx,
+                                            generation,
+                                            crate::detail_tools::FileChooser::Open,
+                                            None,
+                                            move |_this, path, cx| {
+                                                let target = target.clone();
+                                                let bg = cx.background_executor().clone();
+                                                cx.spawn(async move |weak, app| {
+                                                    let res = bg
+                                                        .spawn(async move {
+                                                            crate::totp_qr::decode_totp_from_file(
+                                                                &path,
+                                                            )
+                                                        })
+                                                        .await;
+                                                    let _ = weak.update(app, |this, cx| {
+                                                        if this.client.generation != generation
+                                                            || this.client.editor.is_none()
+                                                        {
+                                                            return;
+                                                        }
+                                                        match res {
+                                                            Ok(uri) => {
+                                                                target.update(cx, |field, cx| {
+                                                                    field.set(&uri, cx);
+                                                                });
+                                                                this.ui.toast.show(
+                                                                    crate::ui::toast::ToastKind::Success,
+                                                                    "已从图片二维码填入验证器密钥",
+                                                                    std::time::Instant::now(),
+                                                                    this.animate,
+                                                                );
+                                                            }
+                                                            Err(err) => {
+                                                                this.ui.toast.show(
+                                                                    crate::ui::toast::ToastKind::Warning,
+                                                                    err,
+                                                                    std::time::Instant::now(),
+                                                                    this.animate,
+                                                                );
+                                                            }
+                                                        }
+                                                        cx.notify();
+                                                    });
+                                                })
+                                                .detach();
+                                            },
+                                        );
+                                    })),
                                 )
                             })
                             .when(self.secret, |el| el.child(reveal_button(&self.input, cx))),

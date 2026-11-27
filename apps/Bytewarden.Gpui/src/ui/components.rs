@@ -5,8 +5,8 @@
 use std::f32::consts::TAU;
 
 use gpui::{
-    AnyView, App, BoxShadow, Context, Div, ElementId, Hsla, PathBuilder, Point, SharedString,
-    Stateful, Window, canvas, div, hsla, point, prelude::*, px,
+    AnyView, App, Bounds, BoxShadow, Context, Corners, Div, ElementId, Hsla, SharedString,
+    Stateful, Window, canvas, div, fill, hsla, point, prelude::*, px, size,
 };
 
 use crate::theme::{self, hex};
@@ -356,63 +356,110 @@ pub fn toggle_switch(id: impl Into<ElementId>, checked: bool) -> Stateful<Div> {
     toggle_switch_animated(id, checked, if checked { 1. } else { 0. })
 }
 
-/// Hardware-accelerated continuously rotating chevron (`0.0` = right `›`, `1.0` = down `⌄`).
-pub fn rotating_chevron(progress: f32, icon_size: f32, color: Hsla) -> impl IntoElement {
-    let angle = progress.clamp(0., 1.) * std::f32::consts::FRAC_PI_2;
-    canvas(
-        |_, _, _| (),
-        move |bounds, _, window, _| {
-            let cx = f32::from(bounds.origin.x) + f32::from(bounds.size.width) * 0.5;
-            let cy = f32::from(bounds.origin.y) + f32::from(bounds.size.height) * 0.5;
-            let arm =
-                (f32::from(bounds.size.width).min(f32::from(bounds.size.height)) * 0.28).max(2.5);
-            let rot = |dx: f32, dy: f32| -> Point<gpui::Pixels> {
-                let c = angle.cos();
-                let s = angle.sin();
-                point(px(cx + dx * c - dy * s), px(cy + dx * s + dy * c))
-            };
-            let mut builder = PathBuilder::stroke(px(1.5));
-            builder.move_to(rot(-arm * 0.45, -arm));
-            builder.line_to(rot(arm * 0.55, 0.));
-            builder.line_to(rot(-arm * 0.45, arm));
-            if let Ok(path) = builder.build() {
-                window.paint_path(path, color);
-            }
-        },
-    )
-    .size(px(icon_size))
-    .flex_shrink_0()
+/// Zero-Path chevron indicator (`0.0` = right `›`, `1.0` = down `⌄`).
+/// Uses cached DirectWrite glyph sprites instead of `PathBuilder` so GPUI never
+/// allocates full-window 4x MSAA `PathResources` textures (~80-160 MB on High-DPI).
+pub fn rotating_chevron(progress: f32, icon_size: f32, color: Hsla) -> Div {
+    let p = progress.clamp(0., 1.);
+    let base = div()
+        .relative()
+        .size(px(icon_size))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_color(color);
+    if p <= 0.02 {
+        base.child(glyph_icon(glyph::CHEVRON_RIGHT, icon_size * 0.85))
+    } else if p >= 0.98 {
+        base.child(glyph_icon(glyph::CHEVRON_DOWN, icon_size * 0.85))
+    } else {
+        base.child(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .opacity(1. - p)
+                .child(glyph_icon(glyph::CHEVRON_RIGHT, icon_size * 0.85)),
+        )
+        .child(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .opacity(p)
+                .child(glyph_icon(glyph::CHEVRON_DOWN, icon_size * 0.85)),
+        )
+    }
 }
 
-/// Hardware-accelerated rotating sync/refresh icon (`angle_rad` rotates continuously).
-pub fn rotating_refresh_icon(angle_rad: f32, icon_size: f32, color: Hsla) -> impl IntoElement {
-    canvas(
-        |_, _, _| (),
-        move |bounds, _, window, _| {
-            let cx = f32::from(bounds.origin.x) + f32::from(bounds.size.width) * 0.5;
-            let cy = f32::from(bounds.origin.y) + f32::from(bounds.size.height) * 0.5;
-            let r =
-                (f32::from(bounds.size.width).min(f32::from(bounds.size.height)) * 0.36).max(3.);
-            if let Ok(arc1) =
-                build_arc_path(cx, cy, r, angle_rad, std::f32::consts::PI * 0.72, 12, 1.6)
-            {
-                window.paint_path(arc1, color);
-            }
-            if let Ok(arc2) = build_arc_path(
-                cx,
-                cy,
-                r,
-                angle_rad + std::f32::consts::PI,
-                std::f32::consts::PI * 0.72,
-                12,
-                1.6,
-            ) {
-                window.paint_path(arc2, color);
-            }
-        },
-    )
-    .size(px(icon_size))
-    .flex_shrink_0()
+fn paint_orbital_dots(
+    bounds: Bounds<gpui::Pixels>,
+    angle_rad: f32,
+    color: Hsla,
+    window: &mut Window,
+) {
+    const DOTS: usize = 8;
+    let w = f32::from(bounds.size.width);
+    let h = f32::from(bounds.size.height);
+    let cx = f32::from(bounds.origin.x) + w * 0.5;
+    let cy = f32::from(bounds.origin.y) + h * 0.5;
+    let min_dim = w.min(h);
+    let dot_d = (min_dim * 0.19).clamp(2.0, 3.6);
+    let dot_r = dot_d * 0.5;
+    let orbit_r = (min_dim * 0.5 - dot_r - 0.5).max(2.0);
+    for i in 0..DOTS {
+        let theta = (i as f32 / DOTS as f32) * TAU - std::f32::consts::FRAC_PI_2;
+        let mut delta = (angle_rad - theta).rem_euclid(TAU);
+        if delta > TAU {
+            delta -= TAU;
+        }
+        let trail = (1.0 - delta / TAU).powi(2);
+        let alpha = (0.16 + 0.84 * trail).clamp(0.16, 1.0);
+        let mut quad = fill(
+            Bounds::new(
+                point(
+                    px(cx + orbit_r * theta.cos() - dot_r),
+                    px(cy + orbit_r * theta.sin() - dot_r),
+                ),
+                size(px(dot_d), px(dot_d)),
+            ),
+            color.opacity(alpha),
+        );
+        quad.corner_radii = Corners::all(px(dot_r));
+        window.paint_quad(quad);
+    }
+}
+
+/// Zero-Path refresh icon: renders a crisp glyph at rest and an instanced 8-dot
+/// orbital `PaintQuad` ring while spinning (`0` MSAA path textures).
+pub fn rotating_refresh_icon(angle_rad: f32, icon_size: f32, color: Hsla) -> Div {
+    let rem = angle_rad.rem_euclid(std::f32::consts::PI);
+    let settled = rem < 0.03 || (std::f32::consts::PI - rem) < 0.03;
+    let base = div()
+        .size(px(icon_size))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_color(color);
+    if settled {
+        base.child(glyph_icon(glyph::SYNC, icon_size))
+    } else {
+        base.child(
+            canvas(
+                |_, _, _| (),
+                move |bounds, _, window, _| {
+                    paint_orbital_dots(bounds, angle_rad, color, window);
+                },
+            )
+            .size(px(icon_size)),
+        )
+    }
 }
 
 /// Soft animated skeleton placeholder aligned with Detail Hero + FieldGroup card geometry.
@@ -764,33 +811,49 @@ pub fn format_totp(code: &str) -> String {
     }
 }
 
-/// Hardware-accelerated GPUI Canvas circular TOTP countdown ring.
+/// Zero-Path hardware-instanced `PaintQuad` circular TOTP countdown ring (12 radial dots).
+/// Avoids `PathBuilder` so viewing a TOTP item never allocates 4x MSAA full-window textures.
 pub fn totp_ring(fraction: f32, urgent: bool, ring_size: f32) -> impl IntoElement {
     let pal = theme::palette();
-    let track_color: Hsla = Hsla::from(hex(pal.border)).opacity(0.65);
-    let arc_color: Hsla = hex(if urgent { pal.danger } else { pal.accent_fill }).into();
+    let track_color: Hsla = Hsla::from(hex(pal.border)).opacity(0.55);
+    let active_color: Hsla = hex(if urgent { pal.danger } else { pal.accent_fill }).into();
     let frac = fraction.clamp(0., 1.);
 
     canvas(
         |_, _, _| (),
         move |bounds, _, window, _| {
-            let cx = f32::from(bounds.origin.x) + f32::from(bounds.size.width) * 0.5;
-            let cy = f32::from(bounds.origin.y) + f32::from(bounds.size.height) * 0.5;
-            let r = (f32::from(bounds.size.width).min(f32::from(bounds.size.height)) * 0.5 - 2.5)
-                .max(3.);
+            const TICKS: usize = 12;
+            let w = f32::from(bounds.size.width);
+            let h = f32::from(bounds.size.height);
+            let cx = f32::from(bounds.origin.x) + w * 0.5;
+            let cy = f32::from(bounds.origin.y) + h * 0.5;
+            let dot_d = (w.min(h) * 0.14).clamp(2.4, 4.0);
+            let dot_r = dot_d * 0.5;
+            let r = (w.min(h) * 0.5 - dot_r - 1.0).max(3.);
+            let lit = frac * TICKS as f32;
 
-            // Background full track circle.
-            if let Ok(path) = build_arc_path(cx, cy, r, 0., TAU, 36, 2.8) {
-                window.paint_path(path, track_color);
-            }
-            // Active countdown arc starting at 12 o'clock (-PI/2).
-            if frac > 0.01 {
-                let start = -std::f32::consts::FRAC_PI_2;
-                let sweep = TAU * frac;
-                let steps = ((frac * 36.).ceil() as usize).max(4);
-                if let Ok(path) = build_arc_path(cx, cy, r, start, sweep, steps, 3.0) {
-                    window.paint_path(path, arc_color);
-                }
+            for i in 0..TICKS {
+                let theta = -std::f32::consts::FRAC_PI_2 + (i as f32 / TICKS as f32) * TAU;
+                let strength = (lit - i as f32).clamp(0., 1.);
+                let col = if strength <= 0.02 {
+                    track_color
+                } else if strength >= 0.98 {
+                    active_color
+                } else {
+                    lerp_hsla(track_color, active_color, strength)
+                };
+                let mut quad = fill(
+                    Bounds::new(
+                        point(
+                            px(cx + r * theta.cos() - dot_r),
+                            px(cy + r * theta.sin() - dot_r),
+                        ),
+                        size(px(dot_d), px(dot_d)),
+                    ),
+                    col,
+                );
+                quad.corner_radii = Corners::all(px(dot_r));
+                window.paint_quad(quad);
             }
         },
     )
@@ -798,49 +861,16 @@ pub fn totp_ring(fraction: f32, urgent: bool, ring_size: f32) -> impl IntoElemen
     .flex_shrink_0()
 }
 
-/// Hardware-accelerated GPUI Canvas smooth rotating arc spinner for active sync/network jobs.
+/// Zero-Path hardware-instanced `PaintQuad` orbital spinner for active sync/network jobs.
 pub fn sync_spinner(angle_rad: f32, spinner_size: f32, color: Hsla) -> impl IntoElement {
-    let track_color = color.opacity(0.22);
     canvas(
         |_, _, _| (),
         move |bounds, _, window, _| {
-            let cx = f32::from(bounds.origin.x) + f32::from(bounds.size.width) * 0.5;
-            let cy = f32::from(bounds.origin.y) + f32::from(bounds.size.height) * 0.5;
-            let r = (f32::from(bounds.size.width).min(f32::from(bounds.size.height)) * 0.5 - 2.0)
-                .max(2.5);
-            if let Ok(track) = build_arc_path(cx, cy, r, 0., TAU, 24, 2.0) {
-                window.paint_path(track, track_color);
-            }
-            if let Ok(arc) = build_arc_path(cx, cy, r, angle_rad, TAU * 0.34, 14, 2.2) {
-                window.paint_path(arc, color);
-            }
+            paint_orbital_dots(bounds, angle_rad, color, window);
         },
     )
     .size(px(spinner_size))
     .flex_shrink_0()
-}
-
-fn build_arc_path(
-    cx: f32,
-    cy: f32,
-    r: f32,
-    start_angle: f32,
-    sweep: f32,
-    steps: usize,
-    stroke_width: f32,
-) -> gpui::Result<gpui::Path<gpui::Pixels>> {
-    let mut builder = PathBuilder::stroke(px(stroke_width));
-    let steps = steps.max(2);
-    for i in 0..=steps {
-        let theta = start_angle + sweep * (i as f32 / steps as f32);
-        let p: Point<gpui::Pixels> = point(px(cx + r * theta.cos()), px(cy + r * theta.sin()));
-        if i == 0 {
-            builder.move_to(p);
-        } else {
-            builder.line_to(p);
-        }
-    }
-    builder.build()
 }
 
 /// Floating bottom-center animated Toast pill with live countdown bar.

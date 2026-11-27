@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bytewarden_core::desktop::{Item, Overview, Session};
+use bytewarden_core::desktop::{Item, Session};
 use gpui::{Context, CursorStyle, Div, MouseButton, Stateful, div, prelude::*, px, uniform_list};
 use zeroize::Zeroizing;
 
@@ -112,12 +112,11 @@ impl VaultPreview {
                 .to_owned()
         };
 
-        let type_counts = self
-            .client
-            .overview
-            .as_ref()
-            .map(|o| count_by_type(o, self.client.selected_folder.as_deref()))
-            .unwrap_or([0; 9]);
+        let type_counts = self.ui.vault_type_counts(
+            self.client.overview_generation,
+            self.client.overview.as_ref(),
+            self.client.selected_folder.as_deref(),
+        );
 
         // Compact single-row header above the list pane.
         let list_header = div()
@@ -576,25 +575,31 @@ impl VaultPreview {
                 .copy_pulse
                 .sample_staggered(now, Duration::ZERO, self.animate);
 
-        // Row actions authorize and fetch the target detail on demand.
         let can_quick_copy =
             !self.selection.active && !restricted && !item.deleted && item.item_type == 1;
-        let show_totp_quick_copy = self.selected_item_id.as_deref() == Some(item.id.as_str())
+        let is_hovered = self.ui.hovered_vault_row == Some(index);
+        let (user_copied, pass_copied, totp_copied) =
+            if can_quick_copy && self.ui.has_active_copied_tag(now) {
+                (
+                    self.ui
+                        .is_recently_copied(&format!("row-user-{}", item.id), now),
+                    self.ui
+                        .is_recently_copied(&format!("row-pass-{}", item.id), now),
+                    self.ui
+                        .is_recently_copied(&format!("row-totp-{}", item.id), now),
+                )
+            } else {
+                (false, false, false)
+            };
+        let any_copied = user_copied || pass_copied || totp_copied;
+        let mount_quick_copy = can_quick_copy && (is_hovered || any_copied);
+        let show_totp_quick_copy = mount_quick_copy
+            && self.selected_item_id.as_deref() == Some(item.id.as_str())
             && self
                 .client
                 .detail
                 .as_ref()
                 .is_some_and(|detail| detail.totp.is_some());
-
-        let group_name: gpui::SharedString = format!("vault-row-{index}").into();
-        let copy_user_tag = format!("row-user-{}", item.id);
-        let copy_pass_tag = format!("row-pass-{}", item.id);
-        let copy_totp_tag = format!("row-totp-{}", item.id);
-        let user_copied = self.ui.is_recently_copied(&copy_user_tag, now);
-        let pass_copied = self.ui.is_recently_copied(&copy_pass_tag, now);
-        let totp_copied = self.ui.is_recently_copied(&copy_totp_tag, now);
-        let any_copied = user_copied || pass_copied || totp_copied;
-        let quick_copy_id = item.id.clone();
         let quick_bg = if is_selected {
             hex(pal.card)
         } else {
@@ -603,8 +608,22 @@ impl VaultPreview {
 
         div()
             .id(("item", index))
-            .group(group_name.clone())
             .cursor_pointer()
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                let next = if *hovered {
+                    Some(index)
+                } else if this.ui.hovered_vault_row == Some(index) {
+                    None
+                } else {
+                    return;
+                };
+                if this.ui.hovered_vault_row != next {
+                    this.ui.hovered_vault_row = next;
+                    if can_quick_copy {
+                        cx.notify();
+                    }
+                }
+            }))
             .relative()
             .w_full()
             .h(px(size::ROW))
@@ -743,12 +762,12 @@ impl VaultPreview {
                             }),
                     ),
             )
-            // Hover/focus revealed quick-copy pill cluster floating cleanly on the right edge
-            // so titles and usernames keep full horizontal breathing room at rest.
-            .when(can_quick_copy, |row| {
-                let username_id = quick_copy_id.clone();
-                let password_id = quick_copy_id.clone();
-                let totp_id = quick_copy_id.clone();
+            // Mount quick-copy pill cluster ONLY on the hovered (or recently-copied) row so
+            // scrolling 10,000 items pays zero hidden button/closure/string overhead per row.
+            .when(mount_quick_copy, |row| {
+                let username_id = item.id.clone();
+                let password_id = item.id.clone();
+                let totp_id = item.id.clone();
                 row.child(
                     div()
                         .absolute()
@@ -763,8 +782,6 @@ impl VaultPreview {
                         .flex()
                         .items_center()
                         .gap(px(2.))
-                        .opacity(if any_copied { 1. } else { 0. })
-                        .group_hover(group_name.clone(), |s| s.opacity(1.))
                         .child(
                             icon_btn(
                                 ("row-copy-user", index),
@@ -853,7 +870,36 @@ impl VaultPreview {
                         }),
                 )
             })
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    if this.selection.active || this.client.editor.is_some() {
+                        return;
+                    }
+                    let now = Instant::now();
+                    this.ui.close_popovers(this.animate);
+                    this.ui.ctx_menu = Some(super::state::VaultContextMenu {
+                        item_index: index,
+                        position: event.position,
+                    });
+                    this.ui.ctx_menu_spring = if this.animate {
+                        super::spring::Spring::launch(
+                            0.,
+                            1.,
+                            super::spring::SpringConfig::SNAPPY,
+                            now,
+                        )
+                    } else {
+                        super::spring::Spring::settled(1., super::spring::SpringConfig::SNAPPY, now)
+                    };
+                    cx.notify();
+                }),
+            )
             .on_click(cx.listener(move |this, _, _, cx| {
+                if this.ui.ctx_menu.is_some() {
+                    this.ui.close_popovers(this.animate);
+                }
                 if this.selection.active {
                     if !restricted {
                         this.toggle_selected_id(&id, cx);
@@ -950,10 +996,7 @@ impl VaultPreview {
         let session = self.client.state();
         let active_account = self.client.active();
         let (title, subtitle) = match session {
-            Session::Locked => (
-                "保险库已锁定",
-                "使用主密码离线解锁本机快照，或重新同步最新数据。",
-            ),
+            Session::Locked => ("保险库已锁定", "解锁后即可访问保险库。"),
             Session::Unlocked => (
                 "准备就绪，开始同步",
                 "连接服务器拉取并解密你的 Bitwarden 保险库。",
@@ -1055,7 +1098,9 @@ impl VaultPreview {
                                 .h(px(38.))
                                 .child(glyph_icon(glyph::SYNC, 15.))
                                 .child("同步保险库")
-                                .on_click(cx.listener(|this, _, _, cx| this.request_sync(cx))),
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.sync_or_reconnect(window, cx)
+                                })),
                             Session::SignedOut => btn("login", BtnVariant::Primary)
                                 .w_full()
                                 .h(px(38.))
@@ -1140,6 +1185,379 @@ impl VaultPreview {
             cx.notify();
         }
     }
+
+    /// Move vault list selection up (`delta = -1`) or down (`delta = 1`) via keyboard arrows.
+    pub fn step_vault_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if self.page != crate::Page::Vault
+            || self.client.overview.is_none()
+            || !self.client.ready()
+            || self.client.form.is_some()
+            || self.client.editor.is_some()
+            || self.ui.palette_open
+            || self.ui.shortcuts_open
+            || self.selection.pending.is_some()
+            || self.selection.active
+        {
+            return;
+        }
+        let indices = self.indices();
+        if indices.is_empty() {
+            return;
+        }
+        let next_pos = match self
+            .selected
+            .and_then(|sel| indices.iter().position(|&idx| idx == sel))
+        {
+            Some(pos) => {
+                if delta < 0 {
+                    pos.saturating_sub(1)
+                } else {
+                    (pos + 1).min(indices.len() - 1)
+                }
+            }
+            None => {
+                if delta < 0 {
+                    indices.len() - 1
+                } else {
+                    0
+                }
+            }
+        };
+        let next_index = indices[next_pos];
+        self.ui.close_popovers(self.animate);
+        self.scroll
+            .scroll_to_item(next_pos, gpui::ScrollStrategy::Center);
+        self.choose_item(next_index, cx);
+    }
+
+    /// Move currently selected vault item to Trash (or open permanent delete confirm if already in Trash).
+    pub fn delete_selected_vault_item(&mut self, cx: &mut Context<Self>) {
+        if self.page != crate::Page::Vault
+            || !self.write_available()
+            || self.client.form.is_some()
+            || self.client.editor.is_some()
+            || self.ui.palette_open
+            || self.ui.shortcuts_open
+            || self.selection.pending.is_some()
+            || self.selection.active
+        {
+            return;
+        }
+        let Some(index) = self.selected else {
+            return;
+        };
+        let Some(item) = self
+            .client
+            .overview
+            .as_ref()
+            .and_then(|o| o.items.get(index))
+        else {
+            return;
+        };
+        if item.restricted {
+            return;
+        }
+        let action = if item.deleted {
+            bytewarden_core::desktop::ItemAction::Delete
+        } else {
+            bytewarden_core::desktop::ItemAction::Trash
+        };
+        self.begin_action(action, cx);
+    }
+
+    /// Single floating right-click context menu mounted only while open (zero per-row cost at rest).
+    pub fn render_vault_context_menu(
+        &self,
+        progress: f32,
+        viewport: gpui::Size<gpui::Pixels>,
+        cx: &Context<Self>,
+    ) -> Div {
+        let Some(menu) = self.ui.ctx_menu else {
+            return div();
+        };
+        let Some(item) = self
+            .client
+            .overview
+            .as_ref()
+            .and_then(|o| o.items.get(menu.item_index))
+        else {
+            return div();
+        };
+        let pal = theme::palette();
+        let index = menu.item_index;
+        let item_id = item.id.clone();
+        let is_login = item.item_type == 1;
+        let is_favorite = item.favorite;
+        let is_archived = item.archived;
+        let is_deleted = item.deleted;
+        let is_restricted = item.restricted;
+        let can_mutate = self.write_available();
+        let can_quick_copy = !is_restricted && !is_deleted && is_login;
+        let show_totp = can_quick_copy
+            && self.selected_item_id.as_deref() == Some(item.id.as_str())
+            && self
+                .client
+                .detail
+                .as_ref()
+                .is_some_and(|d| d.totp.is_some());
+
+        let menu_w = 192.0f32;
+        let est_h = if can_quick_copy { 290.0f32 } else { 200.0f32 };
+        let max_x = (f32::from(viewport.width) - menu_w - 8.).max(8.);
+        let max_y = (f32::from(viewport.height) - est_h - 8.).max(44.);
+        let left = f32::from(menu.position.x).clamp(8., max_x);
+        let top = f32::from(menu.position.y).clamp(44., max_y) + 6. * (1. - progress);
+
+        let mut card = elevated_card()
+            .absolute()
+            .left(px(left))
+            .top(px(top))
+            .w(px(menu_w))
+            .p(px(6.))
+            .opacity(clamp_opacity(progress))
+            .occlude()
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation());
+
+        if can_quick_copy {
+            let uid = item_id.clone();
+            let pid = item_id.clone();
+            let tid = item_id.clone();
+            card = card
+                .child(
+                    btn("ctx-copy-user", BtnVariant::Subtle)
+                        .w_full()
+                        .justify_start()
+                        .h(px(30.))
+                        .text_size(px(13.))
+                        .child(glyph_icon(glyph::PERSON, 13.))
+                        .child("复制用户名")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.ui.close_popovers(this.animate);
+                            this.request_quick_copy(uid.clone(), QuickCopyAction::Username, cx);
+                        })),
+                )
+                .child(
+                    btn("ctx-copy-pass", BtnVariant::Subtle)
+                        .w_full()
+                        .justify_start()
+                        .h(px(30.))
+                        .text_size(px(13.))
+                        .child(glyph_icon(glyph::KEY, 13.))
+                        .child("复制密码")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.ui.close_popovers(this.animate);
+                            this.request_quick_copy(pid.clone(), QuickCopyAction::Password, cx);
+                        })),
+                )
+                .when(show_totp, |el| {
+                    el.child(
+                        btn("ctx-copy-totp", BtnVariant::Subtle)
+                            .w_full()
+                            .justify_start()
+                            .h(px(30.))
+                            .text_size(px(13.))
+                            .child(glyph_icon(glyph::CLOCK, 13.))
+                            .child("复制验证码")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.ui.close_popovers(this.animate);
+                                this.request_quick_copy(tid.clone(), QuickCopyAction::Totp, cx);
+                            })),
+                    )
+                })
+                .child(div().h(px(1.)).my(px(2.)).bg(hex(pal.border_subtle)));
+        }
+
+        if self.selected != Some(index) {
+            card = card.child(
+                btn("ctx-open", BtnVariant::Subtle)
+                    .w_full()
+                    .justify_start()
+                    .h(px(30.))
+                    .text_size(px(13.))
+                    .child(glyph_icon(glyph::EYE, 13.))
+                    .child("查看详情")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.ui.close_popovers(this.animate);
+                        this.choose_item(index, cx);
+                    })),
+            );
+        }
+
+        if can_mutate && !is_deleted && !is_restricted {
+            let fav_id = item_id.clone();
+            let edit_id = item_id.clone();
+            let clone_id = item_id.clone();
+            card = card
+                .child(
+                    btn("ctx-edit", BtnVariant::Subtle)
+                        .w_full()
+                        .justify_start()
+                        .h(px(30.))
+                        .text_size(px(13.))
+                        .child(glyph_icon(glyph::EDIT, 13.))
+                        .child("编辑条目")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.ui.close_popovers(this.animate);
+                            this.selected = Some(index);
+                            this.selected_item_id = Some(edit_id.clone());
+                            this.edit_item(cx);
+                        })),
+                )
+                .child(
+                    btn("ctx-fav", BtnVariant::Subtle)
+                        .w_full()
+                        .justify_start()
+                        .h(px(30.))
+                        .text_size(px(13.))
+                        .child(glyph_icon(
+                            if is_favorite {
+                                glyph::STAR_SOLID
+                            } else {
+                                glyph::STAR
+                            },
+                            13.,
+                        ))
+                        .child(if is_favorite {
+                            "取消收藏"
+                        } else {
+                            "收藏条目"
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.ui.close_popovers(this.animate);
+                            this.selected = Some(index);
+                            this.selected_item_id = Some(fav_id.clone());
+                            this.begin_action(
+                                if is_favorite {
+                                    bytewarden_core::desktop::ItemAction::Unfavorite
+                                } else {
+                                    bytewarden_core::desktop::ItemAction::Favorite
+                                },
+                                cx,
+                            );
+                        })),
+                )
+                .child(
+                    btn("ctx-clone", BtnVariant::Subtle)
+                        .w_full()
+                        .justify_start()
+                        .h(px(30.))
+                        .text_size(px(13.))
+                        .child(glyph_icon(glyph::COPY, 13.))
+                        .child("克隆条目")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.ui.close_popovers(this.animate);
+                            this.selected = Some(index);
+                            this.selected_item_id = Some(clone_id.clone());
+                            this.clone_item(cx);
+                        })),
+                );
+        }
+
+        if can_mutate && !is_deleted {
+            let arch_id = item_id.clone();
+            let trash_id = item_id.clone();
+            card = card
+                .child(
+                    btn("ctx-archive", BtnVariant::Subtle)
+                        .w_full()
+                        .justify_start()
+                        .h(px(30.))
+                        .text_size(px(13.))
+                        .child(glyph_icon(glyph::ARCHIVE, 13.))
+                        .child(if is_archived {
+                            "取消归档"
+                        } else {
+                            "归档"
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.ui.close_popovers(this.animate);
+                            this.selected = Some(index);
+                            this.selected_item_id = Some(arch_id.clone());
+                            this.begin_action(
+                                if is_archived {
+                                    bytewarden_core::desktop::ItemAction::Unarchive
+                                } else {
+                                    bytewarden_core::desktop::ItemAction::Archive
+                                },
+                                cx,
+                            );
+                        })),
+                )
+                .child(div().h(px(1.)).my(px(2.)).bg(hex(pal.border_subtle)))
+                .child(
+                    btn("ctx-trash", BtnVariant::Danger)
+                        .w_full()
+                        .justify_start()
+                        .h(px(30.))
+                        .text_size(px(13.))
+                        .child(glyph_icon(glyph::DELETE, 13.))
+                        .child("移至回收站")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.ui.close_popovers(this.animate);
+                            this.selected = Some(index);
+                            this.selected_item_id = Some(trash_id.clone());
+                            this.begin_action(bytewarden_core::desktop::ItemAction::Trash, cx);
+                        })),
+                );
+        } else if can_mutate && is_deleted {
+            let res_id = item_id.clone();
+            let del_id = item_id.clone();
+            card = card
+                .child(
+                    btn("ctx-restore", BtnVariant::Tinted)
+                        .w_full()
+                        .justify_start()
+                        .h(px(30.))
+                        .text_size(px(13.))
+                        .child(glyph_icon(glyph::RESTORE, 13.))
+                        .child("还原条目")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.ui.close_popovers(this.animate);
+                            this.selected = Some(index);
+                            this.selected_item_id = Some(res_id.clone());
+                            this.begin_action(bytewarden_core::desktop::ItemAction::Restore, cx);
+                        })),
+                )
+                .child(
+                    btn("ctx-delete-perm", BtnVariant::Danger)
+                        .w_full()
+                        .justify_start()
+                        .h(px(30.))
+                        .text_size(px(13.))
+                        .child(glyph_icon(glyph::DELETE, 13.))
+                        .child("永久删除")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.ui.close_popovers(this.animate);
+                            this.selected = Some(index);
+                            this.selected_item_id = Some(del_id.clone());
+                            this.begin_action(bytewarden_core::desktop::ItemAction::Delete, cx);
+                        })),
+                );
+        }
+
+        div()
+            .absolute()
+            .inset_0()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.ui.close_popovers(this.animate);
+                    cx.notify();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, _, _, cx| {
+                    this.ui.close_popovers(this.animate);
+                    cx.notify();
+                }),
+            )
+            .child(card)
+    }
 }
 
 pub fn type_label(item_type: u8) -> &'static str {
@@ -1147,24 +1565,4 @@ pub fn type_label(item_type: u8) -> &'static str {
         .iter()
         .find(|(filter, _, _)| *filter == Filter::Kind(item_type))
         .map_or("条目", |(_, label, _)| *label)
-}
-
-fn count_by_type(overview: &Overview, folder: Option<&str>) -> [usize; 9] {
-    let mut counts = [0usize; 9];
-    for item in &overview.items {
-        if item.deleted || item.archived {
-            continue;
-        }
-        if let Some(folder_id) = folder
-            && item.folder_id.as_deref().unwrap_or("") != folder_id
-        {
-            continue;
-        }
-        counts[0] += 1;
-        let idx = usize::from(item.item_type);
-        if (1..=8).contains(&idx) {
-            counts[idx] += 1;
-        }
-    }
-    counts
 }

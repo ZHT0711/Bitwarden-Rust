@@ -11,12 +11,14 @@ mod generator;
 mod generator_preferences;
 mod input;
 mod motion;
+mod passkeys;
 mod sends;
 mod sensitive_text;
 mod settings;
 mod startup;
 mod theme;
 mod timeout;
+mod totp_qr;
 mod tray;
 mod ui;
 mod vault_list;
@@ -33,10 +35,12 @@ use bytewarden_core::desktop::{self, Item, ItemAction, Request};
 use client::{Client, Form};
 use generator::Generator;
 use gpui::{
-    App, Application, Bounds, Context, FocusHandle, KeyBinding, MouseButton, TitlebarOptions,
-    UniformListScrollHandle, Window, WindowBounds, WindowOptions, actions, div, prelude::*, px,
-    size, uniform_list,
+    App, Application, Context, FocusHandle, KeyBinding, MouseButton, TitlebarOptions,
+    UniformListScrollHandle, Window, WindowOptions, actions, div, prelude::*, px, size,
+    uniform_list,
 };
+#[cfg(test)]
+use gpui::{Bounds, WindowBounds};
 use motion::{CONTENT_TIME, RAIL, Sidebar, Tween};
 use vault_list::{Filter, Sort};
 use zeroize::Zeroizing;
@@ -62,7 +66,10 @@ actions!(
         DismissNavigation,
         ToggleSelection,
         SelectVisible,
-        ClearSelection
+        ClearSelection,
+        VaultNavUp,
+        VaultNavDown,
+        VaultDelete
     ]
 );
 
@@ -97,6 +104,7 @@ struct VaultPreview {
     favicon_cache: favicon::FaviconCache,
     tray: Option<tray::Tray>,
     single_instance: Option<tray::SingleInstance>,
+    passkeys: passkeys::PasskeyState,
     clipboard: clipboard::Clipboard,
     clipboard_generation: u64,
     confirm_attachment: Option<String>,
@@ -268,6 +276,7 @@ impl VaultPreview {
             favicon_cache: favicon::FaviconCache::default(),
             tray: None,
             single_instance: None,
+            passkeys: passkeys::PasskeyState::default(),
             clipboard: clipboard::Clipboard::default(),
             clipboard_generation: 0,
             confirm_attachment: None,
@@ -284,6 +293,7 @@ impl VaultPreview {
         focus.focus(window);
         ui::brand::apply_window_icon(window);
         let mut view = Self::initial_state(window, settings::Settings::load(), focus, cx);
+        tray::apply_screen_capture_protection(window, view.settings.prevent_screenshots);
         view.client
             .search
             .update(cx, |input, _| input.set_borderless(true));
@@ -311,6 +321,8 @@ impl VaultPreview {
         let weak = cx.weak_entity();
         window.on_window_should_close(cx, move |window, cx| {
             weak.update(cx, |this, cx| {
+                this.settings.capture_window_bounds(window);
+                this.settings.save_silent();
                 let tray_registered = this.tray.as_ref().is_some_and(tray::Tray::is_registered);
                 let exit_requested = this
                     .tray
@@ -336,6 +348,7 @@ impl VaultPreview {
         });
         view.initialize_timeouts(window, cx);
         view.observe_generator(cx);
+        view.start_passkey_provider(window, cx);
         view.initialize(cx);
         view
     }
@@ -346,6 +359,7 @@ impl VaultPreview {
         }
         self.closing = true;
         self.stop_timeouts();
+        self.stop_passkey_provider(cx);
         self.favicon_cache.clear();
         self.selection.clear();
         self.selection_password
@@ -392,6 +406,20 @@ impl VaultPreview {
         self.scroll = UniformListScrollHandle::new();
     }
 
+    fn refresh_search_index(&mut self) {
+        if self.index_generation != Some(self.client.overview_generation) {
+            self.search_index = self
+                .client
+                .overview
+                .as_ref()
+                .map_or_else(vault_list::Index::default, |overview| {
+                    vault_list::Index::new(&overview.items)
+                });
+            self.index_generation = Some(self.client.overview_generation);
+            self.invalidate_query();
+        }
+    }
+
     fn indices(&mut self) -> Rc<[usize]> {
         let account = self.client.active().map(|account| account.id.clone());
         let icon_account = self
@@ -421,17 +449,7 @@ impl VaultPreview {
         }) {
             self.selection.blocked_generation = None;
         }
-        if self.index_generation != Some(self.client.overview_generation) {
-            self.search_index = self
-                .client
-                .overview
-                .as_ref()
-                .map_or_else(vault_list::Index::default, |overview| {
-                    vault_list::Index::new(&overview.items)
-                });
-            self.index_generation = Some(self.client.overview_generation);
-            self.invalidate_query();
-        }
+        self.refresh_search_index();
         let projection_changed = self.projection.is_none();
         let indices = self
             .projection
@@ -1517,6 +1535,7 @@ impl Render for VaultPreview {
         let (accounts_p, accounts_anim) = self.ui.accounts_spring.sample(now, self.animate);
         let (_, menu_anim) = self.ui.item_menu_spring.sample(now, self.animate);
         let (_, new_menu_anim) = self.ui.new_menu_spring.sample(now, self.animate);
+        let (ctx_menu_p, ctx_menu_anim) = self.ui.ctx_menu_spring.sample(now, self.animate);
         let (_, editor_gen_anim) = self.ui.editor_gen_spring.sample(now, self.animate);
         let (palette_p, palette_anim) = self.ui.palette_spring.sample(now, self.animate);
         let (shortcuts_p, shortcuts_anim) = self.ui.shortcuts_spring.sample(now, self.animate);
@@ -1533,10 +1552,6 @@ impl Render for VaultPreview {
         let (_, gen_result_anim) = self.ui.generator_result_spring.sample(now, self.animate);
         let dynamic_anim = self.ui.sample_dynamic_springs(now, self.animate);
         let busy_spinning = self.client.busy.is_some() && self.animate;
-        let skeleton_anim = self.animate
-            && self.client.detail.is_none()
-            && self.selected.is_some()
-            && self.ui.detail_loading_since.is_some();
 
         let (_, toast_anim) = self.ui.toast.sample(now, self.animate);
 
@@ -1553,7 +1568,13 @@ impl Render for VaultPreview {
         let is_full_auth_form = matches!(self.client.form, Some(Form::SignIn | Form::Unlock));
         let is_modal_form = matches!(
             self.client.form,
-            Some(Form::Detail | Form::EditorPassword | Form::Reverify(_) | Form::Confirm(_))
+            Some(
+                Form::HelloEnrollment
+                    | Form::Detail
+                    | Form::EditorPassword
+                    | Form::Reverify(_)
+                    | Form::Confirm(_)
+            )
         );
 
         let persistent_banner = self.render_persistent_banner(now, cx);
@@ -1577,6 +1598,7 @@ impl Render for VaultPreview {
             || accounts_anim
             || menu_anim
             || new_menu_anim
+            || ctx_menu_anim
             || editor_gen_anim
             || palette_anim
             || shortcuts_anim
@@ -1595,7 +1617,6 @@ impl Render for VaultPreview {
             || dynamic_anim
             || toast_anim
             || busy_spinning
-            || skeleton_anim
         {
             window.request_animation_frame();
         } else if !self.animate
@@ -1772,7 +1793,10 @@ impl Render for VaultPreview {
                 } else if this.client.show_accounts {
                     this.client.show_accounts = false;
                     cx.notify();
-                } else if this.ui.item_menu_open || this.ui.new_menu_open || this.ui.editor_gen_open
+                } else if this.ui.item_menu_open
+                    || this.ui.new_menu_open
+                    || this.ui.editor_gen_open
+                    || this.ui.ctx_menu.is_some()
                 {
                     this.ui.close_popovers(this.animate);
                     cx.notify();
@@ -1784,6 +1808,8 @@ impl Render for VaultPreview {
                     this.focus.focus(window);
                     this.session_notice();
                     cx.notify();
+                } else if this.passkeys.has_modal() {
+                    this.clear_passkey_modal(true, cx);
                 } else if this.folders.has_form() && this.client.ready() {
                     this.folders.dismiss_form();
                     cx.notify();
@@ -1792,14 +1818,19 @@ impl Render for VaultPreview {
                 }
             }))
             .on_action(cx.listener(|this, _: &Lock, _, cx| this.request_lock(cx)))
-            .on_action(cx.listener(|this, _: &Sync, _, cx| {
-                if this.selection.pending.is_none() {
-                    this.request_sync(cx);
-                }
-            }))
+            .on_action(cx.listener(|this, _: &Sync, window, cx| this.sync_or_reconnect(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleSelection, _, cx| this.toggle_selection(cx)))
             .on_action(cx.listener(|this, _: &SelectVisible, _, cx| this.select_visible(cx)))
             .on_action(cx.listener(|this, _: &ClearSelection, _, cx| this.clear_selection(cx)))
+            .on_action(cx.listener(|this, _: &VaultNavUp, _, cx| {
+                this.step_vault_selection(-1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &VaultNavDown, _, cx| {
+                this.step_vault_selection(1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &VaultDelete, _, cx| {
+                this.delete_selected_vault_item(cx);
+            }))
             .on_action(cx.listener(|this, _: &SaveEditor, _, cx| {
                 if this.client.editor.is_some() {
                     this.save_editor(cx);
@@ -1962,6 +1993,10 @@ impl Render for VaultPreview {
                         )
                     }),
             )
+            // Floating Vault Row Right-Click Context Menu.
+            .when(self.ui.ctx_menu.is_some() || ctx_menu_p > 0.02, |root| {
+                root.child(self.render_vault_context_menu(ctx_menu_p, window.viewport_size(), cx))
+            })
             // Floating Account Switcher Popover.
             .when(self.client.show_accounts || accounts_p > 0.02, |root| {
                 root.child(self.render_account_popover(accounts_p, compact_chrome, cx))
@@ -2026,6 +2061,17 @@ impl Render for VaultPreview {
                     ))
                 },
             )
+            // Centered Modal for Windows Native Passkey Provider requests.
+            .when(self.passkeys.has_modal(), |root| {
+                root.child(self.render_modal_overlay(
+                    1.,
+                    self.render_passkey_modal(cx),
+                    |this, _, cx| {
+                        this.clear_passkey_modal(true, cx);
+                    },
+                    cx,
+                ))
+            })
             // Command Palette (`Ctrl+K`).
             .when(self.ui.palette_open || palette_p > 0.02, |root| {
                 root.child(self.render_command_palette(palette_p, cx))
@@ -2061,8 +2107,15 @@ fn bind_shortcuts(cx: &mut App) {
         KeyBinding::new("ctrl-shift-s", ToggleSelection, None),
         KeyBinding::new("ctrl-shift-a", SelectVisible, None),
         KeyBinding::new("ctrl-shift-d", ClearSelection, None),
+        KeyBinding::new("up", VaultNavUp, None),
+        KeyBinding::new("down", VaultNavDown, None),
+        KeyBinding::new("delete", VaultDelete, None),
     ]);
 }
+
+#[cfg(all(test, windows))]
+#[path = "../../../work/gpui-auth-memory-probe.rs"]
+mod native_auth_memory_probe;
 
 fn main() {
     let startup_requested =
@@ -2080,14 +2133,7 @@ fn main() {
             }
         })
         .detach();
-        let bounds = Bounds::centered(
-            None,
-            size(
-                px(ui::tokens::size::WINDOW_DEFAULT_W),
-                px(ui::tokens::size::WINDOW_DEFAULT_H),
-            ),
-            cx,
-        );
+        let initial_bounds = settings::Settings::load().initial_window_bounds(cx);
         let single_instance_for_window = single_instance.clone();
         let window = match cx.open_window(
             WindowOptions {
@@ -2096,7 +2142,7 @@ fn main() {
                     appears_transparent: true,
                     ..Default::default()
                 }),
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_bounds: Some(initial_bounds),
                 window_min_size: Some(size(px(420.), px(410.))),
                 show: !startup_requested,
                 ..Default::default()
@@ -2105,10 +2151,7 @@ fn main() {
                 let view = cx.new(|cx| VaultPreview::new(window, cx));
                 let weak = view.downgrade();
                 let app = cx.to_async();
-                let mut guard = single_instance_for_window.borrow_mut().take();
-                if let Some(instance) = guard.as_mut() {
-                    instance.attach_window(window);
-                }
+                let guard = single_instance_for_window.borrow_mut().take();
                 view.update(cx, |this, _cx| {
                     this.single_instance = guard;
                     if this.settings.keep_in_tray {
@@ -2158,5 +2201,10 @@ fn main() {
         if !started_hidden {
             cx.activate(true);
         }
+        let _ = window.update(cx, |view, window, _| {
+            if let Some(instance) = &mut view.single_instance {
+                instance.attach_window(window);
+            }
+        });
     });
 }

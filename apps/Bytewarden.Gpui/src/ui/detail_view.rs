@@ -96,8 +96,7 @@ impl VaultPreview {
                         now.saturating_duration_since(started)
                     });
                 if elapsed >= Duration::from_millis(120) {
-                    let phase = elapsed.as_secs_f32() * 0.75;
-                    container.child(detail_skeleton(phase))
+                    container.child(detail_skeleton(0.25))
                 } else {
                     // Hold calm canvas during fast local decryption (< 120ms) to avoid empty-state flash.
                     container

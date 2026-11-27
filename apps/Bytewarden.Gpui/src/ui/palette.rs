@@ -77,38 +77,26 @@ impl VaultPreview {
         cx.notify();
     }
 
-    pub fn collect_palette_entries(&self) -> Vec<PaletteEntry> {
+    pub fn collect_palette_entries(&mut self) -> Vec<PaletteEntry> {
+        self.refresh_search_index();
         let query = self.ui.palette_query.trim().to_lowercase();
         let mut entries = Vec::new();
 
-        // 1. Matching vault items (up to 6, metadata-only search, never touches secrets).
         if let Some(overview) = &self.client.overview {
-            let mut item_hits = 0usize;
-            for (index, item) in overview.items.iter().enumerate() {
-                if item.deleted {
-                    continue;
-                }
-                let matches = query.is_empty()
-                    || item.name.to_lowercase().contains(&query)
-                    || item.subtitle.to_lowercase().contains(&query);
-                if matches {
-                    entries.push(PaletteEntry {
-                        title: item.name.clone(),
-                        subtitle: if item.subtitle.is_empty() {
-                            "保险库条目".into()
-                        } else {
-                            item.subtitle.clone()
-                        },
-                        icon_glyph: vault_list::icon_for(item),
-                        shortcut: None,
-                        item_type: Some(item.item_type),
-                        action: PaletteAction::OpenItem(index),
-                    });
-                    item_hits += 1;
-                    if item_hits >= if query.is_empty() { 4 } else { 6 } {
-                        break;
-                    }
-                }
+            for &index in self.search_index.palette_items(&overview.items, &query) {
+                let item = &overview.items[index];
+                entries.push(PaletteEntry {
+                    title: item.name.clone(),
+                    subtitle: if item.subtitle.is_empty() {
+                        "保险库条目".into()
+                    } else {
+                        item.subtitle.clone()
+                    },
+                    icon_glyph: vault_list::icon_for(item),
+                    shortcut: None,
+                    item_type: Some(item.item_type),
+                    action: PaletteAction::OpenItem(index),
+                });
             }
         }
 
@@ -141,9 +129,14 @@ impl VaultPreview {
                 });
             }
         }
-        if self.client.sync_available() {
+        if self.client.sync_available() || self.client.reconnect_available() {
             commands.push(PaletteEntry {
-                title: "同步保险库".into(),
+                title: if self.client.reconnect_available() {
+                    "重新连接账户"
+                } else {
+                    "同步保险库"
+                }
+                .into(),
                 subtitle: "从服务器拉取最新加密数据".into(),
                 icon_glyph: glyph::SYNC,
                 shortcut: Some("Ctrl+R"),
@@ -303,7 +296,7 @@ impl VaultPreview {
                 self.open_page(Page::Vault, cx);
                 self.new_item(window, cx);
             }
-            PaletteAction::Sync => self.request_sync(cx),
+            PaletteAction::Sync => self.sync_or_reconnect(window, cx),
             PaletteAction::Lock => self.request_lock(cx),
             PaletteAction::OpenPage(page) => self.open_page(page, cx),
             PaletteAction::OpenSettings(tab) => {
@@ -374,7 +367,7 @@ impl VaultPreview {
     }
 
     pub fn render_command_palette(
-        &self,
+        &mut self,
         progress: f32,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {

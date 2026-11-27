@@ -8,6 +8,7 @@ license.workspace = true
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
+aes.workspace = true
 aes-gcm.workspace = true
 async-trait.workspace = true
 argon2.workspace = true
@@ -24,6 +25,7 @@ bitwarden-generators.workspace = true
 bitwarden-fido.workspace = true
 bw-sdk-core = { workspace = true, features = ["internal"] }
 bytes.workspace = true
+cbc.workspace = true
 chrono.workspace = true
 csv.workspace = true
 hmac.workspace = true

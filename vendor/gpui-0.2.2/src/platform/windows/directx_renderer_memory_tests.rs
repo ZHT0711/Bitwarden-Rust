@@ -61,7 +61,8 @@ fn assert_red_pixel(renderer: &mut DirectXRenderer, scene: &Scene) {
     renderer.draw_paths_from_intermediate(&scene.paths).unwrap();
     unsafe {
         let mut desc = D3D11_TEXTURE2D_DESC::default();
-        renderer.resources.render_target.GetDesc(&mut desc);
+        let target = renderer.resources.render_target.as_ref().unwrap();
+        target.GetDesc(&mut desc);
         desc.Usage = D3D11_USAGE_STAGING;
         desc.BindFlags = 0;
         desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
@@ -74,7 +75,7 @@ fn assert_red_pixel(renderer: &mut DirectXRenderer, scene: &Scene) {
             .unwrap();
         let staging = staging.unwrap();
         let context = &renderer.devices.device_context;
-        context.CopyResource(&staging, &*renderer.resources.render_target);
+        context.CopyResource(&staging, target);
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
         context
             .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
@@ -153,4 +154,15 @@ fn paths_allocate_on_first_use_release_and_recover_after_resize() {
     assert_red_pixel(&mut renderer, &scene);
     renderer.draw(&Scene::default()).unwrap();
     assert!(renderer.resources.path_resources.is_none());
+}
+
+#[::core::prelude::v1::test]
+fn draw_recreates_released_render_target_at_the_same_size() {
+    let window = TestWindow::new();
+    let devices = DirectXDevices::new().unwrap();
+    let mut renderer = DirectXRenderer::new(window.0, &devices, true).unwrap();
+    renderer.resources.release_targets();
+    renderer.draw(&Scene::default()).unwrap();
+    assert!(renderer.resources.render_target.is_some());
+    assert!(renderer.resources.render_target_view[0].is_some());
 }

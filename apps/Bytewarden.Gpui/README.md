@@ -13,6 +13,12 @@ cargo run --locked --manifest-path apps/Bytewarden.Gpui/Cargo.toml
 cargo test --locked --manifest-path apps/Bytewarden.Gpui/Cargo.toml
 ```
 
+## 登录与解锁
+
+首次登录或重新连接账户时，GPUI 会在同一流程中完成服务器认证和同步。重启后恢复的账户可选「解锁并同步」或「仅离线解锁」。服务器认证成功但同步失败时，已有快照以只读方式打开，之后可直接重试同步。
+
+Windows Hello 在「设置 → 安全」按账户启用。先同步一次保险库，再用主密码和 Windows Hello 完成设置。锁定后可用 Windows Hello 解锁本机快照，也可使用主密码。自动提示可在同一设置页开启。
+
 ## 快捷键
 
 `Ctrl+B` 切换侧栏，`Ctrl+F` 搜索，`Ctrl+N` 新增，`Ctrl+E` 编辑，`Ctrl+R` 同步，`Ctrl+L` 锁定。可用性随当前页面、登录、锁定和离线只读状态变化。

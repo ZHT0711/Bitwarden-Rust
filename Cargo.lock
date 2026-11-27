@@ -937,6 +937,7 @@ checksum = "776dfebd015e2d8732c684a2c71003674ccb49457b539b9e82151ba38e96dd7c"
 name = "bytewarden-core"
 version = "0.2.0"
 dependencies = [
+ "aes 0.9.4",
  "aes-gcm 0.10.3",
  "argon2 0.5.3",
  "async-trait",
@@ -954,6 +955,7 @@ dependencies = [
  "bitwarden-state",
  "bitwarden-vault",
  "bytes",
+ "cbc",
  "chrono",
  "csv",
  "hmac 0.13.0",

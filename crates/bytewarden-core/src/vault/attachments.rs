@@ -1,23 +1,35 @@
-use std::{io::Write, path::Path, sync::OnceLock, time::Duration};
+use std::{
+    io::{SeekFrom, Write},
+    path::Path,
+    sync::OnceLock,
+    time::Duration,
+};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use bitwarden_api_base::AuthRequired;
+use bitwarden_crypto::{
+    IdentifyKey, PrimitiveEncryptable, SymmetricCryptoKey, SymmetricKeyAlgorithm,
+};
 use bitwarden_vault::{
     AttachmentFileUploadType, AttachmentView, Cipher, CipherCreateAttachmentError,
     CipherDeleteAttachmentError, CipherId, CipherView, CreateAttachmentRequest, CreatedAttachment,
     VaultClientExt,
 };
 use bw_sdk_core::Client;
-use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use reqwest::{multipart, redirect::Policy, StatusCode};
 use serde::Serialize;
-use tokio::io::AsyncReadExt;
+use tokio::{
+    fs::File,
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+};
 use url::Url;
 use zeroize::Zeroizing;
 
 use super::{VaultCache, VaultError, VaultMutationResult};
 use crate::auth_request;
+
+mod stream;
 
 // Bitwarden Desktop allows 500 MiB of plaintext. Allow for encrypted framing and padding.
 const MAX_FILE_BYTES: usize = 500 * 1024 * 1024;
@@ -126,18 +138,18 @@ impl VaultCache {
         Ok((cipher, view))
     }
 
-    pub(crate) async fn decrypt_attachment(
+    pub(crate) async fn stage_attachment_download(
         &self,
         client: &Client,
         api_url: &str,
-        item_id: &str,
-        revision: &str,
+        detail: (&str, &str),
         attachment_id: &str,
-    ) -> Result<Zeroizing<Vec<u8>>, VaultError> {
+        destination: &Path,
+    ) -> Result<tempfile::NamedTempFile, VaultError> {
         if !valid_id(attachment_id) {
             return Err(VaultError::Validation);
         }
-        let (cipher, view) = self.attachment_item(client, item_id, revision).await?;
+        let (cipher, view) = self.attachment_item(client, detail.0, detail.1).await?;
         let attachment = view
             .attachments
             .into_iter()
@@ -158,11 +170,57 @@ impl VaultCache {
         .await
         .map_err(|_| VaultError::AttachmentDownloadFailed)?
         .map_err(|_| VaultError::AttachmentDownloadFailed)?;
-        let encrypted = download_blob(api_url, &url).await?;
-        attachments
-            .decrypt_buffer(cipher, attachment, &encrypted)
-            .map(Zeroizing::new)
-            .map_err(|_| VaultError::DecryptionFailed)
+        let (mut encrypted, length) = download_blob(api_url, &url).await?;
+        if encrypted
+            .read_u8()
+            .await
+            .map_err(|_| VaultError::DecryptionFailed)?
+            == stream::LEGACY_FORMAT
+        {
+            let key = match attachment.key {
+                Some(key) => key,
+                None => {
+                    let ctx = client.internal.get_key_store().context();
+                    // Old attachments with no attachment key use the user or org key.
+                    #[allow(deprecated)]
+                    ctx.dangerous_get_symmetric_key(cipher.key_identifier())
+                        .map_err(|_| VaultError::DecryptionFailed)?
+                        .clone()
+                }
+            };
+            return stream::decrypt(encrypted, length, &key, destination).await;
+        }
+
+        // Other SDK formats retain their existing reader until a compatible streaming
+        // implementation is available. Plaintext is staged only after SDK verification.
+        encrypted
+            .seek(SeekFrom::Start(0))
+            .await
+            .map_err(|_| VaultError::FileAccess)?;
+        let mut contents = Vec::new();
+        contents
+            .try_reserve_exact(length as usize)
+            .map_err(|_| VaultError::AttachmentTooLarge)?;
+        encrypted
+            .read_to_end(&mut contents)
+            .await
+            .map_err(|_| VaultError::FileAccess)?;
+        let plaintext = Zeroizing::new(
+            attachments
+                .decrypt_buffer(cipher, attachment, &contents)
+                .map_err(|_| VaultError::DecryptionFailed)?,
+        );
+        drop(contents);
+        let temporary = download_temporary(destination)?;
+        let mut file = File::from_std(temporary.reopen().map_err(|_| VaultError::FileAccess)?);
+        for block in plaintext.chunks(64 * 1024) {
+            file.write_all(block)
+                .await
+                .map_err(|_| VaultError::FileAccess)?;
+        }
+        file.flush().await.map_err(|_| VaultError::FileAccess)?;
+        file.sync_all().await.map_err(|_| VaultError::FileAccess)?;
+        Ok(temporary)
     }
 
     pub(crate) async fn upload_attachment(
@@ -183,34 +241,35 @@ impl VaultCache {
             .and_then(|name| name.to_str())
             .filter(|_| source.is_absolute())
             .ok_or(VaultError::AttachmentFileRead)?;
-        let contents = read_upload_file(source, MAX_FILE_BYTES).await?;
+        let (source, length) = open_upload_file(source, MAX_FILE_BYTES).await?;
         self.activate(client);
         let attachments = client.vault().attachments();
-        let encrypted = attachments
-            .encrypt_buffer(
-                original.clone(),
-                AttachmentView {
-                    file_name: Some(name.to_owned()),
-                    id: None,
-                    url: None,
-                    size: None,
-                    size_name: None,
-                    key: None,
-                },
-                &contents,
-            )
-            .map_err(|_| VaultError::AttachmentUploadFailed)?;
-        drop(contents);
-        let request = CreateAttachmentRequest {
-            key: encrypted
-                .attachment
+        let (key, wrapped_key, file_name) = {
+            let mut ctx = client.internal.get_key_store().context();
+            let owner = original.key_identifier();
+            let cipher_key = original
                 .key
-                .ok_or(VaultError::AttachmentUploadFailed)?,
-            file_name: encrypted
-                .attachment
-                .file_name
-                .ok_or(VaultError::AttachmentUploadFailed)?,
-            file_size: encrypted.contents.len() as u64,
+                .as_ref()
+                .map(|wrapped| ctx.unwrap_symmetric_key(owner, wrapped))
+                .transpose()
+                .map_err(|_| VaultError::AttachmentUploadFailed)?
+                .unwrap_or(owner);
+            let key = SymmetricCryptoKey::make(SymmetricKeyAlgorithm::Aes256CbcHmac);
+            let slot = ctx.add_local_symmetric_key(key.clone());
+            let wrapped = ctx
+                .wrap_symmetric_key(cipher_key, slot)
+                .map_err(|_| VaultError::AttachmentUploadFailed)?;
+            let file_name = name
+                .encrypt(&mut ctx, cipher_key)
+                .map_err(|_| VaultError::AttachmentUploadFailed)?;
+            (key, wrapped, file_name)
+        };
+        let (encrypted, file_size) = stream::encrypt(source, length, &key).await?;
+        drop(key);
+        let request = CreateAttachmentRequest {
+            key: wrapped_key,
+            file_name,
+            file_size,
             last_known_revision_date: original.revision_date,
         };
         if !auth_request::is_current(request_id) {
@@ -243,10 +302,7 @@ impl VaultCache {
         }
         self.secure_metadata_cache(original).await?;
         Box::pin(upload_payload(
-            client,
-            cipher_id,
-            &created,
-            Bytes::from(encrypted.contents),
+            client, cipher_id, &created, encrypted, file_size,
         ))
         .await?;
         *pending = None;
@@ -314,7 +370,23 @@ pub(crate) async fn read_upload_file(
     path: &Path,
     limit: usize,
 ) -> Result<Zeroizing<Vec<u8>>, VaultError> {
-    let file = tokio::fs::File::open(path)
+    let (file, length) = open_upload_file(path, limit).await?;
+    let mut contents = Zeroizing::new(Vec::new());
+    contents
+        .try_reserve_exact(length as usize)
+        .map_err(|_| VaultError::AttachmentTooLarge)?;
+    file.take(limit as u64 + 1)
+        .read_to_end(&mut contents)
+        .await
+        .map_err(|_| VaultError::AttachmentFileRead)?;
+    if contents.len() > limit {
+        return Err(VaultError::AttachmentTooLarge);
+    }
+    Ok(contents)
+}
+
+async fn open_upload_file(path: &Path, limit: usize) -> Result<(File, u64), VaultError> {
+    let file = File::open(path)
         .await
         .map_err(|_| VaultError::AttachmentFileRead)?;
     let meta = file
@@ -327,18 +399,7 @@ pub(crate) async fn read_upload_file(
     if meta.len() > limit as u64 {
         return Err(VaultError::AttachmentTooLarge);
     }
-    let mut contents = Zeroizing::new(Vec::new());
-    contents
-        .try_reserve_exact(meta.len() as usize)
-        .map_err(|_| VaultError::AttachmentTooLarge)?;
-    file.take(limit as u64 + 1)
-        .read_to_end(&mut contents)
-        .await
-        .map_err(|_| VaultError::AttachmentFileRead)?;
-    if contents.len() > limit {
-        return Err(VaultError::AttachmentTooLarge);
-    }
-    Ok(contents)
+    Ok((file, meta.len()))
 }
 
 fn has_attachment(cipher: &Cipher, id: &str) -> bool {
@@ -368,7 +429,8 @@ async fn upload_payload(
     client: &Client,
     cipher_id: CipherId,
     slot: &CreatedAttachment,
-    contents: Bytes,
+    contents: File,
+    length: u64,
 ) -> Result<(), VaultError> {
     let config = client.internal.get_api_configurations();
     let api = &config.api_config;
@@ -378,7 +440,6 @@ async fn upload_payload(
                 "{}/ciphers/{cipher_id}/attachment/{}",
                 api.base_path, slot.attachment_id
             );
-            let length = contents.len() as u64;
             let part = multipart::Part::stream_with_length(contents, length).file_name("data");
             let form = multipart::Form::new().part("data", part);
             api.client
@@ -390,7 +451,7 @@ async fn upload_payload(
                 .map_err(|_| VaultError::AttachmentUploadFailed)?
         }
         AttachmentFileUploadType::Azure => {
-            return upload_azure(client, cipher_id, slot, &api.base_path, contents).await
+            return upload_azure(client, cipher_id, slot, &api.base_path, contents, length).await
         }
     };
     if !response.status().is_success() {
@@ -404,11 +465,12 @@ async fn upload_azure(
     cipher_id: CipherId,
     slot: &CreatedAttachment,
     api: &str,
-    contents: Bytes,
+    contents: File,
+    length: u64,
 ) -> Result<(), VaultError> {
     let url = fresh_blob_url(client, cipher_id, slot, api, &slot.upload_url).await?;
-    if contents.len() <= MAX_SINGLE_BLOB_BYTES {
-        return put_blob(url, contents, true).await;
+    if length <= MAX_SINGLE_BLOB_BYTES as u64 {
+        return put_blob(url, contents.into(), length, true).await;
     }
     // The desktop service uses Put Block + Put Block List above the single-blob threshold.
     let block_id = STANDARD.encode([0; 16]);
@@ -417,11 +479,12 @@ async fn upload_azure(
         .query_pairs_mut()
         .append_pair("comp", "block")
         .append_pair("blockid", &block_id);
-    put_blob(block, contents, false).await?;
+    put_blob(block, contents.into(), length, false).await?;
     let mut list = fresh_blob_url(client, cipher_id, slot, api, url.as_str()).await?;
     list.query_pairs_mut().append_pair("comp", "blocklist");
     let xml = format!("<?xml version=\"1.0\" encoding=\"utf-8\"?><BlockList><Latest>{block_id}</Latest></BlockList>");
-    put_blob(list, Bytes::from(xml), false).await
+    let length = xml.len() as u64;
+    put_blob(list, xml.into(), length, false).await
 }
 
 async fn fresh_blob_url(
@@ -457,7 +520,12 @@ async fn fresh_blob_url(
     Ok(url)
 }
 
-async fn put_blob(url: Url, contents: Bytes, single: bool) -> Result<(), VaultError> {
+async fn put_blob(
+    url: Url,
+    contents: reqwest::Body,
+    length: u64,
+    single: bool,
+) -> Result<(), VaultError> {
     let version = url
         .query_pairs()
         .find(|(key, _)| key == "sv")
@@ -465,6 +533,7 @@ async fn put_blob(url: Url, contents: Bytes, single: bool) -> Result<(), VaultEr
     let mut request = blob_client()?
         .put(url)
         .header(reqwest::header::CACHE_CONTROL, "no-store")
+        .header(reqwest::header::CONTENT_LENGTH, length)
         .header(
             "x-ms-date",
             Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string(),
@@ -520,7 +589,7 @@ fn blob_client() -> Result<&'static reqwest::Client, VaultError> {
         .ok_or(VaultError::Internal)
 }
 
-async fn download_blob(api_url: &str, blob_url: &str) -> Result<Vec<u8>, VaultError> {
+async fn download_blob(api_url: &str, blob_url: &str) -> Result<(File, u64), VaultError> {
     let api = Url::parse(api_url).map_err(|_| VaultError::Internal)?;
     let url = Url::parse(blob_url).map_err(|_| VaultError::AttachmentDownloadFailed)?;
     if !allowed_url(&url, &api) {
@@ -541,24 +610,36 @@ async fn download_blob(api_url: &str, blob_url: &str) -> Result<Vec<u8>, VaultEr
     if declared > MAX_ENCRYPTED_BYTES as u64 {
         return Err(VaultError::AttachmentTooLarge);
     }
-    let mut contents = Vec::new();
-    contents
-        .try_reserve_exact(declared as usize)
-        .map_err(|_| VaultError::AttachmentTooLarge)?;
+    let mut contents = File::from_std(tempfile::tempfile().map_err(|_| VaultError::FileAccess)?);
+    let mut length = 0;
     while let Some(chunk) = response
         .chunk()
         .await
         .map_err(|_| VaultError::AttachmentDownloadFailed)?
     {
-        if chunk.len() > MAX_ENCRYPTED_BYTES - contents.len() {
+        length += chunk.len() as u64;
+        if length > MAX_ENCRYPTED_BYTES as u64 {
             return Err(VaultError::AttachmentTooLarge);
         }
         contents
-            .try_reserve(chunk.len())
-            .map_err(|_| VaultError::AttachmentTooLarge)?;
-        contents.extend_from_slice(&chunk);
+            .write_all(&chunk)
+            .await
+            .map_err(|_| VaultError::FileAccess)?;
     }
-    Ok(contents)
+    contents.flush().await.map_err(|_| VaultError::FileAccess)?;
+    contents
+        .seek(SeekFrom::Start(0))
+        .await
+        .map_err(|_| VaultError::FileAccess)?;
+    Ok((contents, length))
+}
+
+fn download_temporary(destination: &Path) -> Result<tempfile::NamedTempFile, VaultError> {
+    let directory = destination.parent().ok_or(VaultError::FileAccess)?;
+    tempfile::Builder::new()
+        .prefix(".bytewarden-")
+        .tempfile_in(directory)
+        .map_err(|_| VaultError::FileAccess)
 }
 
 pub(crate) fn save_download(
@@ -567,14 +648,10 @@ pub(crate) fn save_download(
     replace_existing: bool,
     request_id: u64,
 ) -> Result<(), VaultError> {
-    let directory = destination.parent().ok_or(VaultError::FileAccess)?;
     if !auth_request::is_current(request_id) {
         return Err(VaultError::Cancelled);
     }
-    let mut temporary = tempfile::Builder::new()
-        .prefix(".bytewarden-")
-        .tempfile_in(directory)
-        .map_err(|_| VaultError::FileAccess)?;
+    let mut temporary = download_temporary(destination)?;
     for block in contents.chunks(1024 * 1024) {
         if !auth_request::is_current(request_id) {
             return Err(VaultError::Cancelled);
@@ -587,6 +664,15 @@ pub(crate) fn save_download(
         .as_file()
         .sync_all()
         .map_err(|_| VaultError::FileAccess)?;
+    commit_download(temporary, destination, replace_existing, request_id)
+}
+
+pub(crate) fn commit_download(
+    temporary: tempfile::NamedTempFile,
+    destination: &Path,
+    replace_existing: bool,
+    request_id: u64,
+) -> Result<(), VaultError> {
     if !auth_request::is_current(request_id) {
         return Err(VaultError::Cancelled);
     }

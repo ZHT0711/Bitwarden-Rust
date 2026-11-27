@@ -198,17 +198,14 @@ impl Request {
     }
 
     pub fn import(self, account: &str, source: &Path, password: &str) -> Result<Mutation, Error> {
-        let account = desktop::argument(account)?;
-        let source = desktop::argument(source.to_str().ok_or_else(Error::validation)?)?;
-        let password = desktop::argument(password)?;
-        desktop::read(unsafe {
-            export::bw_vault_import(
-                desktop::ptr(&account),
-                desktop::ptr(&source),
-                desktop::ptr(&password),
-                self.raw(),
-            )
-        })
+        let account = desktop::checked_argument(account)?;
+        let source = desktop::checked_argument(source.to_str().ok_or_else(Error::validation)?)?;
+        let password = desktop::checked_argument(password)?;
+        let account_id = uuid::Uuid::parse_str(account).map_err(|_| Error::validation())?;
+        let command =
+            export::import_command(account_id, source.into(), Zeroizing::new(password.into()))
+                .map_err(Error::from_code)?;
+        self.write(command)
     }
 
     pub fn export(

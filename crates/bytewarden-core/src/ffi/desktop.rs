@@ -19,11 +19,19 @@ pub use super::desktop_transfer::{
     ExportFormat, ExportReport, SendDetail, SendDraft, SendSummary, Sends,
 };
 use super::{accounts, *};
+pub use crate::vault::{
+    VaultFolder as Folder, VaultItem as Item, VaultMutationResult as Mutation,
+    VaultOverview as Overview,
+};
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Error(String);
 
 impl Error {
+    pub(super) fn from_code(code: &str) -> Self {
+        Self(code.into())
+    }
+
     pub fn code(&self) -> &str {
         &self.0
     }
@@ -367,35 +375,70 @@ impl Request {
         read::<bool>(unsafe { bw_auth_unlock(ptr(&password), self.0) }).map(|_| ())
     }
 
+    pub fn enable_hello(self, account: &str, password: &str, hwnd: usize) -> Result<(), Error> {
+        #[cfg(windows)]
+        {
+            let account = argument(account)?;
+            let password = argument(password)?;
+            let window =
+                hello_window::window_id(hwnd).map_err(|_| Error::from_code("helloUnavailable"))?;
+            read::<bool>(unsafe {
+                hello::bw_hello_enable_for_window(ptr(&account), ptr(&password), window, self.0)
+            })
+            .map(|_| ())
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (self, account, password, hwnd);
+            Err(Error::from_code("helloUnavailable"))
+        }
+    }
+
+    pub fn unlock_hello(self, account: &str, hwnd: usize) -> Result<(), Error> {
+        #[cfg(windows)]
+        {
+            let account = argument(account)?;
+            let window =
+                hello_window::window_id(hwnd).map_err(|_| Error::from_code("helloUnavailable"))?;
+            read::<bool>(unsafe {
+                hello::bw_hello_unlock_for_window(ptr(&account), window, self.0)
+            })
+            .map(|_| ())
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (self, account, hwnd);
+            Err(Error::from_code("helloUnavailable"))
+        }
+    }
+
     pub fn sync(self) -> Result<Overview, Error> {
-        read(bw_vault_sync(self.0))
+        vault_sync(self.0, Overview::clone).map_err(Error)
     }
 
     pub fn create_folder(self, name: &str) -> Result<Mutation, Error> {
-        let name = argument(name)?;
-        read(unsafe { bw_folder_create(ptr(&name), self.0) })
+        self.write(VaultWriteCommand::CreateFolder(
+            checked_argument(name)?.into(),
+        ))
     }
 
     pub fn rename_folder(self, id: &str, name: &str) -> Result<Mutation, Error> {
-        let id = argument(id)?;
-        let name = argument(name)?;
-        read(unsafe { bw_folder_rename(ptr(&id), ptr(&name), self.0) })
+        self.write(VaultWriteCommand::RenameFolder {
+            id: checked_argument(id)?.into(),
+            name: checked_argument(name)?.into(),
+        })
     }
 
     pub fn delete_folders(self, ids: &[String]) -> Result<Mutation, Error> {
-        let ids = serial(ids)?;
-        read(unsafe { bw_folders_delete(ptr(&ids), self.0) })
+        self.write(VaultWriteCommand::DeleteFolders(parse_ids(ids)?))
     }
 
     pub fn move_items(self, ids: &[String], folder_id: Option<&str>) -> Result<Mutation, Error> {
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Payload<'a> {
-            ids: &'a [String],
-            folder_id: Option<&'a str>,
-        }
-        let data = serial(&Payload { ids, folder_id })?;
-        read(unsafe { bw_vault_move_items(ptr(&data), self.0) })
+        let folder_id = folder_id.map(parse_id).transpose()?;
+        self.write(VaultWriteCommand::MoveItems(VaultItemMove {
+            ids: parse_ids(ids)?,
+            folder_id,
+        }))
     }
 
     pub fn bulk_action(
@@ -404,17 +447,11 @@ impl Request {
         action: ItemAction,
         password: &str,
     ) -> Result<Mutation, Error> {
-        #[derive(Serialize)]
-        struct Payload<'a> {
-            ids: &'a [String],
-            action: &'static str,
-        }
-        let data = serial(&Payload {
-            ids,
-            action: action.code(),
-        })?;
-        let password = argument(password)?;
-        read(unsafe { bw_vault_bulk_action(ptr(&data), ptr(&password), self.0) })
+        self.write(VaultWriteCommand::BulkAction {
+            ids: parse_ids(ids)?,
+            action: action.code().into(),
+            password: Zeroizing::new(checked_argument(password)?.into()),
+        })
     }
 
     pub fn editor(self, id: &str, password: &str) -> Result<Draft, Error> {
@@ -425,11 +462,15 @@ impl Request {
 
     pub fn save_item(self, draft: &Draft, password: &str) -> Result<Mutation, Error> {
         let data = serial(draft)?;
-        let password = argument(password)?;
+        let password = checked_argument(password)?;
+        let data = parse_editor_json(&data[..data.len() - 1]).ok_or_else(Error::validation)?;
         if draft.id.is_some() {
-            read(unsafe { bw_vault_update(ptr(&data), ptr(&password), self.0) })
+            self.write(VaultWriteCommand::Update(
+                data,
+                Zeroizing::new(password.into()),
+            ))
         } else {
-            read(unsafe { bw_vault_create(ptr(&data), self.0) })
+            self.write(VaultWriteCommand::Create(data))
         }
     }
 
@@ -446,21 +487,26 @@ impl Request {
         revision: &str,
         password: &str,
     ) -> Result<Overview, Error> {
-        let id = argument(id)?;
-        let action = argument(action.code())?;
-        let revision = argument(revision)?;
-        let password = argument(password)?;
-        let result: Mutation = read(unsafe {
-            bw_vault_action(
-                ptr(&id),
-                ptr(&action),
-                ptr(&revision),
-                ptr(&password),
-                self.0,
-            )
-        })?;
-        Ok(result.overview)
+        self.write(VaultWriteCommand::Action {
+            id: checked_argument(id)?.into(),
+            action: action.code().into(),
+            revision: checked_argument(revision)?.into(),
+            password: Zeroizing::new(checked_argument(password)?.into()),
+        })
+        .map(|result| result.overview)
     }
+
+    pub(super) fn write(self, command: VaultWriteCommand) -> Result<Mutation, Error> {
+        write_vault(command, self.0).map_err(Error)
+    }
+}
+
+fn parse_ids<T: std::str::FromStr>(ids: &[String]) -> Result<Vec<T>, Error> {
+    ids.iter().map(|id| parse_id(id)).collect()
+}
+
+fn parse_id<T: std::str::FromStr>(id: &str) -> Result<T, Error> {
+    id.parse().map_err(|_| Error::validation())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -545,40 +591,6 @@ impl Account {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Overview {
-    pub items: Vec<Item>,
-    pub folders: Vec<Folder>,
-    pub last_sync: String,
-    pub failures: usize,
-    pub read_only: bool,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Item {
-    pub id: String,
-    pub name: String,
-    pub subtitle: String,
-    pub item_type: u8,
-    pub favorite: bool,
-    pub folder_id: Option<String>,
-    pub organization_id: Option<String>,
-    pub deleted: bool,
-    pub archived: bool,
-    pub reprompt: bool,
-    pub restricted: bool,
-    pub revision_date: String,
-    pub website_host: Option<String>,
-}
-
-#[derive(Deserialize)]
-pub struct Mutation {
-    pub overview: Overview,
-    pub id: Option<String>,
-}
-
 // Keep the entire editable projection so an edit never drops unrelated fields,
 // URI matching modes, or linked-field associations. Passkey private material
 // is not part of this projection; the core retains it unless told to remove it.
@@ -650,12 +662,6 @@ pub struct Passkey {
     pub relying_party: String,
     pub user_name: Option<String>,
     pub created_at: String,
-}
-
-#[derive(Deserialize)]
-pub struct Folder {
-    pub id: String,
-    pub name: String,
 }
 
 #[derive(Deserialize)]
@@ -771,12 +777,14 @@ impl AttachmentLease {
             .map(|_| ())
     }
     pub fn upload(self, source: &Path) -> Result<Mutation, Error> {
-        let path = argument(source.to_str().ok_or_else(Error::validation)?)?;
-        read(unsafe { bw_vault_upload_attachment(ptr(&path), self.0 .0) })
+        let path = checked_argument(source.to_str().ok_or_else(Error::validation)?)?;
+        self.0
+            .write(VaultWriteCommand::UploadAttachment(path.into()))
     }
     pub fn delete(self, id: &str) -> Result<Mutation, Error> {
-        let id = argument(id)?;
-        read(unsafe { bw_vault_delete_attachment(ptr(&id), self.0 .0) })
+        self.0.write(VaultWriteCommand::DeleteAttachment(
+            checked_argument(id)?.into(),
+        ))
     }
 }
 
@@ -950,8 +958,21 @@ pub fn apply_timeouts(actions: &[AccountTimeout], interrupt: bool) -> Result<Vec
 pub fn accounts() -> Result<Vec<Account>, Error> {
     read(accounts::bw_auth_accounts())
 }
+pub fn disable_hello(account: &str) -> Result<(), Error> {
+    #[cfg(windows)]
+    {
+        let account = argument(account)?;
+        read::<bool>(unsafe { hello::bw_hello_disable(ptr(&account)) }).map(|_| ())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = account;
+        Err(Error::from_code("helloUnavailable"))
+    }
+}
+
 pub fn overview() -> Result<Overview, Error> {
-    read(bw_vault_overview())
+    vault_overview(Overview::clone).map_err(Error)
 }
 pub fn switch_account(id: &str) -> Result<Vec<Account>, Error> {
     let id = argument(id)?;
@@ -1144,10 +1165,15 @@ pub fn password_strength(value: &str) -> Result<Option<u8>, Error> {
     Ok(u8::try_from(score).ok().filter(|score| *score <= 4))
 }
 
-pub(super) fn argument(value: &str) -> Result<Zeroizing<Vec<u8>>, Error> {
+pub(super) fn checked_argument(value: &str) -> Result<&str, Error> {
     if value.as_bytes().contains(&0) {
         return Err(Error::validation());
     }
+    Ok(value)
+}
+
+pub(super) fn argument(value: &str) -> Result<Zeroizing<Vec<u8>>, Error> {
+    let value = checked_argument(value)?;
     let mut buffer = Zeroizing::new(Vec::with_capacity(value.len() + 1));
     buffer.extend_from_slice(value.as_bytes());
     buffer.push(0);

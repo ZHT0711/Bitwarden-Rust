@@ -85,6 +85,7 @@ pub struct Index {
     keys: Vec<(String, String)>,
     order: Vec<usize>,
     sort: Option<Sort>,
+    palette: Option<(String, Vec<usize>)>,
 }
 
 impl Index {
@@ -96,7 +97,25 @@ impl Index {
                 .collect(),
             order: (0..items.len()).collect(),
             sort: None,
+            palette: None,
         }
+    }
+
+    pub fn palette_items(&mut self, items: &[Item], query: &str) -> &[usize] {
+        if !matches!(&self.palette, Some((previous, _)) if previous == query) {
+            let hits = items
+                .iter()
+                .zip(&self.keys)
+                .enumerate()
+                .filter(|(_, (item, (name, subtitle)))| {
+                    !item.deleted && (name.contains(query) || subtitle.contains(query))
+                })
+                .map(|(index, _)| index)
+                .take(if query.is_empty() { 4 } else { 6 })
+                .collect();
+            self.palette = Some((query.to_owned(), hits));
+        }
+        self.palette.as_ref().map_or(&[], |(_, hits)| hits)
     }
 
     pub fn visible(
@@ -210,6 +229,20 @@ mod tests {
             revision_date: "2026-11-25T00:00:00Z".into(),
             website_host: None,
         }
+    }
+
+    #[test]
+    fn palette_search_preserves_source_order_and_excludes_trash() {
+        let mut items = vec![item("missing", "Unrelated", "")];
+        items.extend((0..8).map(|i| item(&i.to_string(), "Équipe", "User")));
+        items[2].deleted = true;
+        items[3].archived = true;
+        let mut index = Index::new(&items);
+        assert_eq!(index.palette_items(&items, ""), &[0, 1, 3, 4]);
+        assert_eq!(index.palette_items(&items, "équipe"), &[1, 3, 4, 5, 6, 7]);
+        assert_eq!(index.palette_items(&items, "équipe"), &[1, 3, 4, 5, 6, 7]);
+        assert_eq!(index.palette_items(&items, "user"), &[1, 3, 4, 5, 6, 7]);
+        assert!(index.palette_items(&items, "no-match").is_empty());
     }
     #[test]
     fn ten_thousand_items_keep_order_and_exact_search_results() {

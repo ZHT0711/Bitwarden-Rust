@@ -78,6 +78,21 @@ impl NavPillState {
     }
 }
 
+pub struct CachedVaultCounts {
+    pub generation: u64,
+    pub sidebar_totals: (usize, usize, usize, usize),
+    pub folder_counts: HashMap<String, usize>,
+    pub all_type_counts: [usize; 9],
+    pub scoped_folder: Option<String>,
+    pub scoped_type_counts: [usize; 9],
+}
+
+#[derive(Clone, Copy)]
+pub struct VaultContextMenu {
+    pub item_index: usize,
+    pub position: gpui::Point<gpui::Pixels>,
+}
+
 pub struct UiState {
     pub toast: ToastState,
     pub nav_pill_main: Rc<RefCell<NavPillState>>,
@@ -135,6 +150,10 @@ pub struct UiState {
     pub generator_spin_spring: Spring,
     pub generator_result_spring: Spring,
     pub detail_loading_since: Option<Instant>,
+    pub hovered_vault_row: Option<usize>,
+    pub ctx_menu: Option<VaultContextMenu>,
+    pub ctx_menu_spring: Spring,
+    pub vault_counts: RefCell<Option<CachedVaultCounts>>,
     pub toggle_springs: HashMap<ElementId, Spring>,
     pub collapsible_springs: HashMap<ElementId, Spring>,
     pub segmented_springs: HashMap<ElementId, Spring>,
@@ -205,6 +224,10 @@ impl UiState {
             generator_spin_spring: Spring::settled(0., SpringConfig::FLUID, now),
             generator_result_spring: Spring::settled(1., SpringConfig::SNAPPY, now),
             detail_loading_since: None,
+            hovered_vault_row: None,
+            ctx_menu: None,
+            ctx_menu_spring: Spring::settled(0., SpringConfig::SNAPPY, now),
+            vault_counts: RefCell::new(None),
             toggle_springs: HashMap::new(),
             collapsible_springs: HashMap::new(),
             segmented_springs: HashMap::new(),
@@ -449,10 +472,131 @@ impl UiState {
         self.toast.show_clipboard(label, clear_after, now, animate);
     }
 
+    pub fn has_active_copied_tag(&self, now: Instant) -> bool {
+        self.copied_tag
+            .as_ref()
+            .is_some_and(|(_, at)| now.saturating_duration_since(*at) < Duration::from_millis(1600))
+    }
+
     pub fn is_recently_copied(&self, tag: &str, now: Instant) -> bool {
         self.copied_tag.as_ref().is_some_and(|(t, at)| {
             t == tag && now.saturating_duration_since(*at) < Duration::from_millis(1600)
         })
+    }
+
+    fn refresh_vault_counts(&self, generation: u64, overview: &bytewarden_core::desktop::Overview) {
+        let mut guard = self.vault_counts.borrow_mut();
+        if guard.as_ref().is_some_and(|c| c.generation == generation) {
+            return;
+        }
+        let mut active = 0usize;
+        let mut fav = 0usize;
+        let mut arch = 0usize;
+        let mut trash = 0usize;
+        let mut folder_counts: HashMap<String, usize> = HashMap::new();
+        let mut all_type_counts = [0usize; 9];
+        for item in &overview.items {
+            if item.deleted {
+                trash += 1;
+            } else if item.archived {
+                arch += 1;
+            } else {
+                active += 1;
+                if item.favorite {
+                    fav += 1;
+                }
+                all_type_counts[0] += 1;
+                let idx = usize::from(item.item_type);
+                if (1..=8).contains(&idx) {
+                    all_type_counts[idx] += 1;
+                }
+                if let Some(fid) = item.folder_id.as_deref()
+                    && !fid.is_empty()
+                {
+                    *folder_counts.entry(fid.to_owned()).or_insert(0) += 1;
+                }
+            }
+        }
+        *guard = Some(CachedVaultCounts {
+            generation,
+            sidebar_totals: (active, fav, arch, trash),
+            folder_counts,
+            all_type_counts,
+            scoped_folder: None,
+            scoped_type_counts: all_type_counts,
+        });
+    }
+
+    pub fn sidebar_counts(
+        &self,
+        generation: u64,
+        overview: Option<&bytewarden_core::desktop::Overview>,
+    ) -> (usize, usize, usize, usize) {
+        let Some(overview) = overview else {
+            return (0, 0, 0, 0);
+        };
+        self.refresh_vault_counts(generation, overview);
+        self.vault_counts
+            .borrow()
+            .as_ref()
+            .map_or((0, 0, 0, 0), |c| c.sidebar_totals)
+    }
+
+    pub fn folder_item_count(
+        &self,
+        generation: u64,
+        overview: &bytewarden_core::desktop::Overview,
+        folder_id: &str,
+    ) -> usize {
+        self.refresh_vault_counts(generation, overview);
+        self.vault_counts
+            .borrow()
+            .as_ref()
+            .and_then(|c| c.folder_counts.get(folder_id).copied())
+            .unwrap_or(0)
+    }
+
+    pub fn vault_type_counts(
+        &self,
+        generation: u64,
+        overview: Option<&bytewarden_core::desktop::Overview>,
+        selected_folder: Option<&str>,
+    ) -> [usize; 9] {
+        let Some(overview) = overview else {
+            return [0; 9];
+        };
+        self.refresh_vault_counts(generation, overview);
+        let Some(folder_id) = selected_folder else {
+            return self
+                .vault_counts
+                .borrow()
+                .as_ref()
+                .map_or([0; 9], |c| c.all_type_counts);
+        };
+        let mut guard = self.vault_counts.borrow_mut();
+        let Some(cache) = guard.as_mut() else {
+            return [0; 9];
+        };
+        if cache.scoped_folder.as_deref() == Some(folder_id) {
+            return cache.scoped_type_counts;
+        }
+        let mut counts = [0usize; 9];
+        for item in &overview.items {
+            if item.deleted || item.archived {
+                continue;
+            }
+            if item.folder_id.as_deref().unwrap_or("") != folder_id {
+                continue;
+            }
+            counts[0] += 1;
+            let idx = usize::from(item.item_type);
+            if (1..=8).contains(&idx) {
+                counts[idx] += 1;
+            }
+        }
+        cache.scoped_folder = Some(folder_id.to_owned());
+        cache.scoped_type_counts = counts;
+        counts
     }
 
     pub fn close_popovers(&mut self, animate: bool) {
@@ -463,6 +607,8 @@ impl UiState {
         self.new_menu_spring.retarget(0., now, animate);
         self.editor_gen_open = false;
         self.editor_gen_spring.retarget(0., now, animate);
+        self.ctx_menu = None;
+        self.ctx_menu_spring.retarget(0., now, animate);
     }
 
     /// Classify a status notice written by core/client logic:

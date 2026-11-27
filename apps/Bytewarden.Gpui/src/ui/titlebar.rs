@@ -93,6 +93,8 @@ impl VaultPreview {
             );
 
         let ultra_compact = window.viewport_size().width < px(560.);
+        let has_search_text =
+            !self.query.is_empty() || !self.client.search.read(cx).value().is_empty();
         // Center Search + Command Palette trigger pill.
         let search_pill = if search_active {
             div()
@@ -113,7 +115,7 @@ impl VaultPreview {
                         .child(glyph_icon(glyph::SEARCH, 13.)),
                 )
                 .child(div().flex_1().min_w_0().child(self.client.search.clone()))
-                .when(!self.query.is_empty(), |box_el| {
+                .when(has_search_text, |box_el| {
                     box_el.child(
                         div()
                             .id("clear-search-pill")
@@ -126,12 +128,17 @@ impl VaultPreview {
                             .text_color(hex(pal.text_muted))
                             .hover(move |s| s.bg(hex(pal.hover)).text_color(hex(pal.text)))
                             .child(glyph_icon(glyph::CLOSE, 10.))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.client.search.update(cx, |input, cx| input.set("", cx));
-                                this.query.clear();
-                                this.invalidate_query();
-                                cx.notify();
-                            })),
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.client.search.update(cx, |input, cx| input.set("", cx));
+                                    this.query.clear();
+                                    this.invalidate_query();
+                                    this.client.search.read(cx).focus(window);
+                                    cx.notify();
+                                }),
+                            ),
                     )
                 })
                 .when(!ultra_compact, |box_el| {
@@ -151,6 +158,7 @@ impl VaultPreview {
                             .hover(move |s| s.bg(hex(pal.hover)).text_color(hex(pal.text)))
                             .child("Ctrl+K")
                             .tooltip(|_, cx| make_tooltip("打开命令面板", Some("Ctrl+K"), cx))
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.open_command_palette(window, cx);
                             })),
@@ -226,6 +234,8 @@ impl VaultPreview {
         // Right action cluster + native Windows 11 caption buttons.
         let sync_tooltip: gpui::SharedString = if let Some(busy_label) = self.client.busy {
             format!("{busy_label}…").into()
+        } else if self.client.reconnect_available() {
+            "重新连接账户并同步".into()
         } else if is_read_only {
             "离线只读 · 点击重新同步".into()
         } else if let Some(last) = self
@@ -276,7 +286,7 @@ impl VaultPreview {
                         )
                     }),
             );
-        } else if self.client.sync_available()
+        } else if (self.client.sync_available() || self.client.reconnect_available())
             && self.client.form.is_none()
             && self.selection.pending.is_none()
         {
@@ -313,7 +323,9 @@ impl VaultPreview {
                         )
                     })
                     .tooltip(move |_, cx| make_tooltip(sync_tooltip.clone(), Some("Ctrl+R"), cx))
-                    .on_click(cx.listener(|this, _, _, cx| this.request_sync(cx))),
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.sync_or_reconnect(window, cx)),
+                    ),
             );
         }
 

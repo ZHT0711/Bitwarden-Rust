@@ -50,7 +50,9 @@ use crate::auth_request::{self, RequestError};
 use crate::protocol_compat::{self, ResponseKind, SyncCompatibility};
 #[cfg(windows)]
 use crate::vault::EncryptedVaultState;
-use crate::vault::{VaultCache, VaultEditorData, VaultError, VaultMutationResult, VaultTotp};
+use crate::vault::{
+    VaultCache, VaultEditorData, VaultError, VaultMutationResult, VaultOverview, VaultTotp,
+};
 mod accounts;
 use accounts::AuthAccounts;
 
@@ -1408,10 +1410,14 @@ fn complete_vault_unlock_raw(
 }
 
 fn vault_access_error() -> *mut c_char {
+    vault_error(vault_access_code())
+}
+
+fn vault_access_code() -> &'static str {
     if bw_auth_session_state() == SESSION_LOCKED {
-        vault_error("locked")
+        "locked"
     } else {
-        vault_error("notAuthenticated")
+        "notAuthenticated"
     }
 }
 
@@ -1420,11 +1426,28 @@ fn vault_error(code: &str) -> *mut c_char {
 }
 
 fn vault_success(value: &impl serde::Serialize) -> *mut c_char {
-    into_raw_string(serde_json::json!({"ok": true, "data": value}).to_string())
+    #[derive(Serialize)]
+    struct Response<'a, T> {
+        ok: bool,
+        data: &'a T,
+    }
+    match serde_json::to_vec(&Response {
+        ok: true,
+        data: value,
+    }) {
+        Ok(bytes) => {
+            CString::new(bytes).map_or_else(|_| vault_error("internal"), CString::into_raw)
+        }
+        Err(_) => vault_error("internal"),
+    }
 }
 
 #[no_mangle]
 pub extern "C" fn bw_vault_overview() -> *mut c_char {
+    vault_overview(vault_success).unwrap_or_else(|error| vault_error(&error))
+}
+
+fn vault_overview<T>(project: impl FnOnce(&VaultOverview) -> T) -> Result<T, String> {
     catch_unwind(AssertUnwindSafe(|| {
         let guard = auth_client()
             .lock()
@@ -1434,24 +1457,29 @@ pub extern "C" fn bw_vault_overview() -> *mut c_char {
             .as_ref()
             .filter(|_| bw_auth_session_state() == SESSION_UNLOCKED)
         else {
-            return vault_access_error();
+            return Err(vault_access_code().into());
         };
         if session.vault.needs_reconciliation() {
-            return vault_error("notSynced");
+            return Err("notSynced".into());
         }
-        match session.vault.overview() {
-            Ok(overview) => vault_success(overview),
-            Err(error) => vault_error(&error.to_string()),
-        }
+        session
+            .vault
+            .overview()
+            .map(project)
+            .map_err(|error| error.to_string())
     }))
-    .unwrap_or_else(|_| vault_error("internal"))
+    .unwrap_or_else(|_| Err("internal".into()))
 }
 
 #[no_mangle]
 pub extern "C" fn bw_vault_sync(request_id: u64) -> *mut c_char {
+    vault_sync(request_id, vault_success).unwrap_or_else(|error| vault_error(&error))
+}
+
+fn vault_sync<T>(request_id: u64, project: impl FnOnce(&VaultOverview) -> T) -> Result<T, String> {
     catch_unwind(AssertUnwindSafe(|| {
         let Some(runtime) = runtime() else {
-            return vault_error("internal");
+            return Err("internal".into());
         };
         let mut guard = auth_client()
             .lock()
@@ -1461,10 +1489,10 @@ pub extern "C" fn bw_vault_sync(request_id: u64) -> *mut c_char {
             .as_mut()
             .filter(|_| bw_auth_session_state() == SESSION_UNLOCKED)
         else {
-            return vault_access_error();
+            return Err(vault_access_code().into());
         };
         if session.offline_only {
-            return vault_error("signInRequired");
+            return Err("signInRequired".into());
         }
         let result = catch_unwind(AssertUnwindSafe(|| {
             runtime.block_on(auth_request::run(
@@ -1478,7 +1506,7 @@ pub extern "C" fn bw_vault_sync(request_id: u64) -> *mut c_char {
         if session.unlock_data.is_none() {
             pin::clear_session(session);
             if !remove_cached_vault(session) {
-                return vault_error("cacheRevocationFailed");
+                return Err("cacheRevocationFailed".into());
             }
         }
         match result {
@@ -1493,20 +1521,19 @@ pub extern "C" fn bw_vault_sync(request_id: u64) -> *mut c_char {
                     &session.vault,
                     &session.client,
                 ));
-                vault_success(
-                    session
-                        .vault
-                        .overview()
-                        .expect("successful sync has an overview"),
-                )
+                session
+                    .vault
+                    .overview()
+                    .map(project)
+                    .map_err(|error| error.to_string())
             }
-            Ok(Ok(Ok(_))) | Ok(Err(RequestError::Cancelled)) => vault_error("cancelled"),
-            Ok(Err(RequestError::TimedOut)) => vault_error("timedOut"),
-            Ok(Ok(Err(error))) => vault_error(&error.to_string()),
-            Err(_) => vault_error("internal"),
+            Ok(Ok(Ok(_))) | Ok(Err(RequestError::Cancelled)) => Err("cancelled".into()),
+            Ok(Err(RequestError::TimedOut)) => Err("timedOut".into()),
+            Ok(Ok(Err(error))) => Err(error.to_string()),
+            Err(_) => Err("internal".into()),
         }
     }))
-    .unwrap_or_else(|_| vault_error("internal"))
+    .unwrap_or_else(|_| Err("internal".into()))
 }
 
 #[no_mangle]
@@ -1654,16 +1681,16 @@ pub unsafe extern "C" fn bw_vault_download_attachment(
         };
         match runtime.block_on(auth_request::run_transfer(
             request_id,
-            session.vault.decrypt_attachment(
+            session.vault.stage_attachment_download(
                 &session.client,
                 &session.server.api_url,
-                &detail.item_id,
-                &detail.revision,
+                (&detail.item_id, &detail.revision),
                 &attachment_id,
+                destination,
             ),
         )) {
-            Ok(Ok(contents)) => match crate::vault::attachments::save_download(
-                &contents,
+            Ok(Ok(temporary)) => match crate::vault::attachments::commit_download(
+                temporary,
                 destination,
                 replace_existing,
                 request_id,
@@ -1750,9 +1777,16 @@ enum VaultWriteCommand {
 }
 
 fn perform_vault_write(command: VaultWriteCommand, request_id: u64) -> *mut c_char {
+    match write_vault(command, request_id) {
+        Ok(result) => vault_success(&result),
+        Err(error) => vault_error(&error),
+    }
+}
+
+fn write_vault(command: VaultWriteCommand, request_id: u64) -> Result<VaultMutationResult, String> {
     catch_unwind(AssertUnwindSafe(|| {
         let Some(runtime) = runtime() else {
-            return vault_error("internal");
+            return Err("internal".into());
         };
         let mut guard = auth_client()
             .lock()
@@ -1762,14 +1796,14 @@ fn perform_vault_write(command: VaultWriteCommand, request_id: u64) -> *mut c_ch
             .as_mut()
             .filter(|_| bw_auth_session_state() == SESSION_UNLOCKED)
         else {
-            return vault_access_error();
+            return Err(vault_access_code().into());
         };
         if let Err(error) = session.vault.ensure_synced() {
-            return vault_error(&error.to_string());
+            return Err(error.to_string());
         }
         if let VaultWriteCommand::Import { account_id, .. } = &command {
             if session.account_id != *account_id {
-                return vault_error("cancelled");
+                return Err("cancelled".into());
             }
         }
         let importing = matches!(&command, VaultWriteCommand::Import { .. });
@@ -1777,7 +1811,7 @@ fn perform_vault_write(command: VaultWriteCommand, request_id: u64) -> *mut c_ch
         #[cfg(windows)]
         let cache_write = match CacheWrite::begin(session) {
             Ok(write) => write,
-            Err(error) => return vault_error(&error.to_string()),
+            Err(error) => return Err(error.to_string()),
         };
         let upload = matches!(&command, VaultWriteCommand::UploadAttachment(_));
         let mut pending_upload = None;
@@ -1798,7 +1832,7 @@ fn perform_vault_write(command: VaultWriteCommand, request_id: u64) -> *mut c_ch
                         session.vault.create(&session.client, data).await
                     }
                     VaultWriteCommand::Update(data, password) => {
-                        session.vault.update(&session.client, data, &password).await
+                        Box::pin(session.vault.update(&session.client, data, &password)).await
                     }
                     VaultWriteCommand::CreateFolder(name) => {
                         session.vault.create_folder(&session.client, &name).await
@@ -1894,7 +1928,7 @@ fn perform_vault_write(command: VaultWriteCommand, request_id: u64) -> *mut c_ch
             .unwrap_or(false);
             if !recovered || session.vault.needs_reconciliation() {
                 session.vault.mark_write_uncertain();
-                return vault_error("writeUncertain");
+                return Err("writeUncertain".into());
             }
             session.open_detail = None;
         }
@@ -1906,7 +1940,7 @@ fn perform_vault_write(command: VaultWriteCommand, request_id: u64) -> *mut c_ch
         if importing && session.unlock_data.is_none() {
             pin::clear_session(session);
             if !remove_cached_vault(session) {
-                return vault_error("cacheRevocationFailed");
+                return Err("cacheRevocationFailed".into());
             }
         }
         #[cfg(windows)]
@@ -1924,16 +1958,16 @@ fn perform_vault_write(command: VaultWriteCommand, request_id: u64) -> *mut c_ch
                         &session.client,
                     ));
                 }
-                vault_write_success(&result)
+                Ok(result)
             }
-            Ok(Ok(Err(error))) => vault_error(&error.to_string()),
-            _ if interrupted => vault_error("writeUncertain"),
-            Ok(Err(RequestError::Cancelled)) => vault_error("cancelled"),
-            Ok(Err(RequestError::TimedOut)) => vault_error("timedOut"),
-            Err(_) => vault_error("internal"),
+            Ok(Ok(Err(error))) => Err(error.to_string()),
+            _ if interrupted => Err("writeUncertain".into()),
+            Ok(Err(RequestError::Cancelled)) => Err("cancelled".into()),
+            Ok(Err(RequestError::TimedOut)) => Err("timedOut".into()),
+            Err(_) => Err("internal".into()),
         }
     }))
-    .unwrap_or_else(|_| vault_error("internal"))
+    .unwrap_or_else(|_| Err("internal".into()))
 }
 
 #[no_mangle]
@@ -1964,16 +1998,16 @@ pub unsafe extern "C" fn bw_vault_delete_attachment(
     .unwrap_or_else(|_| vault_error("internal"))
 }
 
-fn vault_write_success(result: &VaultMutationResult) -> *mut c_char {
-    vault_success(result)
-}
-
 unsafe fn read_editor_json(value: *const c_char) -> Option<VaultEditorData> {
     let json = Zeroizing::new(unsafe { read_utf8(value) }?);
+    parse_editor_json(json.as_bytes())
+}
+
+fn parse_editor_json(json: &[u8]) -> Option<VaultEditorData> {
     if json.len() > 1_048_576 {
         return None;
     }
-    serde_json::from_str(&json).ok()
+    serde_json::from_slice(json).ok()
 }
 
 #[no_mangle]

@@ -1048,19 +1048,31 @@ impl Element for Line {
             } else {
                 vec![run]
             };
-            let line = window
-                .text_system()
-                .shape_text_uncached(
-                    display,
-                    style.font_size.to_pixels(window.rem_size()),
-                    &runs,
-                    input.multiline.then_some(bounds.size.width.max(px(1.))),
-                    None,
-                )
-                .unwrap_or_default()
-                .into_iter()
-                .next()
-                .unwrap_or_default();
+            let font_size = style.font_size.to_pixels(window.rem_size());
+            let wrap = input.multiline.then_some(bounds.size.width.max(px(1.)));
+            let line = if input.value.is_empty() {
+                window
+                    .text_system()
+                    .shape_text(
+                        gpui::SharedString::new_static(input.placeholder),
+                        font_size,
+                        &runs,
+                        wrap,
+                        None,
+                    )
+                    .unwrap_or_default()
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default()
+            } else {
+                window
+                    .text_system()
+                    .shape_text_uncached(display, font_size, &runs, wrap, None)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default()
+            };
             let height = line.size(line_height).height;
             lines.push(TextLine { range, line, top });
             top += height;

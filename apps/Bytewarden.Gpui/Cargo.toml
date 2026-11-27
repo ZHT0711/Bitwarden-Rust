@@ -8,6 +8,7 @@ license = "GPL-3.0-only"
 gpui = { version = "=0.2.2", default-features = false, features = ["windows-manifest"] }
 futures = "=0.3.34"
 image = { version = "=0.25.10", default-features = false, features = ["bmp", "gif", "jpeg", "png", "tiff", "webp"] }
+rqrr = "0.9"
 bytewarden-core = { path = "../../crates/bytewarden-core" }
 zeroize = "1"
 uuid = { version = "1", features = ["v4"] }

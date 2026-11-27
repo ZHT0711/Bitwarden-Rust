@@ -11,6 +11,7 @@ edition = "2021"
 license = "GPL-3.0-only"
 
 [workspace.dependencies]
+aes = "0.9"
 aes-gcm = "0.10"
 async-trait = "0.1"
 argon2 = "0.5"
@@ -28,12 +29,13 @@ bitwarden-crypto-sync-handler = { git = "https://github.com/bitwarden/sdk-intern
 bw-sdk-core = { package = "bitwarden-core", git = "https://github.com/bitwarden/sdk-internal", rev = "56c7617b23501af70221094cdee59e10b2a9d8d2" }
 bitwarden-sensitive-value = { git = "https://github.com/bitwarden/sdk-internal", rev = "56c7617b23501af70221094cdee59e10b2a9d8d2" }
 bytes = "1"
+cbc = { version = "0.2", features = ["zeroize"] }
 chrono = { version = "0.4", features = ["serde"] }
 csv = "1.4"
 hmac = "0.13"
 http = "1"
 rand = "0.8"
-reqwest = { version = "0.13", default-features = false, features = ["form", "json", "multipart", "system-proxy"] }
+reqwest = { version = "0.13", default-features = false, features = ["form", "json", "multipart", "stream", "system-proxy"] }
 reqwest-middleware = { version = "0.5", features = ["form", "json", "multipart"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

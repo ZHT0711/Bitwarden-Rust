@@ -153,22 +153,33 @@ pub unsafe extern "C" fn bw_vault_import(
         else {
             return vault_error("fileAccess");
         };
-        let Some(password) = (unsafe { read_utf8(password) })
-            .map(Zeroizing::new)
-            .filter(|v| v.encode_utf16().count() <= 1024)
-        else {
+        let Some(password) = (unsafe { read_utf8(password) }).map(Zeroizing::new) else {
             return vault_error("validation");
         };
-        perform_vault_write(
-            VaultWriteCommand::Import {
-                account_id,
-                source,
-                password,
-            },
-            request_id,
-        )
+        match import_command(account_id, source, password) {
+            Ok(command) => perform_vault_write(command, request_id),
+            Err(code) => vault_error(code),
+        }
     }))
     .unwrap_or_else(|_| vault_error("internal"))
+}
+
+pub(super) fn import_command(
+    account_id: Uuid,
+    source: String,
+    password: Zeroizing<String>,
+) -> Result<VaultWriteCommand, &'static str> {
+    if !Path::new(&source).is_absolute() {
+        return Err("fileAccess");
+    }
+    if password.encode_utf16().count() > 1024 {
+        return Err("validation");
+    }
+    Ok(VaultWriteCommand::Import {
+        account_id,
+        source,
+        password,
+    })
 }
 
 pub(super) async fn import(

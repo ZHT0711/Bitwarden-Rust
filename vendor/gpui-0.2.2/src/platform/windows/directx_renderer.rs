@@ -1,7 +1,4 @@
-use std::{
-    mem::ManuallyDrop,
-    sync::{Arc, OnceLock},
-};
+use std::sync::{Arc, OnceLock};
 
 use ::util::ResultExt;
 use anyhow::{Context, Result};
@@ -43,8 +40,8 @@ pub(crate) struct FontInfo {
 pub(crate) struct DirectXRenderer {
     hwnd: HWND,
     atlas: Arc<DirectXAtlas>,
-    devices: ManuallyDrop<DirectXRendererDevices>,
-    resources: ManuallyDrop<DirectXResources>,
+    devices: DirectXRendererDevices,
+    resources: DirectXResources,
     globals: DirectXGlobalElements,
     pipelines: DirectXRenderPipelines,
     direct_composition: Option<DirectComposition>,
@@ -63,8 +60,8 @@ pub(crate) struct DirectXRendererDevices {
 
 struct DirectXResources {
     // Direct3D rendering objects
-    swap_chain: IDXGISwapChain1,
-    render_target: ManuallyDrop<ID3D11Texture2D>,
+    swap_chain: Option<IDXGISwapChain1>,
+    render_target: Option<ID3D11Texture2D>,
     render_target_view: [Option<ID3D11RenderTargetView>; 1],
 
     // Allocate full-window path textures only while a scene needs paths.
@@ -123,7 +120,7 @@ impl DirectXRendererDevices {
     pub(crate) fn new(
         directx_devices: &DirectXDevices,
         disable_direct_composition: bool,
-    ) -> Result<ManuallyDrop<Self>> {
+    ) -> Result<Self> {
         let DirectXDevices {
             adapter,
             dxgi_factory,
@@ -136,13 +133,13 @@ impl DirectXRendererDevices {
             Some(device.cast().context("Creating DXGI device")?)
         };
 
-        Ok(ManuallyDrop::new(Self {
+        Ok(Self {
             adapter: adapter.clone(),
             dxgi_factory: dxgi_factory.clone(),
             device: device.clone(),
             device_context: device_context.clone(),
             dxgi_device,
-        }))
+        })
     }
 }
 
@@ -173,7 +170,12 @@ impl DirectXRenderer {
             let composition = DirectComposition::new(devices.dxgi_device.as_ref().unwrap(), hwnd)
                 .context("Creating DirectComposition")?;
             composition
-                .set_swap_chain(&resources.swap_chain)
+                .set_swap_chain(
+                    resources
+                        .swap_chain
+                        .as_ref()
+                        .context("Missing swap chain")?,
+                )
                 .context("Setting swap chain for DirectComposition")?;
             Some(composition)
         };
@@ -195,6 +197,9 @@ impl DirectXRenderer {
     }
 
     fn pre_draw(&self) -> Result<()> {
+        let target = self.resources.render_target_view[0]
+            .as_ref()
+            .context("Missing DirectX render target")?;
         update_buffer(
             &self.devices.device_context,
             self.globals.global_params_buffer[0].as_ref().unwrap(),
@@ -209,10 +214,9 @@ impl DirectXRenderer {
             }],
         )?;
         unsafe {
-            self.devices.device_context.ClearRenderTargetView(
-                self.resources.render_target_view[0].as_ref().unwrap(),
-                &[0.0; 4],
-            );
+            self.devices
+                .device_context
+                .ClearRenderTargetView(target, &[0.0; 4]);
             self.devices
                 .device_context
                 .OMSetRenderTargets(Some(&self.resources.render_target_view), None);
@@ -225,7 +229,12 @@ impl DirectXRenderer {
 
     #[inline]
     fn present(&mut self) -> Result<()> {
-        let result = unsafe { self.resources.swap_chain.Present(0, DXGI_PRESENT(0)) };
+        let swap_chain = self
+            .resources
+            .swap_chain
+            .as_ref()
+            .context("Missing swap chain")?;
+        let result = unsafe { swap_chain.Present(0, DXGI_PRESENT(0)) };
         result.ok().context("Presenting swap chain failed")
     }
 
@@ -247,7 +256,7 @@ impl DirectXRenderer {
     }
 
     fn handle_device_lost_impl(&mut self, directx_devices: &DirectXDevices) -> Result<()> {
-        let disable_direct_composition = self.direct_composition.is_none();
+        let disable_direct_composition = self.devices.dxgi_device.is_none();
 
         unsafe {
             #[cfg(debug_assertions)]
@@ -255,22 +264,26 @@ impl DirectXRenderer {
                 .context("Failed to report live objects after device lost")
                 .log_err();
 
-            ManuallyDrop::drop(&mut self.resources);
-            self.devices.device_context.OMSetRenderTargets(None, None);
             self.devices.device_context.ClearState();
+        }
+        // DXGI permits one flip-model swap chain per window. Release the old
+        // bindings and chain before creating its replacement.
+        self.resources.release_targets();
+        drop(self.direct_composition.take());
+        drop(self.resources.swap_chain.take());
+        unsafe {
             self.devices.device_context.Flush();
 
             #[cfg(debug_assertions)]
             report_live_objects(&self.devices.device)
                 .context("Failed to report live objects after device lost")
                 .log_err();
-
-            drop(self.direct_composition.take());
-            ManuallyDrop::drop(&mut self.devices);
         }
 
         let devices = DirectXRendererDevices::new(directx_devices, disable_direct_composition)
             .context("Recreating DirectX devices")?;
+        let globals = DirectXGlobalElements::new(&devices.device)?;
+        let pipelines = DirectXRenderPipelines::new(&devices.device)?;
         let resources = DirectXResources::new(
             &devices,
             self.resources.width,
@@ -278,15 +291,17 @@ impl DirectXRenderer {
             self.hwnd,
             disable_direct_composition,
         )?;
-        let globals = DirectXGlobalElements::new(&devices.device)?;
-        let pipelines = DirectXRenderPipelines::new(&devices.device)?;
-
         let direct_composition = if disable_direct_composition {
             None
         } else {
             let composition =
                 DirectComposition::new(devices.dxgi_device.as_ref().unwrap(), self.hwnd)?;
-            composition.set_swap_chain(&resources.swap_chain)?;
+            composition.set_swap_chain(
+                resources
+                    .swap_chain
+                    .as_ref()
+                    .context("Missing swap chain")?,
+            )?;
             Some(composition)
         };
 
@@ -307,6 +322,12 @@ impl DirectXRenderer {
     }
 
     pub(crate) fn draw(&mut self, scene: &Scene) -> Result<()> {
+        if self.resources.swap_chain.is_none() {
+            return Ok(());
+        }
+        if self.resources.render_target.is_none() {
+            self.resize_buffers(self.resources.width, self.resources.height)?;
+        }
         if scene.paths.is_empty() && self.resources.path_resources.take().is_some() {
             // The immediate context also retains a reference to the last SRV.
             unsafe {
@@ -349,11 +370,21 @@ impl DirectXRenderer {
     pub(crate) fn resize(&mut self, new_size: Size<DevicePixels>) -> Result<()> {
         let width = new_size.width.0.max(1) as u32;
         let height = new_size.height.0.max(1) as u32;
-        if self.resources.width == width && self.resources.height == height {
+        if self.resources.width == width
+            && self.resources.height == height
+            && self.resources.render_target.is_some()
+        {
             return Ok(());
         }
         self.resources.width = width;
         self.resources.height = height;
+        self.resize_buffers(width, height)
+    }
+
+    fn resize_buffers(&mut self, width: u32, height: u32) -> Result<()> {
+        if self.resources.swap_chain.is_none() {
+            return Ok(());
+        }
 
         // Release bindings and path textures before reallocating for a new size.
         unsafe {
@@ -362,17 +393,19 @@ impl DirectXRenderer {
                 .device_context
                 .PSSetShaderResources(0, Some(&[None]));
         }
-        self.resources.path_resources = None;
-        unsafe { ManuallyDrop::drop(&mut self.resources.render_target) };
-        drop(self.resources.render_target_view[0].take().unwrap());
+        self.resources.release_targets();
+        let swap_chain = self
+            .resources
+            .swap_chain
+            .as_ref()
+            .context("Missing swap chain")?;
 
         // Resizing the swap chain requires a call to the underlying DXGI adapter, which can return the device removed error.
         // The app might have moved to a monitor that's attached to a different graphics device.
         // When a graphics device is removed or reset, the desktop resolution often changes, resulting in a window size change.
         // But here we just return the error, because we are handling device lost scenarios elsewhere.
         unsafe {
-            self.resources
-                .swap_chain
+            swap_chain
                 .ResizeBuffers(
                     BUFFER_COUNT as u32,
                     width,
@@ -707,7 +740,7 @@ impl DirectXResources {
         height: u32,
         hwnd: HWND,
         disable_direct_composition: bool,
-    ) -> Result<ManuallyDrop<Self>> {
+    ) -> Result<Self> {
         let swap_chain = if disable_direct_composition {
             create_swap_chain(&devices.dxgi_factory, &devices.device, hwnd, width, height)?
         } else {
@@ -723,15 +756,21 @@ impl DirectXResources {
             create_resources(devices, &swap_chain, width, height)?;
         set_rasterizer_state(&devices.device, &devices.device_context)?;
 
-        Ok(ManuallyDrop::new(Self {
-            swap_chain,
-            render_target,
+        Ok(Self {
+            swap_chain: Some(swap_chain),
+            render_target: Some(render_target),
             render_target_view,
             path_resources: None,
             viewport,
             width,
             height,
-        }))
+        })
+    }
+
+    fn release_targets(&mut self) {
+        self.path_resources = None;
+        self.render_target_view[0] = None;
+        self.render_target = None;
     }
 
     #[inline]
@@ -741,9 +780,10 @@ impl DirectXResources {
         width: u32,
         height: u32,
     ) -> Result<()> {
+        let swap_chain = self.swap_chain.as_ref().context("Missing swap chain")?;
         let (render_target, render_target_view, viewport) =
-            create_resources(devices, &self.swap_chain, width, height)?;
-        self.render_target = render_target;
+            create_resources(devices, swap_chain, width, height)?;
+        self.render_target = Some(render_target);
         self.render_target_view = render_target_view;
         self.path_resources = None;
         self.viewport = viewport;
@@ -1026,18 +1066,6 @@ impl Drop for DirectXRenderer {
     fn drop(&mut self) {
         #[cfg(debug_assertions)]
         report_live_objects(&self.devices.device).ok();
-        unsafe {
-            ManuallyDrop::drop(&mut self.devices);
-            ManuallyDrop::drop(&mut self.resources);
-        }
-    }
-}
-
-impl Drop for DirectXResources {
-    fn drop(&mut self) {
-        unsafe {
-            ManuallyDrop::drop(&mut self.render_target);
-        }
     }
 }
 
@@ -1110,7 +1138,7 @@ fn create_resources(
     width: u32,
     height: u32,
 ) -> Result<(
-    ManuallyDrop<ID3D11Texture2D>,
+    ID3D11Texture2D,
     [Option<ID3D11RenderTargetView>; 1],
     [D3D11_VIEWPORT; 1],
 )> {
@@ -1124,16 +1152,15 @@ fn create_resources(
 fn create_render_target_and_its_view(
     swap_chain: &IDXGISwapChain1,
     device: &ID3D11Device,
-) -> Result<(
-    ManuallyDrop<ID3D11Texture2D>,
-    [Option<ID3D11RenderTargetView>; 1],
-)> {
+) -> Result<(ID3D11Texture2D, [Option<ID3D11RenderTargetView>; 1])> {
     let render_target: ID3D11Texture2D = unsafe { swap_chain.GetBuffer(0) }?;
     let mut render_target_view = None;
     unsafe { device.CreateRenderTargetView(&render_target, None, Some(&mut render_target_view))? };
     Ok((
-        ManuallyDrop::new(render_target),
-        [Some(render_target_view.unwrap())],
+        render_target,
+        [Some(
+            render_target_view.context("Missing DirectX render target view")?,
+        )],
     ))
 }
 

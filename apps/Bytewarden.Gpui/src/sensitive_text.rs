@@ -2,6 +2,7 @@
 //! Layout and painting retain glyph geometry only, never plaintext cache keys.
 use std::{
     cell::RefCell,
+    hash::{Hash, Hasher},
     panic::Location,
     rc::{Rc, Weak},
 };
@@ -15,18 +16,124 @@ use zeroize::{Zeroize, Zeroizing};
 
 type Buffer = RefCell<Zeroizing<String>>;
 
+const MAX_CACHED_SHAPES: usize = 64;
+
+/// Glyph-only layout cache entry (`WrappedLine.text` from `shape_text_uncached` is empty).
+/// Stores no plaintext and is wiped synchronously whenever `Registry::clear()` runs.
+struct ShapeEntry {
+    key_hash: u64,
+    byte_len: usize,
+    colored: bool,
+    font_bits: u32,
+    wrap_bits: Option<u32>,
+    dark: bool,
+    lines: Rc<[WrappedLine]>,
+}
+
+struct ShapeCache {
+    seed: u64,
+    entries: Vec<ShapeEntry>,
+}
+
+impl Default for ShapeCache {
+    fn default() -> Self {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        seed ^= (&seed as *const u64 as usize) as u64;
+        if let Ok(d) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            seed ^= d.as_nanos() as u64;
+        }
+        Self {
+            seed,
+            entries: Vec::new(),
+        }
+    }
+}
+
+impl ShapeCache {
+    fn hash_value(&self, value: &str) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.seed.hash(&mut hasher);
+        value.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn get_or_shape(
+        &mut self,
+        value: &str,
+        colored: bool,
+        style: &TextStyle,
+        font_size: Pixels,
+        wrap_width: Option<Pixels>,
+        window: &mut Window,
+    ) -> Rc<[WrappedLine]> {
+        if value.is_empty() {
+            return Rc::from([]);
+        }
+        let key_hash = self.hash_value(value);
+        let byte_len = value.len();
+        let font_bits = f32::from(font_size).to_bits();
+        let wrap_bits = wrap_width.map(|w| f32::from(w).round().to_bits());
+        let dark = crate::theme::palette().dark;
+
+        if let Some(hit) = self.entries.iter().find(|e| {
+            e.key_hash == key_hash
+                && e.byte_len == byte_len
+                && e.colored == colored
+                && e.font_bits == font_bits
+                && e.wrap_bits == wrap_bits
+                && e.dark == dark
+        }) {
+            return hit.lines.clone();
+        }
+
+        let shaped: Rc<[WrappedLine]> = window
+            .text_system()
+            .shape_text_uncached(
+                value,
+                font_size,
+                &runs(value, style, colored),
+                wrap_width,
+                None,
+            )
+            .unwrap_or_default()
+            .into_vec()
+            .into();
+
+        if self.entries.len() >= MAX_CACHED_SHAPES {
+            self.entries.drain(0..MAX_CACHED_SHAPES / 2);
+        }
+        self.entries.push(ShapeEntry {
+            key_hash,
+            byte_len,
+            colored,
+            font_bits,
+            wrap_bits,
+            dark,
+            lines: shaped.clone(),
+        });
+        shaped
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct Registry {
     buffers: RefCell<Vec<Weak<Buffer>>>,
+    shapes: Rc<RefCell<ShapeCache>>,
 }
 
 impl Registry {
     pub(crate) fn text(&self, value: &str, colored: bool) -> SensitiveText {
         let value = Rc::new(RefCell::new(Zeroizing::new(value.to_owned())));
         let mut buffers = self.buffers.borrow_mut();
-        buffers.retain(|buffer| buffer.strong_count() != 0);
+        if buffers.len() >= 64 {
+            buffers.retain(|buffer| buffer.strong_count() != 0);
+        }
         buffers.push(Rc::downgrade(&value));
-        SensitiveText { value, colored }
+        SensitiveText {
+            value,
+            shapes: self.shapes.clone(),
+            colored,
+        }
     }
 
     #[cfg(all(test, feature = "test-support"))]
@@ -39,6 +146,7 @@ impl Registry {
     }
 
     pub(crate) fn clear(&self) {
+        self.shapes.borrow_mut().entries.clear();
         for buffer in self
             .buffers
             .borrow_mut()
@@ -58,6 +166,7 @@ impl Drop for Registry {
 
 pub(crate) struct SensitiveText {
     value: Rc<Buffer>,
+    shapes: Rc<RefCell<ShapeCache>>,
     colored: bool,
 }
 
@@ -95,7 +204,7 @@ impl IntoElement for SensitiveText {
 
 impl Element for SensitiveText {
     type RequestLayoutState = ();
-    type PrepaintState = Vec<WrappedLine>;
+    type PrepaintState = Rc<[WrappedLine]>;
     fn id(&self) -> Option<ElementId> {
         None
     }
@@ -111,6 +220,7 @@ impl Element for SensitiveText {
         _: &mut App,
     ) -> (LayoutId, ()) {
         let value = self.value.clone();
+        let shapes = self.shapes.clone();
         let colored = self.colored;
         let style = window.text_style();
         let font_size = style.font_size.to_pixels(window.rem_size());
@@ -124,16 +234,9 @@ impl Element for SensitiveText {
                         _ => None,
                     });
                     let value = value.borrow();
-                    let lines = window
-                        .text_system()
-                        .shape_text_uncached(
-                            &value,
-                            font_size,
-                            &runs(&value, &style, colored),
-                            wrap_width,
-                            None,
-                        )
-                        .unwrap_or_default();
+                    let lines = shapes
+                        .borrow_mut()
+                        .get_or_shape(&value, colored, &style, font_size, wrap_width, window);
                     let width = lines
                         .iter()
                         .map(|line| line.size(line_height).width)
@@ -157,20 +260,18 @@ impl Element for SensitiveText {
         _: &mut (),
         window: &mut Window,
         _: &mut App,
-    ) -> Vec<WrappedLine> {
+    ) -> Rc<[WrappedLine]> {
         let value = self.value.borrow();
         let style = window.text_style();
-        window
-            .text_system()
-            .shape_text_uncached(
-                &value,
-                style.font_size.to_pixels(window.rem_size()),
-                &runs(&value, &style, self.colored),
-                Some(bounds.size.width.max(px(1.))),
-                None,
-            )
-            .unwrap_or_default()
-            .into_vec()
+        let font_size = style.font_size.to_pixels(window.rem_size());
+        self.shapes.borrow_mut().get_or_shape(
+            &value,
+            self.colored,
+            &style,
+            font_size,
+            Some(bounds.size.width.max(px(1.))),
+            window,
+        )
     }
 
     fn paint(
@@ -179,7 +280,7 @@ impl Element for SensitiveText {
         _: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         _: &mut (),
-        lines: &mut Vec<WrappedLine>,
+        lines: &mut Rc<[WrappedLine]>,
         window: &mut Window,
         cx: &mut App,
     ) {
@@ -189,7 +290,7 @@ impl Element for SensitiveText {
         let line_height = window.line_height();
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             let mut top = px(0.);
-            for line in lines {
+            for line in lines.iter() {
                 let _ = line.paint(
                     bounds.origin + point(px(0.), top),
                     line_height,

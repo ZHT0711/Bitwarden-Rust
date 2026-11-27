@@ -1,5 +1,131 @@
-//! Pure synthetic state tests: no GPUI windows, core requests, or network calls.
+//! Authentication state tests and an opt-in GPUI integration with the synthetic server.
 use super::*;
+
+#[cfg(all(windows, feature = "test-support"))]
+#[gpui::test]
+#[ignore = "requires the isolated loopback fixture and a synthetic cache root"]
+fn online_and_offline_login_use_the_gpui_form(gpui: &mut gpui::TestAppContext) {
+    use std::{
+        io::{Read, Write},
+        net::{Ipv4Addr, TcpStream},
+        time::Duration,
+    };
+
+    let port: u16 = std::env::var("BYTEWARDEN_TEST_FIXTURE_PORT")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let fixture = |method: &str, path: &str| {
+        let mut stream =
+            TcpStream::connect_timeout(&(Ipv4Addr::LOCALHOST, port).into(), Duration::from_secs(2))
+                .unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let body = if method == "POST" { "{}" } else { "" };
+        write!(
+            stream,
+            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        ).unwrap();
+        let mut response = String::new();
+        stream
+            .take(32 * 1024)
+            .read_to_string(&mut response)
+            .unwrap();
+        let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+        assert!(headers.lines().next().unwrap().contains(" 200 "));
+        serde_json::from_str::<serde_json::Value>(body).unwrap()
+    };
+    assert_eq!(fixture("GET", "/health")["fixture"], true);
+    let counters = || fixture("GET", "/control/snapshot");
+    let (view, cx) = crate::workflow_tests::window(gpui);
+    let root = std::env::var("BYTEWARDEN_TEST_AUTH_CACHE").unwrap();
+    desktop::configure_cache(Path::new(&root)).unwrap();
+    let password = "asdfasdfasdf"; // Public synthetic SDK account.
+    let before = counters();
+
+    let initial = snapshot().unwrap();
+    let restored = initial.accounts.iter().any(|account| account.active);
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.settings.auto_prompt_hello = false;
+            view.client.initialized = true;
+            view.client.device = Some(Uuid::nil());
+            view.apply_snapshot(initial, cx);
+            if restored {
+                view.open_unlock(window, cx);
+                assert!(view.client.local_unlock_account().is_some());
+            } else {
+                view.begin_sign_in(window, cx);
+                view.client.region = Region::Custom;
+                view.client.server.update(cx, |field, cx| {
+                    field.set(&format!("http://127.0.0.1:{port}"), cx)
+                });
+                view.client
+                    .email
+                    .update(cx, |field, cx| field.set("test@bitwarden.com", cx));
+            }
+            view.client
+                .password
+                .update(cx, |field, cx| field.set(password, cx));
+            if restored {
+                view.request_unlock(cx);
+            } else {
+                view.submit(cx);
+            }
+        });
+    });
+    cx.run_until_parked();
+    if restored {
+        assert_eq!(counters()["passwordRequests"], before["passwordRequests"]);
+        assert_eq!(counters()["syncRequests"], before["syncRequests"]);
+        cx.update(|_, cx| assert!(view.read(cx).client.overview.as_ref().unwrap().read_only));
+
+        fixture("POST", "/control/fail-next-sync");
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.sync_or_reconnect(window, cx);
+                assert!(view.client.reconnect().is_some());
+                view.client
+                    .password
+                    .update(cx, |field, cx| field.set(password, cx));
+                view.submit(cx);
+            });
+        });
+        cx.run_until_parked();
+        let after = counters();
+        assert_eq!(
+            after["passwordRequests"].as_u64().unwrap(),
+            before["passwordRequests"].as_u64().unwrap() + 1
+        );
+        assert_eq!(
+            after["syncRequests"].as_u64().unwrap(),
+            before["syncRequests"].as_u64().unwrap() + 1
+        );
+        cx.update(|_, cx| {
+            let view = view.read(cx);
+            assert!(view.client.overview.as_ref().unwrap().read_only);
+            assert!(view.client.notice.contains("同步未完成"));
+            assert!(view.client.form.is_none());
+        });
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.sync_or_reconnect(window, cx));
+        });
+        cx.run_until_parked();
+        assert_eq!(counters()["passwordRequests"], after["passwordRequests"]);
+    }
+
+    cx.update(|_, cx| {
+        let view = view.read(cx);
+        assert!(view.client.form.is_none());
+        assert_eq!(view.client.state(), Session::Unlocked);
+        assert!(!view.client.overview.as_ref().unwrap().read_only);
+        assert!(view.client.overview.as_ref().unwrap().items.len() >= 2);
+    });
+    desktop::shutdown();
+}
 
 fn authenticator_options() -> TwoFactorOptions {
     TwoFactorOptions::new(Region::Us, [true, false, false])
@@ -15,24 +141,46 @@ fn device_then_two_factor() -> LoginChallenge {
     flow
 }
 
-#[test]
-fn dismissing_an_inflight_unlock_cancels_and_rejects_late_decrypted_results() {
-    assert!(unlock_dismissal_requires_cancellation(
-        Some(Form::Unlock),
-        true
-    ));
-    assert!(!unlock_dismissal_requires_cancellation(
-        Some(Form::Unlock),
-        false
-    ));
-    assert!(!unlock_dismissal_requires_cancellation(
-        Some(Form::SignIn),
-        true
-    ));
-    assert!(!unlock_result_still_current(None, false));
-    assert!(!unlock_result_still_current(Some(Form::SignIn), false));
-    assert!(!unlock_result_still_current(Some(Form::Unlock), true));
-    assert!(unlock_result_still_current(Some(Form::Unlock), false));
+#[cfg(feature = "test-support")]
+#[gpui::test]
+fn restored_account_offers_online_and_local_unlock_in_the_same_form(
+    gpui: &mut gpui::TestAppContext,
+) {
+    let (view, cx) = crate::workflow_tests::window(gpui);
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            crate::workflow_tests::ready(view);
+            view.client.accounts = vec![
+                serde_json::from_value(serde_json::json!({
+                    "id": "review-synthetic-account", "email": "review@example.test",
+                    "serverMode": 2, "serverUrl": "https://vault.example.test",
+                    "state": 2, "active": true, "needsSignIn": true, "helloEnabled": true
+                }))
+                .unwrap(),
+            ];
+            view.open_unlock(window, cx);
+            assert!(view.client.form == Some(Form::SignIn));
+            assert_eq!(
+                view.client.reconnect().unwrap().email,
+                "review@example.test"
+            );
+            assert!(view.client.local_unlock_account().unwrap().hello_enabled);
+            view.restart_login(cx);
+            assert_eq!(
+                view.client.reconnect().unwrap().id,
+                "review-synthetic-account"
+            );
+
+            let generation = view.client.form_generation;
+            view.client.local_unlock_pending = true;
+            view.client.busy = Some("synthetic unlock");
+            view.close_form(cx);
+            assert!(view.lock_queued);
+            assert!(view.client.form_generation != generation);
+            assert!(view.client.form.is_none());
+            assert!(view.client.reconnect().is_none());
+        });
+    });
 }
 
 #[test]

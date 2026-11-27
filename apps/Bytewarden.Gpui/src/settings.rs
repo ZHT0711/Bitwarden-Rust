@@ -13,6 +13,8 @@ pub struct Settings {
     pub theme: Theme,
     pub animations: bool,
     pub clipboard_seconds: u64,
+    pub auto_prompt_hello: bool,
+    pub prevent_screenshots: bool,
     pub sort: Sort,
     pub website_icons: bool,
     pub keep_in_tray: bool,
@@ -20,6 +22,11 @@ pub struct Settings {
     pub start_at_login: bool,
     pub minimize_after_copy: bool,
     pub list_width: f32,
+    pub window_x: Option<f32>,
+    pub window_y: Option<f32>,
+    pub window_w: Option<f32>,
+    pub window_h: Option<f32>,
+    pub window_maximized: bool,
 }
 
 impl Default for Settings {
@@ -28,6 +35,8 @@ impl Default for Settings {
             theme: Theme::System,
             animations: true,
             clipboard_seconds: 30,
+            auto_prompt_hello: false,
+            prevent_screenshots: false,
             sort: Sort::default(),
             website_icons: true,
             keep_in_tray: true,
@@ -35,6 +44,11 @@ impl Default for Settings {
             start_at_login: false,
             minimize_after_copy: false,
             list_width: crate::ui::tokens::size::LIST_DEFAULT,
+            window_x: None,
+            window_y: None,
+            window_w: None,
+            window_h: None,
+            window_maximized: false,
         }
     }
 }
@@ -61,10 +75,43 @@ impl Settings {
                 "theme" => settings.theme = Theme::parse(value),
                 "animations" => settings.animations = value != "false",
                 "sort" => settings.sort = Sort::parse(value),
+                "auto_prompt_hello" => settings.auto_prompt_hello = value == "true",
+                "prevent_screenshots" => settings.prevent_screenshots = value == "true",
                 "website_icons" => settings.website_icons = value != "false",
                 "keep_in_tray" => settings.keep_in_tray = value != "false",
                 "start_hidden" => settings.start_hidden = value != "false",
                 "minimize_after_copy" => settings.minimize_after_copy = value == "true",
+                "window_maximized" => settings.window_maximized = value == "true",
+                "window_x" => {
+                    if let Ok(v) = value.parse::<f32>()
+                        && v.is_finite()
+                        && (-16_000.0..=16_000.0).contains(&v)
+                    {
+                        settings.window_x = Some(v);
+                    }
+                }
+                "window_y" => {
+                    if let Ok(v) = value.parse::<f32>()
+                        && v.is_finite()
+                        && (-16_000.0..=16_000.0).contains(&v)
+                    {
+                        settings.window_y = Some(v);
+                    }
+                }
+                "window_w" => {
+                    if let Ok(v) = value.parse::<f32>()
+                        && v.is_finite()
+                    {
+                        settings.window_w = Some(v.clamp(420., 3840.));
+                    }
+                }
+                "window_h" => {
+                    if let Ok(v) = value.parse::<f32>()
+                        && v.is_finite()
+                    {
+                        settings.window_h = Some(v.clamp(410., 2160.));
+                    }
+                }
                 "clipboard_seconds" => {
                     if let Ok(seconds @ (10 | 30 | 60 | 120)) = value.parse() {
                         settings.clipboard_seconds = seconds;
@@ -86,6 +133,65 @@ impl Settings {
         settings
     }
 
+    pub fn save_silent(&self) {
+        let _ = self.save();
+    }
+
+    pub fn capture_window_bounds(&mut self, window: &Window) {
+        let maximized = window.is_maximized();
+        self.window_maximized = maximized;
+        if !maximized {
+            let bounds = window.bounds();
+            let w = f32::from(bounds.size.width);
+            let h = f32::from(bounds.size.height);
+            let x = f32::from(bounds.origin.x);
+            let y = f32::from(bounds.origin.y);
+            if w >= 420. && h >= 410. && x.is_finite() && y.is_finite() {
+                self.window_x = Some(x);
+                self.window_y = Some(y);
+                self.window_w = Some(w.clamp(420., 3840.));
+                self.window_h = Some(h.clamp(410., 2160.));
+            }
+        }
+    }
+
+    /// Compute startup `WindowBounds`, restoring saved geometry only if it remains
+    /// clearly visible on at least one currently connected display.
+    pub fn initial_window_bounds(&self, cx: &gpui::App) -> gpui::WindowBounds {
+        let default_size = gpui::size(
+            px(crate::ui::tokens::size::WINDOW_DEFAULT_W),
+            px(crate::ui::tokens::size::WINDOW_DEFAULT_H),
+        );
+        let desired_size = match (self.window_w, self.window_h) {
+            (Some(w), Some(h)) => gpui::size(px(w.clamp(420., 3840.)), px(h.clamp(410., 2160.))),
+            _ => default_size,
+        };
+        let bounds = match (self.window_x, self.window_y) {
+            (Some(x), Some(y)) => {
+                let candidate = gpui::Bounds::new(gpui::point(px(x), px(y)), desired_size);
+                let visible_on_any_display = cx.displays().iter().any(|display| {
+                    let db = display.bounds();
+                    let ix1 = f32::from(candidate.left()).max(f32::from(db.left()));
+                    let iy1 = f32::from(candidate.top()).max(f32::from(db.top()));
+                    let ix2 = f32::from(candidate.right()).min(f32::from(db.right()));
+                    let iy2 = f32::from(candidate.bottom()).min(f32::from(db.bottom()));
+                    (ix2 - ix1) >= 120. && (iy2 - iy1) >= 80.
+                });
+                if visible_on_any_display {
+                    candidate
+                } else {
+                    gpui::Bounds::centered(None, desired_size, cx)
+                }
+            }
+            _ => gpui::Bounds::centered(None, desired_size, cx),
+        };
+        if self.window_maximized {
+            gpui::WindowBounds::Maximized(bounds)
+        } else {
+            gpui::WindowBounds::Windowed(bounds)
+        }
+    }
+
     fn save(&self) -> io::Result<()> {
         let root = profile_directory()?;
         fs::create_dir_all(&root)?;
@@ -95,18 +201,34 @@ impl Settings {
     }
 
     fn serialized(&self) -> String {
-        format!(
-            "theme={}\nanimations={}\nclipboard_seconds={}\nsort={}\nwebsite_icons={}\nkeep_in_tray={}\nstart_hidden={}\nminimize_after_copy={}\nlist_width={:.0}\n",
+        let mut out = format!(
+            "theme={}\nanimations={}\nclipboard_seconds={}\nauto_prompt_hello={}\nprevent_screenshots={}\nsort={}\nwebsite_icons={}\nkeep_in_tray={}\nstart_hidden={}\nminimize_after_copy={}\nlist_width={:.0}\nwindow_maximized={}\n",
             self.theme.key(),
             self.animations,
             self.clipboard_seconds,
+            self.auto_prompt_hello,
+            self.prevent_screenshots,
             self.sort.key(),
             self.website_icons,
             self.keep_in_tray,
             self.start_hidden,
             self.minimize_after_copy,
-            self.list_width
-        )
+            self.list_width,
+            self.window_maximized,
+        );
+        if let Some(x) = self.window_x {
+            out.push_str(&format!("window_x={x:.0}\n"));
+        }
+        if let Some(y) = self.window_y {
+            out.push_str(&format!("window_y={y:.0}\n"));
+        }
+        if let Some(w) = self.window_w {
+            out.push_str(&format!("window_w={w:.0}\n"));
+        }
+        if let Some(h) = self.window_h {
+            out.push_str(&format!("window_h={h:.0}\n"));
+        }
+        out
     }
 }
 
@@ -484,6 +606,160 @@ impl VaultPreview {
                 .flex()
                 .flex_col()
                 .gap(px(space::M))
+                .when(cfg!(windows), |view| {
+                    let enabled = self.client.active().is_some_and(|account| account.hello_enabled);
+                    let can_change = timeout_enabled
+                        && (enabled || self.client.overview.is_some() && !self.client.write_guard);
+                    let (pk_badge, pk_desc) = self.passkeys.state_label();
+                    view.child(
+                        card_group("Windows Hello", Some(glyph::LOCK))
+                            .child(setting_row(
+                                "本机解锁",
+                                if enabled {
+                                    "当前账户已启用 Windows Hello，可在锁定后解锁本机保险库。"
+                                } else {
+                                    "联网同步后可启用。设置时需要主密码和 Windows Hello 验证。"
+                                },
+                                btn("settings-hello", BtnVariant::Secondary)
+                                    .child(if enabled { "关闭" } else { "启用" })
+                                    .when(!can_change, |button| button.opacity(0.45))
+                                    .when(can_change, |button| button.on_click(
+                                        cx.listener(|this, _, window, cx| this.change_hello(window, cx)),
+                                    ))
+                                    .into_any_element(),
+                                false,
+                            ))
+                            .child(setting_row(
+                                "自动提示 Windows Hello",
+                                "打开已启用 Windows Hello 的账户解锁页时自动请求验证。",
+                                toggle_switch_animated(
+                                    "auto-prompt-hello",
+                                    self.settings.auto_prompt_hello,
+                                    self.ui.toggle_progress(
+                                        &gpui::ElementId::Name("auto-prompt-hello".into()),
+                                        self.settings.auto_prompt_hello,
+                                        now,
+                                        self.animate,
+                                    ),
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.settings.auto_prompt_hello = !this.settings.auto_prompt_hello;
+                                    this.ui.animate_toggle(
+                                        gpui::ElementId::Name("auto-prompt-hello".into()),
+                                        this.settings.auto_prompt_hello,
+                                        this.animate,
+                                    );
+                                    this.save_settings(cx);
+                                }))
+                                .into_any_element(),
+                                true,
+                            )),
+                    )
+                    .child(
+                        card_group("Windows 通行密钥提供程序", Some(glyph::PASSKEY))
+                            .child(setting_row(
+                                "系统原生通行密钥联动",
+                                pk_desc,
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.))
+                                    .child(crate::ui::components::badge(
+                                        pk_badge,
+                                        if self.passkeys.provider_state == "enabled" {
+                                            pal.success
+                                        } else if self.passkeys.provider_state == "disabled" {
+                                            pal.warning
+                                        } else {
+                                            pal.text_muted
+                                        },
+                                    ))
+                                    .child(
+                                        btn("passkey-register", BtnVariant::Secondary)
+                                            .h(px(30.))
+                                            .px(px(10.))
+                                            .text_size(px(font::CAPTION))
+                                            .when(self.passkeys.registering, |b| b.opacity(0.45))
+                                            .child(if self.passkeys.registering {
+                                                "注册中…"
+                                            } else {
+                                                "注册到 Windows"
+                                            })
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.register_windows_passkey_provider(cx);
+                                            })),
+                                    )
+                                    .child(
+                                        btn("passkey-open-win-settings", BtnVariant::Subtle)
+                                            .h(px(30.))
+                                            .px(px(10.))
+                                            .text_size(px(font::CAPTION))
+                                            .child("系统设置")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                cx.open_url("ms-settings:savedpasskeys");
+                                                this.refresh_windows_passkey_state(cx);
+                                            })),
+                                    )
+                                    .into_any_element(),
+                                false,
+                            ))
+                            .child(setting_row(
+                                "同步通行密钥元数据",
+                                "将当前已解锁保险库中的通行密钥索引同步给 Windows 系统选择器，以便浏览网页时直接显示。",
+                                btn("passkey-sync-meta", BtnVariant::Secondary)
+                                    .h(px(30.))
+                                    .px(px(10.))
+                                    .text_size(px(font::CAPTION))
+                                    .when(!timeout_enabled || self.passkeys.syncing_metadata, |b| {
+                                        b.opacity(0.45)
+                                    })
+                                    .child(if self.passkeys.syncing_metadata {
+                                        "同步中…"
+                                    } else {
+                                        "立即同步"
+                                    })
+                                    .when(timeout_enabled && !self.passkeys.syncing_metadata, |b| {
+                                        b.on_click(cx.listener(|this, _, _, cx| {
+                                            this.sync_windows_passkey_metadata(false, cx);
+                                        }))
+                                    })
+                                    .into_any_element(),
+                                true,
+                            )),
+                    )
+                    .child(
+                        card_group("屏幕隐私保护", Some(glyph::SHIELD)).child(setting_row(
+                            "防止截图与录屏捕获",
+                            "开启后调用 Windows 原生保护，截图工具、录屏与远程屏幕共享将无法捕获本窗口内容。",
+                            toggle_switch_animated(
+                                "prevent-screenshots",
+                                self.settings.prevent_screenshots,
+                                self.ui.toggle_progress(
+                                    &gpui::ElementId::Name("prevent-screenshots".into()),
+                                    self.settings.prevent_screenshots,
+                                    now,
+                                    self.animate,
+                                ),
+                            )
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.settings.prevent_screenshots =
+                                    !this.settings.prevent_screenshots;
+                                crate::tray::apply_screen_capture_protection(
+                                    window,
+                                    this.settings.prevent_screenshots,
+                                );
+                                this.ui.animate_toggle(
+                                    gpui::ElementId::Name("prevent-screenshots".into()),
+                                    this.settings.prevent_screenshots,
+                                    this.animate,
+                                );
+                                this.save_settings(cx);
+                            }))
+                            .into_any_element(),
+                            true,
+                        )),
+                    )
+                })
                 .child(
                     card_group("保险库超时策略", Some(glyph::LOCK)).child(
                         div()
